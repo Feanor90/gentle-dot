@@ -54,7 +54,7 @@ This phase is developed from a Linux host. Windows-only code cannot be compiled 
 | W13 | SW7 | explore → spec → implement | pending | — | Computer control on Windows: UI Automation, `SendInput`, Windows Graphics Capture, `WindowFromPoint`, per-monitor DPI |
 | W14 | SW8 | delegated writer | pending | — | `docs/install.md` Windows section, README badge and claims, `docs/windows-testing.md`, design updates |
 | W15 | SW2, SW5 | explore → fix | done | `136d5c9`; **verified** in fork run `38177833421` — `actions/setup-go@v7` installed Go 1.27.2 and the `gentle-pi` postinstall built `gentle-ai.exe` and reported `Done`; `Install` and `Typecheck` both succeeded | `pnpm install` failed on Windows because the `gentle-pi` postinstall builds its Gentle AI binary from source there and needs Go ≥ 1.25.10 while the runner ships 1.24.13 |
-| W16 | SW2 | inline | in progress | `a10a763`; **fix unverified until the next run** | Windows checkouts get CRLF from `core.autocrlf=true`, and `biome check` reported 201 errors, one per line, on the Windows runner. Fixed with `.gitattributes` (`* text=auto eol=lf`), which also fixes a Windows developer's local checkout |
+| W16 | SW2 | inline | done | `a10a763`; **verified** in fork run `38184877146` — the `Lint` step went from failure to **success** | Windows checkouts get CRLF from `core.autocrlf=true`, and `biome check` reported 201 errors, one per line, on the Windows runner. Fixed with `.gitattributes` (`* text=auto eol=lf`), which also fixes a Windows developer's local checkout |
 
 ## Log
 
@@ -140,3 +140,19 @@ postinstall: Failed
   - **W16 found.** `Lint` **failure**, `Test` skipped: `Found 201 errors`, and every reported line ends in a carriage return (`throw·new·Error(…);␍`). Windows checkouts default to `core.autocrlf=true`, so the working tree gets CRLF and `biome check` judges the bytes it is given. The repository had **no `.gitattributes`**, and the development host uses `core.autocrlf=input`, which is exactly why this never appeared locally.
   - Fix in `a10a763`: `.gitattributes` with `* text=auto eol=lf`. It belongs in the repository rather than in the workflow, because a Windows developer hits the same 201 errors on their own checkout before pushing. `git add --renormalize .` staged only the new file, confirming the stored content was already LF and that nothing else moved.
   - This is the second time in this port that a real defect was invisible on the development host and only a Windows runner could surface it. It is the argument for W3 paying for itself, and it is worth remembering that both times the cost of finding it was one CI run rather than a debugging session on the user's machine.
+
+- **L12 (2026-10-11, agent, evidence):** Run `38184877146` confirmed W16 (the `Lint` step went from failure to **success**) and unblocked the step behind it, which is where the real work starts. **The Windows baseline of the TypeScript suite, measured:**
+
+```
+Test Files  23 failed | 54 passed | 7 skipped (84)
+```
+
+  On Linux the same suite is `78 passed | 6 skipped`, **0 failed**. So 23 of 84 test files fail on Windows, and the failures map onto the plan instead of being random:
+  - **41 assertions are file-permission checks**, the single biggest category: 31 × `expected 438 to be 384` (`0o666` vs `0o600`), 8 × `438 to be 448` (`0o700`), 2 × `438 to be 420` (`0o644`). Windows has no POSIX mode bits, so these can never hold. That is **W5**, whose scope is exactly the `chmod`/`mode` guards.
+  - **POSIX path assumptions: W4.** `expected 'D:\h' to be '/h'` (a test using a POSIX absolute literal), `expected 'D:\a\gentle-dot\…' to match /node_modules\/gentle-pi\/…/` (a forward-slash regex against a backslash path), and a `C:\Users\RUNNER~1\AppData\Local\Temp\…` comparison that differs only in the temp path's form.
+  - **The fd-3 channel: W7**, named and isolated — `app-channel-fd.test.ts` covers "the app channel on fd 3 (S25.1)" and fails exactly there.
+  - **uid/gid privilege switching: W6** — `engine-access.test.ts` (13 failures) exercises `seteuid`/`setegid`, which do not exist on Windows.
+  - **Behaviour that `chmod` was faking: W5.** `child-guard.test.ts` simulates an unwritable extensions folder by removing the write bit; on Windows the write succeeds, so `expected '1' to be '0'` and `expected +0 to be 1`. The tests are honest; the simulation mechanism is what does not port.
+  - **Look at this before estimating W4:** `config.test.ts` reports `expected { port: 5000, host: '127.0.0.1', …(8) } to match object { port: 5000, …(1) }`, an object-shape difference that path handling alone does not explain.
+  - Worst offenders by failure count: `vps-gateway` (31), `app-channel-fd` (27), `runtime` (16), `cli` (15), `engine-access` (13), `connector-integrity` (13), `config` (13). Note that `vps-*` is Linux/VPS-only by design (S25.8), so part of W6 is gating those suites rather than porting them.
+  - This is the number the plan needed: the daemon port is not a handful of `path.join` fixes, it is 23 test files' worth of platform assumptions, and now they are enumerated instead of guessed.
