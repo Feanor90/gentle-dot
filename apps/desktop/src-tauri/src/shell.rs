@@ -475,19 +475,17 @@ fn spawn_snapper(app: AppHandle) -> mpsc::Sender<()> {
 
 /// The panel's backdrop, translated from the OS-agnostic decision in `platform` (design §9).
 ///
-/// Tauri applies only the material that belongs to the host OS, so naming another one is a
-/// silent no-op rather than an error, and Linux keeps the builder exactly as it was
-/// (`WebviewWindowBuilder::effects` is documented as unsupported there). Windows 10 has no
-/// `Mica`; until W8 is verified on a real Windows machine, the panel keeps the translucent URL
-/// and therefore still paints its own background.
+/// Only macOS asks for a material. Tauri applies only the material that belongs to the host, so
+/// naming a foreign one is a silent no-op rather than an error, and `WebviewWindowBuilder::effects`
+/// is documented as unsupported on Linux. Windows is deliberately in the untouched group: Tauri
+/// discards the result of applying a Windows material and offers no readback, so a requested
+/// `Mica` cannot be told apart from one that was ignored, and a translucent panel over an ignored
+/// effect is unreadable. W8 asks for `Mica` once a real Windows machine shows it lands.
 fn with_panel_effects<'a, R: tauri::Runtime, M: tauri::Manager<R>>(
     panel: WebviewWindowBuilder<'a, R, M>,
     os: Os,
 ) -> WebviewWindowBuilder<'a, R, M> {
     match os.panel_effect() {
-        WindowEffect::Mica => {
-            panel.effects(EffectsBuilder::new().effect(Effect::Mica).state(EffectState::Active).build())
-        }
         WindowEffect::HudWindow => panel.effects(
             EffectsBuilder::new().effect(Effect::HudWindow).state(EffectState::Active).radius(20.0).build(),
         ),

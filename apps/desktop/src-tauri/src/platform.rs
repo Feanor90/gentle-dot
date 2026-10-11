@@ -13,12 +13,20 @@ pub enum Os {
     Windows,
 }
 
-/// The backdrop the panel asks the window system for. Windows 11 blurs with `Mica`, macOS with
-/// the `HudWindow` material, and Linux gets nothing: neither X11 nor Wayland can be relied on to
-/// composite a translucent panel, so the UI paints an opaque background instead (design §9).
+/// The backdrop the panel asks the window system for. macOS blurs with the `HudWindow` material.
+/// Linux gets nothing, because neither X11 nor Wayland can be relied on to composite a
+/// translucent panel. Windows gets nothing *yet*, and the reason is not cosmetic:
+///
+/// Tauri applies at most one Windows material and throws the result away
+/// (`tauri/src/vibrancy/windows.rs` scans the effect list with `find` and drops the
+/// `window_vibrancy` result), so there is no `Acrylic` fallback to ask for and no way to read
+/// back whether `Mica` landed. On Windows 10, with transparency effects disabled, over Remote
+/// Desktop, or after a compositor failure the request would be dropped in silence and a
+/// translucent panel would have no backdrop at all. Asking for `Mica` therefore proves nothing,
+/// and requesting it would trade a readable panel for an unverified blur. W8 flips this to
+/// `Mica` once a real Windows machine shows the blur actually lands (SW3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowEffect {
-    Mica,
     HudWindow,
     None,
 }
@@ -36,8 +44,8 @@ impl Os {
     pub fn panel_effect(self) -> WindowEffect {
         match self {
             Os::MacOs => WindowEffect::HudWindow,
-            Os::Windows => WindowEffect::Mica,
-            Os::Linux => WindowEffect::None,
+            // Asking is not proof (see above), so Windows keeps the readable panel.
+            Os::Windows | Os::Linux => WindowEffect::None,
         }
     }
 
@@ -209,12 +217,23 @@ mod tests {
     #[test]
     fn every_os_picks_its_own_panel_backdrop() {
         assert_eq!(Os::MacOs.panel_effect(), WindowEffect::HudWindow);
-        assert_eq!(Os::Windows.panel_effect(), WindowEffect::Mica);
+        // Windows asks for nothing until W8 proves the blur lands; see `WindowEffect`.
+        assert_eq!(Os::Windows.panel_effect(), WindowEffect::None);
         assert_eq!(Os::Linux.panel_effect(), WindowEffect::None);
-        // Only the OS with no backdrop effect asks the UI for an opaque background.
+        // Only the OS with a backdrop effect leaves the background to the window system.
         assert_eq!(panel_url(Os::MacOs), "index.html?surface=panel");
-        assert_eq!(panel_url(Os::Windows), "index.html?surface=panel");
+        assert_eq!(panel_url(Os::Windows), "index.html?surface=panel&effects=none");
         assert_eq!(panel_url(Os::Linux), "index.html?surface=panel&effects=none");
+    }
+
+    #[test]
+    fn an_unverified_backdrop_never_leaves_the_panel_transparent() {
+        // The defect this guards: a translucent panel with a no-op window effect is unreadable,
+        // and Tauri cannot report whether the effect applied.
+        for os in [Os::Windows, Os::Linux] {
+            assert!(!os.has_panel_effect(), "{os:?}");
+            assert!(panel_url(os).ends_with("effects=none"), "{os:?}");
+        }
     }
 
     #[test]
