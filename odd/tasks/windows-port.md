@@ -49,11 +49,11 @@ This phase is developed from a Linux host. Windows-only code cannot be compiled 
 | W8 | SW1, SW3 | delegated writer | pending | — | `.cargo/config.toml` Windows targets, `icon.ico`, `tauri.windows.conf.json`, NSIS/MSI bundle target. Also: ask for `Mica` on the panel once a real Windows machine shows the blur lands (see L8) |
 | W9 | SW1, SW3 | delegated writer | pending | — | Shortcut remap (default is `Alt+Space`, which Windows reserves) and the glyph logic in `shortcut.rs`; autostart through the registry |
 | W10 | SW4 | delegated writer, high risk | pending | — | `secure_store/windows.rs` (Credential Manager / DPAPI) + the documented limit |
-| W11 | SW5 | delegated writer | pending | — | `TARGETS` + `stage-runtime.mjs` for Windows (Node `.zip`, `.cmd`/`.exe` shims, `;` PATH) and `package-windows.mjs` |
+| W11 | SW5 | delegated writer | pending | — | `TARGETS` + `stage-runtime.mjs` for Windows (Node `.zip`, `.cmd`/`.exe` shims, `;` PATH) and `package-windows.mjs`. **Constraint from L9:** the Windows installer cannot carry the engine while `gentle-pi` builds its Gentle AI binary from source there, so either a prebuilt Windows binary ships, or the package carries Go, or the install requires Go 1.25.10+ to be present |
 | W12 | SW6 | delegated writer | pending | — | WASAPI capture backend and the Windows Parakeet path |
 | W13 | SW7 | explore → spec → implement | pending | — | Computer control on Windows: UI Automation, `SendInput`, Windows Graphics Capture, `WindowFromPoint`, per-monitor DPI |
 | W14 | SW8 | delegated writer | pending | — | `docs/install.md` Windows section, README badge and claims, `docs/windows-testing.md`, design updates |
-| W15 | SW2, SW5 | explore → fix | **blocking** | — | `pnpm install --frozen-lockfile` fails on Windows (fork run `38171022857`, `typescript` job, step `Install`). Nothing else on Windows can run until this does |
+| W15 | SW2, SW5 | explore → fix | in progress | `136d5c9`; cause identified from the real log (fork run `38171022857`); **fix unverified until the next run** | `pnpm install` failed on Windows because the `gentle-pi` postinstall builds its Gentle AI binary from source there and needs Go ≥ 1.25.10 while the runner ships 1.24.13. Fixed by installing Go in the CI job |
 
 ## Log
 
@@ -110,3 +110,21 @@ This phase is developed from a Linux host. Windows-only code cannot be compiled 
   - **Why the obvious fix was wrong.** SW3 promised `Acrylic` as a fallback, and it cannot be delivered through this API. `tauri-2.12.1/src/vibrancy/windows.rs` scans the effect list with `find`, so `[Mica, Acrylic]` picks `Mica` and never tries `Acrylic`; the `window_vibrancy` result is discarded with no `?` and no log; and there is no readback to ask whether the effect applied. A silent no-op is therefore indistinguishable from success, and asking for `Mica` proves nothing.
   - **Correction applied:** `WindowEffect::Mica` was removed, `panel_effect()` returns `None` for Windows, and `with_panel_effects` leaves the Windows builder untouched. The panel therefore keeps `effects=none` and paints its own background, which is always readable. W8 asks for `Mica` once a real Windows machine shows the blur lands, and SW3's fallback clause was corrected because the fallback it promised does not exist. A regression test (`an_unverified_backdrop_never_leaves_the_panel_transparent`) now pins the invariant: any OS whose backdrop is unverified must end up with `effects=none`.
   - **Lesson worth keeping:** the review paid for itself here. This was an inferential finding about a platform reachable by only one of the four lenses, on a code path that cannot run on the development host, and it was introduced by the author in the same commit as a comment asserting the opposite. Four lens runs plus one refuter was the right price for it.
+
+- **L9 (2026-10-11, agent, evidence):** W15 diagnosed from the real CI log. The `Install` step failed with the cause named in full:
+
+```
+.../node_modules/gentle-pi postinstall$ node scripts/install-gentle-ai.mjs
+gentle-pi could not install its package-local Gentle AI v4.0.0 binary:
+  Windows source installation requires local Go 1.25.10 or newer;
+  found go version go1.24.13 windows/amd64.
+postinstall: Failed
+[ELIFECYCLE] Command failed with exit code 1.
+```
+
+  - The `windows-latest` image ships Go 1.24.13. On Darwin and Linux the same postinstall downloads a SHA-256-pinned release archive, so the Go requirement is Windows-only and invisible on every other platform.
+  - **What the log rules out**, which matters because these were the guesses before it: `✓ Lockfile passes supply-chain policies (466 entries)`, `Packages: +365`, `added 365, done`, and the `esbuild` postinstall succeeded. Long paths, junctions, symlinks, and a stale or Windows-incomplete lockfile were **never** the problem. The install got all the way to the last postinstall.
+  - Fix in `136d5c9`: `actions/setup-go@v7` with `go-version: stable` before `pnpm install`, because the constraint is "or newer" rather than an exact version. The tag was checked against the upstream release list first (v7.0.0, 2026-07); guessing v5 would have been a year stale, the same mistake made earlier with `pnpm/action-setup`.
+  - **Consequence beyond CI, for SW5 and W11:** a self-contained Windows installer cannot carry the engine while `gentle-pi` builds its binary from source there. Either upstream publishes a prebuilt Windows binary, or the package carries Go, or Windows requires Go 1.25.10+ to be installed. This is the first Windows blocker that is **not** fixable inside this repository.
+  - **Fix not yet verified:** the Go step has never run. Verification needs one more push to the fork's `main`, which is the only trigger available until the workflow exists on the upstream default branch.
+  - Note on the review lifecycle: this work unit moves the candidate tree past `5a68d3fa…`, so lineage `review-e964a8bcd1761b57` is superseded. It was already unable to close (L8: the targeted-validator capture was rejected three times), so nothing that could have finished was lost.
