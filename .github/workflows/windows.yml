@@ -46,6 +46,17 @@ jobs:
           node-version-file: .nvmrc
           cache: pnpm
 
+      # Not a convenience: `pnpm install` cannot succeed on Windows without it. The
+      # gentle-pi postinstall builds its package-local Gentle AI binary **from source** on
+      # Windows and requires Go 1.25.10 or newer, while the windows-latest image ships Go
+      # 1.24.13. On Darwin and Linux the same postinstall downloads a pinned release archive,
+      # so this requirement only shows up here. `stable` is the honest range: the constraint is
+      # "or newer", not an exact version.
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+
       - name: Install
         run: pnpm install --frozen-lockfile
 
