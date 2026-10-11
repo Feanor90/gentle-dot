@@ -1,0 +1,88 @@
+# Gentle Dot — native Windows 11 support
+
+Objective: Gentle Dot runs natively on Windows 11 with parity to macOS — the Dot, the panel, the tray, global shortcuts, persistent secrets, a self-contained installer, voice, and computer control. Design: `docs/design.md`; the macOS/Linux baseline is `odd/tasks/gentle-dot.md`.
+Branch: `feat/windows-port` · Delivery strategy: `staged-phases` (each phase is an independently shippable slice; the user chose full parity in L1, sequenced because review workload and verification tooling differ per phase) · Test runner: `cargo test` for `apps/desktop`, Vitest (`pnpm test`) and Playwright (`pnpm e2e`) for the rest.
+
+## Scope note — what "native Windows" excludes
+
+WSL is not the target. A build produced inside WSL is a Linux ELF binary; Windows cannot run it natively. The target is `x86_64-pc-windows-msvc` (and later `aarch64-pc-windows-msvc`) built on Windows over NTFS. WSL stays usable as a development shell, but every Windows work unit is verified on Windows or on a Windows CI runner, never simulated on Linux.
+
+## Specs
+
+- **SW1 — The platform layer knows Windows.** User: "me interesa tenerlo en windows" (L1).
+  - Acceptance: `platform::Os` has a `Windows` variant and `Os::CURRENT` reports it from `cfg!(target_os = "windows")`; no Windows build silently takes a Linux branch. All platform decisions stay pure functions over injected environment values, so they are tested on every OS.
+  - Checks: `cargo test` for `platform.rs`, including a test per OS variant; the `Os::CURRENT` test asserts against `cfg!(target_os = ...)` for all three.
+- **SW2 — The daemon and the web UI run natively on Windows.** User: chose full parity (L1).
+  - Acceptance: `pnpm install` and `pnpm dev` work on Windows with Node 24; the daemon serves the UI at `http://127.0.0.1:4317`, chats, and answers asks in the browser. No POSIX-only call is reachable on Windows without a platform branch.
+  - Checks: Vitest with Windows-specific unit tests for path, shell, and process handling; a manual browser smoke on Windows.
+- **SW3 — Native shell parity.** Acceptance: a Tauri 2 Windows app shows the floating Dot, expands the panel, keeps the tray with per-state glyphs, registers the open shortcut and the autostart entry, and persists the Dot position. Window effects use a Windows effect (`Mica` on Windows 11, `Acrylic` as fallback) instead of `HudWindow`.
+  - Checks: `cargo test` for the pure decisions; a manual Windows checklist with observed results (mirroring `docs/linux-testing.md`).
+- **SW4 — Secrets persist and the limit is documented.** Acceptance: connector tokens live in the Windows Credential Manager, created and read by the app; no token ever falls back to `MemoryStore` on Windows. Docs state plainly that any process running as the same user — the agent's shell included — can read them, exactly as S25.7 states for Linux.
+  - Checks: Rust unit tests around the store's contract and its failure paths; a manual round-trip on Windows across a restart.
+- **SW5 — Self-contained Windows installer.** Acceptance: a Windows NSIS (and MSI where WiX is available) installer carries its own Node runtime, engine, Engram, and UI; `scripts/package/lib.mjs` accepts `windows-x64`; the staged runtime uses `node/node.exe`, `bin/engram.exe`, `bin/pi.cmd`, and a `;`-separated `PATH`. Installing on a clean Windows user starts the daemon and the engine.
+  - Checks: the existing `scripts/package/test/**` suite extended for the Windows target; an install smoke on a clean Windows user.
+- **SW6 — Voice on Windows.** Acceptance: the mic button records through a Windows capture backend and prefers the local Parakeet model (sherpa-onnx, Windows static libraries confirmed available); without the model, an API key path applies, and the UI reports voice as unavailable rather than failing.
+  - Checks: Rust unit tests for the engine-selection decision; a manual device check on Windows.
+- **SW7 — Computer control on Windows.** Acceptance: parity with the S24 contract — a native helper inside the app (never in the daemon or the engine) that serves MCP on `127.0.0.1:<random port>/mcp` with a per-launch bearer token, exposes the S24.2 tool set, enforces the S24.4 blocklist, rate limit, and risky-action confirmations, and paints the S28 glow. Input goes through `SendInput`, element and risk detection through UI Automation, screenshots through Windows Graphics Capture, and target-window resolution through `WindowFromPoint`.
+  - Checks: Rust unit tests on every pure guard; a Windows checklist with observed results; enforcement tests that the agent cannot reach the approval dialogs.
+- **SW8 — Docs, CI, and honest verification.** Acceptance: `README.md`, `docs/install.md`, and `docs/design.md` list Windows and how to build it; a Windows CI job compiles the Rust shell and runs the suites; `docs/windows-testing.md` mirrors `docs/linux-testing.md`.
+  - Checks: the CI job is green on a Windows runner; docs readback.
+
+## Verification constraint
+
+This phase is developed from a Linux host. Windows-only code cannot be compiled or run here:
+
+- Rust code under `#[cfg(target_os = "windows")]` is verified by review plus the Windows CI job (SW8), never by a local `cargo build`.
+- Node/TypeScript work unit tests run wherever they are platform-neutral; platform-specific behavior is tested through injected values (env, path sep, program name), not through the host.
+- Anything that needs a real Windows machine (window effects, tray, Credential Manager, WASAPI, UI Automation, the installer) is recorded as `blocked: needs Windows` in the task row and in the Log until observed. No such check is ever reported as passed.
+
+## Tasks
+
+| Task | Spec | Route | Status | Evidence | Scope |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| W1 | SW1, SW3 | inline (one pure decision + its two consumers) | done | `17138dd`; tree hash `0713f69d…`; `cargo test` 381 passed / 0 failed / 6 ignored (parent-verified, independent verifier); `pnpm typecheck` clean | `platform.rs` knows Windows (`Os::Windows`, `Os::CURRENT`, `panel_effect`, `panel_url`); `shell.rs` applies the effect and `status.rs` picks the tray glyph per OS |
+| W3 | SW8 | inline | pending | — | Windows CI job: `cargo check`/`test` on `windows-latest` + `pnpm test`, so Windows-only code has a verification channel |
+| W4 | SW2 | delegated writer | pending | — | Daemon: path separators, `.exe`/`.cmd` resolution, `cmd /C` instead of `/bin/sh -c`, `where` instead of `command -v`, `%USERPROFILE%` and drive letters |
+| W5 | SW2 | delegated writer | pending | — | Daemon: kill-tree (`taskkill /T` / job objects), `lsof` replacement, uid/gid and `chmod` guards |
+| W6 | SW1, SW2 | delegated writer | pending | — | Rust: gate `app_channel.rs`, `daemon.rs`, `disclaimed.rs`, `libc`, and the POSIX test helpers |
+| W7 | SW1, SW2 | delegated writer, high risk | pending | — | Replace the fd-3 Unix socketpair with a Windows channel (named pipe or loopback TCP + inherited handle) and document the S25 trust-model change |
+| W8 | SW1, SW3 | delegated writer | pending | — | `.cargo/config.toml` Windows targets, `icon.ico`, `tauri.windows.conf.json`, NSIS/MSI bundle target |
+| W9 | SW1, SW3 | delegated writer | pending | — | Shortcut remap (default is `Alt+Space`, which Windows reserves) and the glyph logic in `shortcut.rs`; autostart through the registry |
+| W10 | SW4 | delegated writer, high risk | pending | — | `secure_store/windows.rs` (Credential Manager / DPAPI) + the documented limit |
+| W11 | SW5 | delegated writer | pending | — | `TARGETS` + `stage-runtime.mjs` for Windows (Node `.zip`, `.cmd`/`.exe` shims, `;` PATH) and `package-windows.mjs` |
+| W12 | SW6 | delegated writer | pending | — | WASAPI capture backend and the Windows Parakeet path |
+| W13 | SW7 | explore → spec → implement | pending | — | Computer control on Windows: UI Automation, `SendInput`, Windows Graphics Capture, `WindowFromPoint`, per-monitor DPI |
+| W14 | SW8 | delegated writer | pending | — | `docs/install.md` Windows section, README badge and claims, `docs/windows-testing.md`, design updates |
+
+## Log
+
+- **L1 (2026-10-11, user):** "Qué necesitamos hacer para adaptar este proyecto a poder utilizarlo en windows, tengo windows 11, y aunque ahora estamos trabajando en wsl 2 o 3 porque se actualizó hace unos días, me interesa tenerlo en windows". Scope choice: **full parity with macOS** (all six phases), including computer control. Environment note: the current checkout lives on the WSL filesystem (`/home/Row/...`), so Windows builds need a Windows-side checkout over NTFS.
+
+- **L2 (2026-10-11, agent, evidence):** Read-only reconnaissance of the whole repository before any write. Findings, with evidence:
+  - No Windows support exists today: zero `#[cfg(windows)]` in the repo, no `icon.ico`, no `tauri.windows.conf.json`, and `scripts/package/lib.mjs:8-12` lists only `darwin-arm64`, `linux-arm64`, `linux-x64` while `scripts/package/test/lib.test.ts:30` asserts that `windows-x64` throws.
+  - `apps/desktop/src-tauri/src/platform.rs:6-14` defines `enum Os { MacOs, Linux }` and `Os::CURRENT` returns `Linux` for anything that is not macOS, so a Windows build would take every Linux branch (`effects=none`, `forced_gdk_backend`, `compositor_places_windows`).
+  - The app↔daemon private channel is a Unix socketpair on fd 3: `app_channel.rs:28`, `daemon.rs:16-18`, `daemon.rs:294-297`, with `pre_exec`, `dup2`, `close_range`, and `getrlimit` in `daemon.rs:313-380`. This does not compile on Windows and is the keystone of the port.
+  - `secure_store/mod.rs:110-117` has macOS (Keychain) and Linux (Secret Service) backends and falls back to `MemoryStore` everywhere else, so Windows would silently lose connector tokens on restart.
+  - Daemon POSIX surface: `chmod`/`mode` 0700/0600 in `daemon.ts`, `connectors.ts`, `profiles.ts`, `isolation.ts`; `spawn` with `{uid, gid}` (`supervisor.ts:221-225`); `execFileSync("/bin/sh", ["-c", …])` (`connector-credentials.ts:30`); `env.SHELL || "/bin/sh"` plus `command -v engram` (`runtime.ts:42`); `lsof` (`isolation.ts:228`); `SIGTERM`/`SIGKILL` kill-tree (`supervisor.ts:167-207`).
+  - Shell: `daemon.rs:223-226` builds a colon-joined `PATH` and `{root}/node/bin/node` with no `.exe`; `build.rs:28-47` records the build machine's `node`/`PATH` and its `find_in_path` has no `.exe` handling; `disclaimed.rs` is `posix_spawn` only; `libc` is unconditional.
+  - Packaging: `stage-runtime.mjs:131-160` downloads Node as `.tar.gz` and extracts with `tar`; `lib.mjs:162` generates `#!/bin/sh` wrappers with 0755.
+  - Voice: `voice/pipe.rs:23-27` records with `parec`/`arecord`; `voice/app.rs:133` already has `VoiceInput::unsupported()`.
+  - Computer control: `computer/macos.rs` (604 lines) is CGEvent/AXUIElement/ScreenCaptureKit with no shared surface; S24 declared macOS-only and put Linux out of scope.
+  - Free wins: the daemon, protocol, and UI are platform-neutral (Tauri access is behind `isTauri()` in `packages/ui/src/desktop.ts:2`); `main.rs:2` already sets `windows_subsystem = "windows"`; `pnpm-lock.yaml` resolves win32 binaries for biome, esbuild, rolldown, and the Tauri CLI; the external engine (`gentle-pi`) provisions a native Windows x64/arm64 runtime, Engram publishes Windows binaries, and sherpa-onnx publishes Windows x64/arm64 static libraries.
+  - Tests: 63 test files, many POSIX-only (`/bin/sleep` and `exec 3<&-` in `daemon.rs` tests, `lsof`, `secret-tool`), so several need platform guards.
+  - Recorded in Engram as the topic mirror of this document.
+
+- **L3 (2026-10-11, agent, decision):** W2 was absorbed into W1. The effect decision (`platform.rs`) and its consumer (`shell.rs`) cannot land separately: on its own, W1 told Windows to paint a translucent panel while `shell.rs` still applied `HudWindow` under `#[cfg(target_os = "macos")]`, leaving the panel transparent with no backdrop. One work unit, one coherent tree.
+
+- **L4 (2026-10-11, agent, evidence):** Two things checked in the `tauri` source rather than assumed.
+  - `Effect::Mica`, `Effect::Acrylic`, and `Effect::HudWindow` are all emitted by a macro in `tauri-utils-2.10.1/src/config.rs:4268-4295` with **no per-variant `cfg`**, so naming `Mica` compiles on macOS and Linux. The gating is at `tauri-2.12.1/src/vibrancy/mod.rs`: `#[cfg(windows)] mod windows;` and `#[cfg(target_os = "macos")] mod macos;`. Asking for a foreign material is a silent no-op, not an error, which is why this unit is verifiable from Linux.
+  - `WebviewWindowBuilder::effects` is documented `**Linux**: Unsupported` (`tauri-2.12.1/src/webview/webview_window.rs:851`). `with_panel_effects` therefore returns the Linux builder untouched instead of handing Tauri an empty effect list.
+
+- **L5 (2026-10-11, agent, evidence):** W1 closed in `17138dd` (3 files, +113/−21). An independent verifier, bound to the tree hash `0713f69d5a2b5c03d0cb667436a0ae76837524e88cd9658ebacd222565b70b4b` (recorded before its run and confirmed unchanged after), reported:
+  - `cargo test` in `apps/desktop/src-tauri`: compiled, **381 passed, 0 failed, 6 ignored**; the five new/changed tests were observed passing by name. This host has the GTK/WebKit2/dbus libraries, so the suite is a usable channel here.
+  - `pnpm typecheck`: clean, exit 0. Note for later units: `npx tsc -b` is **not** a valid invocation in this repo (npx resolves an unrelated `tsc` package); use `pnpm typecheck`.
+  - `has_vibrancy` has zero remaining references, and both `match`es over `Os` (`platform.rs:37`, `status.rs:34`) are exhaustive over all three variants with no wildcard, so adding an OS is a compile error until it is decided.
+  - macOS behavior is unchanged: the `HudWindow` + `Active` + `radius(20.0)` config is byte-identical, and `panel_url(Os::MacOs)` is the same string.
+  - `Effect::Mica` is available on every target: `pub enum WindowEffect` at `tauri-utils-2.10.1/src/lib.rs:71` carries only `#[non_exhaustive]`, with `Mica` at `:123` and no `#[cfg]`.
+  - **Not verified, and not to be reported as such:** no `cfg!(target_os = "windows")` arm has ever been compiled, `Os::CURRENT` resolved to `Linux` during the tests, and Windows runtime behavior (Mica on Windows 11, no Mica on Windows 10) has never been observed on hardware. W3 is the channel that closes this gap.
+  - Side effect worth knowing: `pnpm typecheck` triggered an implicit dependency install into `node_modules/` (untracked); the tracked tree hash was unaffected.
