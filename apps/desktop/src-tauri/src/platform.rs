@@ -1,19 +1,49 @@
 //! Platform decisions for the desktop shell (design §9), kept pure so they are tested on
 //! every OS: the GDK backend on Linux, who places the windows, the panel URL, and what a
 //! second launch (`gentle-dot --toggle`) asks the running app to do.
+//!
+//! The OS-agnostic decisions live here; translating one into a Tauri type is the caller's job
+//! (`shell.rs` maps [`WindowEffect`] onto `tauri::window::Effect`). Nothing in this module names
+//! a platform crate, which is what lets the Windows branches be tested on macOS and Linux.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {
     MacOs,
     Linux,
+    Windows,
+}
+
+/// The backdrop the panel asks the window system for. Windows 11 blurs with `Mica`, macOS with
+/// the `HudWindow` material, and Linux gets nothing: neither X11 nor Wayland can be relied on to
+/// composite a translucent panel, so the UI paints an opaque background instead (design §9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowEffect {
+    Mica,
+    HudWindow,
+    None,
 }
 
 impl Os {
-    pub const CURRENT: Os = if cfg!(target_os = "macos") { Os::MacOs } else { Os::Linux };
+    pub const CURRENT: Os = if cfg!(target_os = "macos") {
+        Os::MacOs
+    } else if cfg!(target_os = "windows") {
+        Os::Windows
+    } else {
+        Os::Linux
+    };
 
-    /// Only macOS blurs the desktop behind the panel (`HudWindow`); Linux has no window effects.
-    pub fn has_vibrancy(self) -> bool {
-        self == Os::MacOs
+    /// The panel's backdrop on this OS. `None` means the panel must paint an opaque background.
+    pub fn panel_effect(self) -> WindowEffect {
+        match self {
+            Os::MacOs => WindowEffect::HudWindow,
+            Os::Windows => WindowEffect::Mica,
+            Os::Linux => WindowEffect::None,
+        }
+    }
+
+    /// Whether the window system blurs the desktop behind the panel.
+    pub fn has_panel_effect(self) -> bool {
+        self.panel_effect() != WindowEffect::None
     }
 }
 
@@ -21,9 +51,10 @@ impl Os {
 pub const DOT_TITLE: &str = "Gentle Dot";
 pub const PANEL_TITLE: &str = "Gentle Dot Panel";
 
-/// The panel page. Without vibrancy, `effects=none` makes the UI paint an opaque background.
+/// The panel page. Without a backdrop effect, `effects=none` makes the UI paint an opaque
+/// background.
 pub fn panel_url(os: Os) -> &'static str {
-    if os.has_vibrancy() {
+    if os.has_panel_effect() {
         "index.html?surface=panel"
     } else {
         "index.html?surface=panel&effects=none"
@@ -176,16 +207,33 @@ mod tests {
     }
 
     #[test]
-    fn the_panel_uses_vibrancy_only_on_macos() {
-        assert!(Os::MacOs.has_vibrancy());
-        assert!(!Os::Linux.has_vibrancy());
+    fn every_os_picks_its_own_panel_backdrop() {
+        assert_eq!(Os::MacOs.panel_effect(), WindowEffect::HudWindow);
+        assert_eq!(Os::Windows.panel_effect(), WindowEffect::Mica);
+        assert_eq!(Os::Linux.panel_effect(), WindowEffect::None);
+        // Only the OS with no backdrop effect asks the UI for an opaque background.
         assert_eq!(panel_url(Os::MacOs), "index.html?surface=panel");
+        assert_eq!(panel_url(Os::Windows), "index.html?surface=panel");
         assert_eq!(panel_url(Os::Linux), "index.html?surface=panel&effects=none");
     }
 
     #[test]
+    fn has_panel_effect_agrees_with_the_effect_it_names() {
+        for os in [Os::MacOs, Os::Windows, Os::Linux] {
+            assert_eq!(os.has_panel_effect(), os.panel_effect() != WindowEffect::None, "{os:?}");
+        }
+    }
+
+    #[test]
     fn current_os_matches_the_build_target() {
-        assert_eq!(Os::CURRENT == Os::MacOs, cfg!(target_os = "macos"));
+        let expected = if cfg!(target_os = "macos") {
+            Os::MacOs
+        } else if cfg!(target_os = "windows") {
+            Os::Windows
+        } else {
+            Os::Linux
+        };
+        assert_eq!(Os::CURRENT, expected);
     }
 
     #[test]

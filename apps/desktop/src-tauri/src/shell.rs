@@ -10,7 +10,7 @@ use crate::computer::session::Reason;
 use crate::config::{self, ConnectionInfo, DesktopConfig, DEFAULT_SHORTCUT};
 use crate::daemon::{self, Daemon, RestartOutcome};
 use crate::geometry::{self, Rect};
-use crate::platform::{self, LaunchRequest, Os, DOT_TITLE, PANEL_TITLE};
+use crate::platform::{self, LaunchRequest, Os, WindowEffect, DOT_TITLE, PANEL_TITLE};
 use crate::position::{self, DotPosition};
 use crate::secure_store::{self, SecretStore};
 use crate::shortcut;
@@ -24,7 +24,6 @@ use std::time::Duration;
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
-#[cfg(target_os = "macos")]
 use tauri::window::{Effect, EffectState, EffectsBuilder};
 use tauri::{
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, RunEvent, WebviewUrl, WebviewWindow,
@@ -474,6 +473,28 @@ fn spawn_snapper(app: AppHandle) -> mpsc::Sender<()> {
     tx
 }
 
+/// The panel's backdrop, translated from the OS-agnostic decision in `platform` (design §9).
+///
+/// Tauri applies only the material that belongs to the host OS, so naming another one is a
+/// silent no-op rather than an error, and Linux keeps the builder exactly as it was
+/// (`WebviewWindowBuilder::effects` is documented as unsupported there). Windows 10 has no
+/// `Mica`; until W8 is verified on a real Windows machine, the panel keeps the translucent URL
+/// and therefore still paints its own background.
+fn with_panel_effects<'a, R: tauri::Runtime, M: tauri::Manager<R>>(
+    panel: WebviewWindowBuilder<'a, R, M>,
+    os: Os,
+) -> WebviewWindowBuilder<'a, R, M> {
+    match os.panel_effect() {
+        WindowEffect::Mica => {
+            panel.effects(EffectsBuilder::new().effect(Effect::Mica).state(EffectState::Active).build())
+        }
+        WindowEffect::HudWindow => panel.effects(
+            EffectsBuilder::new().effect(Effect::HudWindow).state(EffectState::Active).radius(20.0).build(),
+        ),
+        WindowEffect::None => panel,
+    }
+}
+
 fn build_windows(
     app: &AppHandle,
     config: &DesktopConfig,
@@ -510,9 +531,7 @@ fn build_windows(
         // Lets the chat receive HTML5 drops of attachments (S31); Tauri's own handler would take them.
         .disable_drag_drop_handler()
         .visible(false);
-    #[cfg(target_os = "macos")]
-    let panel = panel
-        .effects(EffectsBuilder::new().effect(Effect::HudWindow).state(EffectState::Active).radius(20.0).build());
+    let panel = with_panel_effects(panel, Os::CURRENT);
     panel.build()?;
 
     if !places_windows {
