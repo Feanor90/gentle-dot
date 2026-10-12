@@ -1,0 +1,37 @@
+# Windows support for Gentle Dot
+
+Port the desktop app (Tauri 2 shell + Node daemon) to Windows 10/11 x64 without weakening the security model of `docs/design.md` (§4 App channel, Secrets, Integrity; §8).
+Delivered in phases as chained PRs from a fork (`Feanor90/gentle-dot`, branch per phase) toward `Gentleman-Programming/gentle-dot`. Engram mirror: `odd/windows-support/tasks`.
+
+## Specs
+
+- S1 (L1): "Finalmente esto es para mac como comprobarás después de analizar toda la documentación, entonces el proyecto sería si podemos adapatar esto a windows."
+- S2 (L2): "redacta un buen plan hermano para implementar esto, ves dejandolo todo en orden en engram par ano perder nada."
+- S3 (L3, proposed by the agent, accepted as the working order): deliver in phases — Phase 1 "secure base" (build, app channel, secret store, file privacy, daemon lifecycle, tray, shortcut, installer; no computer control, as on Linux today), Phase 2 voice, Phase 3 computer control.
+- S4 (derived from S1 + upstream design §4/§8): every security property the upstream docs claim on macOS/Linux either holds on Windows with an equivalent mechanism and a test, or is documented as a Windows limit in `docs/install.md` and `docs/design.md`, the way S25.7 documents the Linux keyring limit. Never a silent fallback to a weaker store (no secrets in files).
+- S5 (derived from S1): existing macOS and Linux behavior is unchanged; every change to shared code (`platform.rs`, `daemon.rs`, `app_channel.rs`, `shell.rs`, `app-channel.ts`, `isolation.ts`, `private-file.ts`) keeps the current tests passing on those targets (Linux checked in Docker with `scripts/package/linux-cargo-check.mjs`; macOS flagged as unverified locally).
+
+## Tasks
+
+| ID | Specs | Phase | Task | Route | Commit |
+|---|---|---|---|---|---|
+| T0 | S1 | 0 | Fork + branch setup; baseline on Windows: `pnpm install`, `pnpm typecheck`, `pnpm lint`, `pnpm test`, `cargo check` for `x86_64-pc-windows-msvc`; record every failure as the Windows gap list in the Log | inline | — |
+| T1 | S1,S4 | 1 | Spike: app channel on Windows. Rust creates a duplex pipe and passes one end as CRT fd 3 (STARTUPINFO `lpReserved2`, the format libuv/Node read), restricted with `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`; prove `new net.Socket({fd: 3})` works in the daemon and that no daemon child inherits it (Windows analog of `app-channel-fd.test.ts`). Fallback to evaluate only if it fails: owner-only DACL named pipe, single instance, `PIPE_REJECT_REMOTE_CLIENTS`, with the race documented | explore + inline spike | — |
+| T2 | S1,S4,S5 | 1 | Make the desktop crate compile on Windows: `Os::Windows` in `platform.rs`; split unix-only code (`UnixStream`, `OwnedFd`, `libc`, `disclaimed.rs`, `cloexec_from`) behind `cfg(unix)`; Windows stubs return explicit "unsupported" errors, never silent success | worker | |
+| T3 | S1,S4 | 1 | Implement the T1 channel: `app_channel.rs` / `daemon.rs` Windows spawn + `app-channel.ts` probe; daemon stops when the channel closes (S35.2) | worker | |
+| T4 | S1,S4 | 1 | Secret store `secure_store/windows.rs`: Windows Credential Manager (generic credentials, target `dev.gentleman.gentle-dot.connectors/<id>`), same `SecretStore` trait and redaction rules; document the same-user readability limit like S25.7 | worker + verify | |
+| T5 | S1,S4 | 1 | Daemon lifecycle on Windows: `process_started` via `GetProcessTimes`, stop via channel close then `TerminateProcess` after grace, Job Object (`KILL_ON_JOB_CLOSE`), atomic pid file | worker | |
+| T6 | S1,S4,S5 | 1 | File privacy and isolation in the daemon: owner-only DACL for the data dir, `token`, `connectors.json`, logs (mode bits are no-ops on Windows); isolate `USERPROFILE`, `APPDATA`, `LOCALAPPDATA` like `HOME`/`XDG_*`; replace `lsof` in `isolation.ts`; approval-guard command checks for Windows spellings (backslashes, `cmdkey`, `vaultcmd`, `%USERPROFILE%\.gentle-dot`) | worker + verify | |
+| T7 | S1,S5 | 1 | Desktop shell on Windows: tray glyphs (no template tinting), `Alt+Space` global shortcut, panel effects (Mica/Acrylic or `effects=none`), autostart, single instance + `--toggle`, DPI-correct Dot placement and snapping, native approval dialogs | worker | |
+| T8 | S1 | 1 | Packaging: `stage-runtime` for `win32-x64` (Node, gentle-pi, Engram), `scripts/package/package-win.mjs` (NSIS), smoke test of the installed daemon | worker | |
+| T9 | S1,S4 | 1 | Docs: Windows section in `docs/install.md`, Windows notes in `docs/design.md` and `apps/desktop/README.md`, README platform badge | inline with T2–T8 | |
+| T10 | S1 | 2 | Voice on Windows: local Parakeet (sherpa-onnx) and the OpenAI-key path; native recognizer unavailable with a clear reason | worker | |
+| T11 | S1,S4 | 3 | Computer control design for Windows (capture: Windows Graphics Capture + `SetWindowDisplayAffinity` exclusion; input: `SendInput`; risk checks: UI Automation; blocklist: Windows Security, Credential Manager, `consent.exe`, password managers, Settings; glow overlay: layered, transparent, no-activate topmost window). Split into tasks before implementing | explore + plan | — |
+
+## Log
+
+- L1 (user, 2026-10-12): "Hola hermano mira lo primero iniciemos esto como repo git, dos vamos a clonar este repo que te paso: https://github.com/Gentleman-Programming/gentle-dot.git , después lee la documentación, seguridad, requisitos, etc etc. Finalmente esto es para mac como comprobarás después de analizar toda la documentación, entonces el proyecto sería si podemos adapatar esto a windows."
+- L2 (user, 2026-10-12): "Ok perfecto redacta un buen plan hermano para implementar esto, ves dejandolo todo en orden en engram par ano perder nada. Luego como siempre trabaja bien según tu instrucciones. Con respecto al fork, tu como lo harías ??"
+- L3 (agent): upstream is macOS + Linux + Web at `8cb20ee`. Windows gaps found by reading: Unix socketpair on fd 3 for the app channel; secret store only Keychain/Secret Service; pid start time via `proc_pidinfo`/`/proc`; `lsof`; POSIX modes; `platform.rs` knows only macOS/Linux; computer control and the native recognizer are macOS-only; no Windows packaging. `computer/windows.rs` is the macOS window list, not Windows.
+- L4 (agent): local toolchain: Node 24.15, pnpm 11.5, rustc 1.93 `stable-x86_64-pc-windows-msvc`, Visual Studio 2019/2022, `gh` logged in as Feanor90. Fork proposal pending user confirmation.
+- L5 (user, 2026-10-12): approved "Sí, adelante": fork in Feanor90, clone = fork, remove the empty root `.git`. Done: fork `https://github.com/Feanor90/gentle-dot`, working copy `C:/The_Magnificient_One/IA/Proyectos/Gentle-Dot/gentle-dot`, `origin` = fork, `upstream` = original, branch `feat/windows-support` from `8cb20ee`. Upstream issue not opened yet (user decision).
