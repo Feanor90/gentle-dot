@@ -41,3 +41,16 @@ export function expectPosixLstatMode(path: string, mode: number, platform: strin
 	}
 	expect(lstatSync(path).mode & 0o777).toBe(mode);
 }
+
+/**
+ * Asserts that `path` carries every execute bit, or loudly skips on a platform without POSIX
+ * modes. Windows has no executable bit: there, whether a file can be run is a matter of its
+ * extension, so the assertion is skipped and the wrapper becomes a `.cmd` in the packaging work.
+ */
+export function expectPosixExecutable(path: string, platform: string = process.platform): void {
+	if (!hasPosixModes(platform)) {
+		warnSkipped();
+		return;
+	}
+	expect(statSync(path).mode & 0o111).toBe(0o111);
+}

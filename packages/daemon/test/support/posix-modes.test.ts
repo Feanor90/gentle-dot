@@ -4,7 +4,12 @@ import { chmodSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { tempDir } from "../helpers.ts";
-import { expectPosixLstatMode, expectPosixMode, hasPosixModes } from "./posix-modes.ts";
+import {
+	expectPosixExecutable,
+	expectPosixLstatMode,
+	expectPosixMode,
+	hasPosixModes,
+} from "./posix-modes.ts";
 
 describe("posix mode helper", () => {
 	it("knows which platforms carry POSIX mode bits", () => {
@@ -20,6 +25,10 @@ describe("posix mode helper", () => {
 		expectPosixMode(file, 0o600, "linux");
 		expectPosixLstatMode(file, 0o600, "linux");
 		expect(() => expectPosixMode(file, 0o644, "linux")).toThrow();
+		chmodSync(file, 0o755);
+		expectPosixExecutable(file, "linux");
+		chmodSync(file, 0o644);
+		expect(() => expectPosixExecutable(file, "linux")).toThrow();
 	});
 
 	it("skips and warns exactly once on Windows, for stat and lstat alike", () => {
@@ -31,6 +40,7 @@ describe("posix mode helper", () => {
 			expect(() => expectPosixMode(file, 0o600, "win32")).not.toThrow();
 			expect(() => expectPosixLstatMode(file, 0o600, "win32")).not.toThrow();
 			expect(() => expectPosixMode(file, 0o644, "win32")).not.toThrow();
+			expect(() => expectPosixExecutable(file, "win32")).not.toThrow();
 			expect(warn).toHaveBeenCalledTimes(1);
 			expect(warn.mock.calls[0]?.[0]).toContain("odd/tasks/windows-port.md");
 			expect(warn.mock.calls[0]?.[0]).toContain("ACL");

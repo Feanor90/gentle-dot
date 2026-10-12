@@ -6,7 +6,6 @@ import {
 	readdirSync,
 	readFileSync,
 	realpathSync,
-	statSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
@@ -14,6 +13,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
 import { tempDir } from "./helpers.ts";
+import { expectPosixExecutable } from "./support/posix-modes.ts";
 
 const PACKAGE = fileURLToPath(new URL("..", import.meta.url));
 const BUILD = join(PACKAGE, "scripts", "build-runtime.ts");
@@ -105,7 +105,7 @@ describe("build:runtime", () => {
 	});
 
 	it("emits a `pi` wrapper that runs the runtime's node and engine wherever the runtime is", () => {
-		expect(statSync(join(out, "bin", "pi")).mode & 0o111).toBe(0o111);
+		expectPosixExecutable(join(out, "bin", "pi"));
 		const moved = tempDir();
 		mkdirSync(join(moved, "bin"));
 		mkdirSync(join(moved, "node", "bin"), { recursive: true });
