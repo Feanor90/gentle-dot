@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import type { ServerMessage } from "@gentle-dot/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -12,6 +12,7 @@ import {
 } from "../src/daemon.ts";
 import { HIDDEN_NAMES, presentText } from "../src/white-label.ts";
 import { FAKE_AGENT, tempDir, waitFor } from "./helpers.ts";
+import { expectPosixMode } from "./support/posix-modes.ts";
 
 const daemons: DotDaemon[] = [];
 afterEach(async () => {
@@ -539,7 +540,7 @@ describe("own instance", () => {
 			// Subagents on, behind the proxy and with the guard (S25.4).
 			GENTLE_PI_AGENTS: "1",
 		});
-		expect(statSync(home).mode & 0o777).toBe(0o700);
+		expectPosixMode(home, 0o700);
 		expect(existsSync(join(dataDir, "workspace"))).toBe(true);
 	});
 
@@ -550,8 +551,8 @@ describe("own instance", () => {
 		writeFileSync(join(dataDir, "token"), `${"k".repeat(43)}\n`, { mode: 0o644 });
 		chmodSync(join(dataDir, "token"), 0o644);
 		expect(ensureToken(dataDir)).toBe("k".repeat(43));
-		expect(statSync(dataDir).mode & 0o777).toBe(0o700);
-		expect(statSync(join(dataDir, "token")).mode & 0o777).toBe(0o600);
+		expectPosixMode(dataDir, 0o700);
+		expectPosixMode(join(dataDir, "token"), 0o600);
 	});
 
 	it("shows the access key only on an interactive terminal", () => {
