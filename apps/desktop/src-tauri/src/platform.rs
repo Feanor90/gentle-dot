@@ -6,12 +6,20 @@
 pub enum Os {
     MacOs,
     Linux,
+    Windows,
 }
 
 impl Os {
-    pub const CURRENT: Os = if cfg!(target_os = "macos") { Os::MacOs } else { Os::Linux };
+    pub const CURRENT: Os = if cfg!(target_os = "macos") {
+        Os::MacOs
+    } else if cfg!(windows) {
+        Os::Windows
+    } else {
+        Os::Linux
+    };
 
-    /// Only macOS blurs the desktop behind the panel (`HudWindow`); Linux has no window effects.
+    /// Only macOS blurs the desktop behind the panel (`HudWindow`); Linux and Windows have no window
+    /// effects here.
     pub fn has_vibrancy(self) -> bool {
         self == Os::MacOs
     }
@@ -179,13 +187,17 @@ mod tests {
     fn the_panel_uses_vibrancy_only_on_macos() {
         assert!(Os::MacOs.has_vibrancy());
         assert!(!Os::Linux.has_vibrancy());
+        assert!(!Os::Windows.has_vibrancy());
         assert_eq!(panel_url(Os::MacOs), "index.html?surface=panel");
         assert_eq!(panel_url(Os::Linux), "index.html?surface=panel&effects=none");
+        assert_eq!(panel_url(Os::Windows), "index.html?surface=panel&effects=none");
     }
 
     #[test]
     fn current_os_matches_the_build_target() {
         assert_eq!(Os::CURRENT == Os::MacOs, cfg!(target_os = "macos"));
+        assert_eq!(Os::CURRENT == Os::Linux, cfg!(target_os = "linux"));
+        assert_eq!(Os::CURRENT == Os::Windows, cfg!(windows));
     }
 
     #[test]

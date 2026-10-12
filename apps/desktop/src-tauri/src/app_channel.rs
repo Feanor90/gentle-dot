@@ -25,13 +25,51 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 /// Where the daemon finds its end of the channel.
 pub const APP_FD: i32 = 3;
+
+/// The app's end of the channel: one of a connected pair of Unix sockets.
+#[cfg(unix)]
+pub type ChannelStream = std::os::unix::net::UnixStream;
+
+/// The app's end of the channel on Windows, which has none yet: the type has no values, so no
+/// channel can be opened and a daemon that needs one is not started (`daemon::channel_pair`).
+#[cfg(windows)]
+#[derive(Debug)]
+pub enum ChannelStream {}
+
+#[cfg(windows)]
+impl ChannelStream {
+    pub fn try_clone(&self) -> io::Result<Self> {
+        match *self {}
+    }
+
+    pub fn shutdown(&self, _how: Shutdown) -> io::Result<()> {
+        match *self {}
+    }
+}
+
+#[cfg(windows)]
+impl Read for ChannelStream {
+    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+        match *self {}
+    }
+}
+
+#[cfg(windows)]
+impl Write for ChannelStream {
+    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+        match *self {}
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match *self {}
+    }
+}
 /// A command may wait for a native confirmation (120 s) before the daemon answers.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(150);
 /// Registering the computer helper waits for the daemon to start reading the channel.
@@ -146,7 +184,7 @@ pub(crate) fn serve_secret(store: &dyn SecretStore, method: &str, params: &Value
 type Reply = mpsc::Sender<Result<Value, String>>;
 
 pub struct AppChannel {
-    writer: Mutex<UnixStream>,
+    writer: Mutex<ChannelStream>,
     pending: Mutex<HashMap<u64, Reply>>,
     next: AtomicU64,
     open: AtomicBool,
@@ -154,7 +192,7 @@ pub struct AppChannel {
 
 impl AppChannel {
     /// Reads `stream` on a thread of its own; each daemon request runs on a worker thread.
-    pub fn start(stream: UnixStream, handler: Arc<dyn Handler>) -> io::Result<Arc<Self>> {
+    pub fn start(stream: ChannelStream, handler: Arc<dyn Handler>) -> io::Result<Arc<Self>> {
         let reader = stream.try_clone()?;
         let channel = Arc::new(AppChannel {
             writer: Mutex::new(stream),
@@ -226,7 +264,7 @@ impl AppChannel {
         self.writer.lock().unwrap_or_else(PoisonError::into_inner).write_all(&line)
     }
 
-    fn read(self: Arc<Self>, mut reader: BufReader<UnixStream>, handler: Arc<dyn Handler>) {
+    fn read(self: Arc<Self>, mut reader: BufReader<ChannelStream>, handler: Arc<dyn Handler>) {
         let mut line = Vec::new();
         loop {
             line.clear();
@@ -288,12 +326,14 @@ impl AppChannel {
     }
 }
 
-#[cfg(test)]
+// The tests drive the channel over a Unix socket pair.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::approvals::fake::{Answer, FakePrompt};
     use crate::approvals::{Approvals, Decision};
     use crate::secure_store::{MemoryStore, MAX_ID_LEN};
+    use std::os::unix::net::UnixStream;
     use std::time::Instant;
 
     /// The daemon's side of the pair, read and written frame by frame.

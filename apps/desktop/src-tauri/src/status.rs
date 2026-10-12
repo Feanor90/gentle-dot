@@ -5,7 +5,8 @@ use crate::platform::Os;
 /// The menu bar rose (`docs/brand/rose-glyph.svg`), one image per state family,
 /// rendered by `apps/desktop/scripts/make-icon.mjs`. On macOS they are 36 px template
 /// images, drawn at 18 pt on Retina menu bars. Linux panels can be light or dark and
-/// do not tint icons, so Linux gets 32 px glyphs in a light gray with a dark outline.
+/// do not tint icons, so Linux gets 32 px glyphs in a light gray with a dark outline, and so does
+/// the Windows notification area, which does not tint them either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayGlyph {
     Ready,
@@ -30,10 +31,10 @@ impl TrayGlyph {
     pub fn image(self, os: Os) -> &'static [u8] {
         match (os, self) {
             (Os::MacOs, _) => self.png(),
-            (Os::Linux, Self::Ready) => include_bytes!("../icons/tray/linux/ready.png"),
-            (Os::Linux, Self::Working) => include_bytes!("../icons/tray/linux/working.png"),
-            (Os::Linux, Self::NeedsYou) => include_bytes!("../icons/tray/linux/needs-you.png"),
-            (Os::Linux, Self::Unavailable) => include_bytes!("../icons/tray/linux/unavailable.png"),
+            (Os::Linux | Os::Windows, Self::Ready) => include_bytes!("../icons/tray/linux/ready.png"),
+            (Os::Linux | Os::Windows, Self::Working) => include_bytes!("../icons/tray/linux/working.png"),
+            (Os::Linux | Os::Windows, Self::NeedsYou) => include_bytes!("../icons/tray/linux/needs-you.png"),
+            (Os::Linux | Os::Windows, Self::Unavailable) => include_bytes!("../icons/tray/linux/unavailable.png"),
         }
     }
 }
@@ -141,6 +142,14 @@ mod tests {
     fn only_the_macos_menu_bar_tints_template_glyphs() {
         assert!(is_template(Os::MacOs));
         assert!(!is_template(Os::Linux));
+        assert!(!is_template(Os::Windows));
+    }
+
+    #[test]
+    fn the_windows_notification_area_gets_the_untinted_32_px_glyphs() {
+        for glyph in [TrayGlyph::Ready, TrayGlyph::Working, TrayGlyph::NeedsYou, TrayGlyph::Unavailable] {
+            assert_eq!(glyph.image(Os::Windows), glyph.image(Os::Linux), "{glyph:?}");
+        }
     }
 
     #[test]

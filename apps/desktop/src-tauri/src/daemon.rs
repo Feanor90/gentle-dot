@@ -9,13 +9,14 @@
 //! [`foreign_daemon_message`], which names the exit. An app without a channel attaches as before.
 
 pub use crate::app_channel::APP_FD;
-use crate::app_channel::{AppChannel, Handler};
+use crate::app_channel::{AppChannel, ChannelStream, Handler};
 use crate::health::check_health;
 use std::fs::{self, File, OpenOptions};
 use std::io;
+#[cfg(unix)]
 use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus};
 use std::sync::{Arc, Mutex};
@@ -90,14 +91,8 @@ pub fn record_launch(data_dir: &Path, pid: u32) -> io::Result<()> {
     let started = process_started(pid).ok_or_else(|| io::Error::other("the assistant is not running"))?;
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let temp = data_dir.join(format!(".{PID_FILE}.{}.{nanos}", std::process::id()));
-    let written = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&temp)
+    let written = create_private_new(&temp)
         .and_then(|mut file| {
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
             use std::io::Write;
             writeln!(file, "{pid} {started}")
         })
@@ -108,25 +103,43 @@ pub fn record_launch(data_dir: &Path, pid: u32) -> io::Result<()> {
     written
 }
 
+/// A new file at `path`, 0600, never opened through a symlink there.
+#[cfg(unix)]
+fn create_private_new(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+/// A new file at `path`: `create_new` refuses any entry already there, a symlink included. It takes
+/// the data folder's access list.
+#[cfg(windows)]
+fn create_private_new(path: &Path) -> io::Result<File> {
+    OpenOptions::new().write(true).create_new(true).open(path)
+}
+
 /// A pid file holds `<pid> <start time>`, far below this.
 const PID_FILE_MAX: u64 = 64;
 
 /// Whether a pid read from the pid file may name a daemon to signal: never this app, its parent,
 /// init, or the kernel.
+#[cfg(unix)]
 fn may_be_daemon(pid: u32) -> bool {
     // SAFETY: getppid(2) has no preconditions.
     let parent = u32::try_from(unsafe { libc::getppid() }).ok();
     pid > 1 && pid != std::process::id() && Some(pid) != parent
 }
 
+/// On Windows pid 0 is the idle process and 4 the kernel.
+#[cfg(windows)]
+fn may_be_daemon(pid: u32) -> bool {
+    pid > 4 && pid != std::process::id()
+}
+
 /// The daemon the pid file names, if it holds a launch. Only a small regular file is read: a
 /// symlink, a FIFO, or anything else there is ignored (opened without following or blocking).
 pub fn recorded_launch(data_dir: &Path) -> Option<Launched> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(data_dir.join(PID_FILE))
-        .ok()?;
+    let file = open_without_following(&data_dir.join(PID_FILE)).ok()?;
     let meta = file.metadata().ok()?;
     if !meta.file_type().is_file() || meta.len() > PID_FILE_MAX {
         return None;
@@ -136,6 +149,21 @@ pub fn recorded_launch(data_dir: &Path) -> Option<Launched> {
     let mut parts = text.split_whitespace();
     let launched = Launched { pid: parts.next()?.parse().ok()?, started: parts.next()?.parse().ok()? };
     (parts.next().is_none() && may_be_daemon(launched.pid)).then_some(launched)
+}
+
+/// Opens `path` for reading without following a symlink or blocking on a FIFO.
+#[cfg(unix)]
+fn open_without_following(path: &Path) -> io::Result<File> {
+    OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)
+}
+
+/// Opens `path` for reading; a symlink there is opened itself (`FILE_FLAG_OPEN_REPARSE_POINT`),
+/// never its target, so its metadata is not a regular file's.
+#[cfg(windows)]
+fn open_without_following(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(path)
 }
 
 /// The recorded daemon, while that same process still runs (a reused pid has another start time).
@@ -152,6 +180,7 @@ fn forget_launch(data_dir: &Path, pid: u32) {
 
 /// SIGTERM to a recorded daemon that is not this app's child, then SIGKILL after `grace`.
 /// Only the process the record names: a pid now used by another process is left alone.
+#[cfg(unix)]
 fn stop_orphan(launch: Launched, grace: Duration) {
     let Ok(pid) = libc::pid_t::try_from(launch.pid) else {
         return;
@@ -172,6 +201,11 @@ fn stop_orphan(launch: Launched, grace: Duration) {
         }
     }
 }
+
+/// Windows records no start time yet ([`process_started`] is `None`), so [`live_orphan`] finds no
+/// orphan and nothing calls this.
+#[cfg(windows)]
+fn stop_orphan(_launch: Launched, _grace: Duration) {}
 
 /// What [`Daemon::ensure_running`] does, from what it finds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,12 +286,20 @@ pub fn runtime_dir(env: impl Fn(&str) -> Option<String>, resource_dir: Option<Pa
 
 /// Opens `<data_dir>/daemon.log` for appending. The folder is 0700 and the log
 /// 0600 (looser modes are repaired) because the daemon's output is private.
+#[cfg(unix)]
 pub fn open_private_log(data_dir: &Path) -> io::Result<File> {
     fs::DirBuilder::new().recursive(true).mode(0o700).create(data_dir)?;
     fs::set_permissions(data_dir, fs::Permissions::from_mode(0o700))?;
     let log = OpenOptions::new().create(true).append(true).mode(0o600).open(data_dir.join("daemon.log"))?;
     log.set_permissions(fs::Permissions::from_mode(0o600))?;
     Ok(log)
+}
+
+/// Opens `<data_dir>/daemon.log` for appending; both take the user profile's access list.
+#[cfg(windows)]
+pub fn open_private_log(data_dir: &Path) -> io::Result<File> {
+    fs::create_dir_all(data_dir)?;
+    OpenOptions::new().create(true).append(true).open(data_dir.join("daemon.log"))
 }
 
 /// A spawned process the app polls, stops, and reaps: a `std::process::Child`, or on macOS a
@@ -291,7 +333,9 @@ impl ChildProcess for Child {
 
 /// A connected pair of Unix sockets: the app's end, and the daemon's, numbered above [`APP_FD`] so
 /// placing it on fd 3 in the child never collides with it. Both are close-on-exec here.
-pub fn channel_pair() -> io::Result<(UnixStream, OwnedFd)> {
+#[cfg(unix)]
+pub fn channel_pair() -> io::Result<(ChannelStream, OwnedFd)> {
+    use std::os::unix::net::UnixStream;
     let (app, daemon) = UnixStream::pair()?;
     let daemon = OwnedFd::from(daemon);
     use std::os::fd::AsRawFd;
@@ -305,6 +349,20 @@ pub fn channel_pair() -> io::Result<(UnixStream, OwnedFd)> {
     }
     // SAFETY: `copy` is a fresh descriptor nobody else owns.
     Ok((app, unsafe { OwnedFd::from_raw_fd(copy) }))
+}
+
+/// Why a daemon that needs the app's channel is not started on Windows.
+pub const CHANNEL_UNSUPPORTED: &str = "the app's private channel to the assistant is not available on Windows yet";
+
+/// The daemon's end of the channel on Windows, which has none yet (see [`ChannelStream`]).
+#[cfg(windows)]
+#[derive(Debug)]
+pub enum DaemonEnd {}
+
+/// Always refused on Windows, so a daemon that needs a channel is never started without one.
+#[cfg(windows)]
+pub fn channel_pair() -> io::Result<(ChannelStream, DaemonEnd)> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, CHANNEL_UNSUPPORTED))
 }
 
 /// Starts the daemon with stdin from `/dev/null`, its output in `log`, and `channel` (from
@@ -321,7 +379,7 @@ fn spawn_daemon(spec: &LaunchSpec, log: File, channel: Option<BorrowedFd<'_>>) -
 /// descriptor some library of the app opened without close-on-exec never reaches the daemon. Node
 /// then marks fd 3 close-on-exec at its own startup (libuv's `uv_disable_stdio_inheritance`), so
 /// the daemon's children never get it either (`app-channel.ts` `childInherits` checks that).
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn spawn_daemon(spec: &LaunchSpec, log: File, channel: Option<BorrowedFd<'_>>) -> io::Result<Box<dyn ChildProcess>> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
@@ -355,7 +413,7 @@ fn spawn_daemon(spec: &LaunchSpec, log: File, channel: Option<BorrowedFd<'_>>) -
 
 /// Marks every descriptor from `first` up close-on-exec. Called between fork and exec: system
 /// calls only.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn cloexec_from(first: libc::c_int) {
     #[cfg(target_os = "linux")]
     if let Ok(low) = libc::c_uint::try_from(first) {
@@ -379,7 +437,29 @@ fn cloexec_from(first: libc::c_int) {
     }
 }
 
+/// Starts the daemon without a window, with stdin from `NUL` and its output in `log`. There is no
+/// channel to pass ([`channel_pair`] refuses).
+#[cfg(windows)]
+fn spawn_daemon(spec: &LaunchSpec, log: File, channel: Option<&DaemonEnd>) -> io::Result<Box<dyn ChildProcess>> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    if let Some(end) = channel {
+        match *end {}
+    }
+    let mut command = Command::new(&spec.program);
+    command
+        .args(&spec.args)
+        .envs(spec.envs.iter().map(|(k, v)| (k, v)))
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .creation_flags(CREATE_NO_WINDOW);
+    Ok(Box::new(command.spawn()?))
+}
+
 /// Sends SIGTERM, waits up to `grace` for a clean exit, then kills.
+#[cfg(unix)]
 pub fn stop_child(child: &mut dyn ChildProcess, grace: Duration) {
     if !matches!(child.try_wait(), Ok(None)) {
         return;
@@ -397,6 +477,16 @@ pub fn stop_child(child: &mut dyn ChildProcess, grace: Duration) {
             return;
         }
         thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Windows has no SIGTERM: the process is ended at once, without the grace period.
+#[cfg(windows)]
+pub fn stop_child(child: &mut dyn ChildProcess, _grace: Duration) {
+    if !matches!(child.try_wait(), Ok(None)) {
+        return;
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -466,7 +556,7 @@ impl Daemon {
         self
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_health(mut self, health: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
         self.health = Some(health);
         self
@@ -584,10 +674,13 @@ impl Daemon {
             Some(_) => Some(channel_pair().map_err(|e| format!("cannot open the assistant's channel: {e}"))?),
             None => None,
         };
+        #[cfg(unix)]
         let channel_end = pair.as_ref().map(|(_, daemon_end)| {
             use std::os::fd::AsFd;
             daemon_end.as_fd()
         });
+        #[cfg(windows)]
+        let channel_end = pair.as_ref().map(|(_, daemon_end)| daemon_end);
         let child = spawn_daemon(&spec, log, channel_end).map_err(|e| format!("cannot start {}: {e}", spec.program))?;
         // A relaunched app can then tell this daemon from one it did not launch (S35.2).
         if let Err(error) = record_launch(&self.data_dir, child.id()) {
@@ -643,8 +736,12 @@ impl Daemon {
 mod tests {
     use super::*;
     use crate::app_channel::{AppChannel, Handler};
-    use std::io::{BufRead, BufReader, Write};
+    #[cfg(unix)]
+    use std::io::{BufRead, BufReader};
+    use std::io::Write;
+    #[cfg(unix)]
     use std::os::fd::{AsFd, AsRawFd};
+    #[cfg(unix)]
     use std::os::unix::net::UnixStream;
     use std::process::Command;
 
@@ -661,7 +758,7 @@ mod tests {
         let spec = launch_spec(env_of(&[]), false, None);
         assert_eq!(spec.program, env!("GENTLE_DOT_BUILD_NODE"));
         assert_eq!(spec.args, vec![env!("GENTLE_DOT_BUILD_DAEMON_SCRIPT").to_string()]);
-        assert!(spec.args[0].ends_with("packages/daemon/src/cli.ts"));
+        assert!(Path::new(&spec.args[0]).ends_with("packages/daemon/src/cli.ts"), "{}", spec.args[0]);
         assert_eq!(env_value(&spec, "PATH"), Some(env!("GENTLE_DOT_BUILD_PATH")));
         assert_eq!(env_value(&spec, "GENTLE_DOT_ALLOWED_ORIGINS"), None);
     }
@@ -696,6 +793,9 @@ mod tests {
         runtime
     }
 
+    // The bundled runtime's layout (`node/bin/node`, a `:` PATH with `/usr/bin`) is the macOS and
+    // Linux one; Windows has no bundled runtime yet.
+    #[cfg(unix)]
     #[test]
     fn launch_spec_runs_the_bundled_runtime_when_present() {
         let runtime = fake_runtime("runtime-bundled", true);
@@ -726,6 +826,7 @@ mod tests {
         assert_eq!(launch_spec(env_of(&[]), false, None), today);
     }
 
+    #[cfg(unix)]
     #[test]
     fn overrides_win_over_the_bundled_runtime() {
         let runtime = fake_runtime("runtime-override", true);
@@ -763,10 +864,23 @@ mod tests {
         std::env::temp_dir().join(format!("gentle-dot-{name}-{}-{nanos}", std::process::id()))
     }
 
+    #[cfg(unix)]
     fn mode_of(path: &Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_private_new_file_is_0600_and_never_replaces_an_entry() {
+        let dir = scratch_dir("private-new");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("file");
+        create_private_new(&path).unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(create_private_new(&path).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn daemon_log_is_private_when_created() {
         let dir = scratch_dir("log-new").join("data");
@@ -775,6 +889,7 @@ mod tests {
         assert_eq!(mode_of(&dir.join("daemon.log")), 0o600);
     }
 
+    #[cfg(unix)]
     #[test]
     fn daemon_log_repairs_looser_modes() {
         let dir = scratch_dir("log-old");
@@ -793,6 +908,7 @@ mod tests {
         LaunchSpec { program: "/bin/sh".into(), args: vec!["-c".into(), script.into()], envs: vec![] }
     }
 
+    #[cfg(unix)]
     fn read_line(stream: &UnixStream) -> String {
         // macOS refuses socket options (EINVAL) once the other end has closed; reading still works.
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
@@ -801,6 +917,7 @@ mod tests {
         line
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_daemon_gets_its_end_of_the_channel_on_fd_3() {
         let dir = scratch_dir("channel-fd");
@@ -816,12 +933,14 @@ IFS= read -r line <&3; printf '%s %s\\n' \"$kind\" \"$line\" >&3";
         assert_eq!(read_line(&app), "");
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_channel_end_is_never_one_the_daemon_could_clobber() {
         let (_app, daemon_end) = channel_pair().unwrap();
         assert!(daemon_end.as_raw_fd() > APP_FD, "{}", daemon_end.as_raw_fd());
     }
 
+    #[cfg(unix)]
     #[test]
     fn without_a_channel_fd_3_is_closed_in_the_daemon() {
         let dir = scratch_dir("channel-none");
@@ -831,6 +950,7 @@ IFS= read -r line <&3; printf '%s %s\\n' \"$kind\" \"$line\" >&3";
         assert_eq!(fs::read_to_string(dir.join("daemon.log")).unwrap(), "none\n");
     }
 
+    #[cfg(unix)]
     #[test]
     fn no_other_descriptor_of_the_app_reaches_the_daemon() {
         let dir = scratch_dir("channel-only");
@@ -853,6 +973,7 @@ IFS= read -r line <&3; printf '%s %s\\n' \"$kind\" \"$line\" >&3";
     /// stand-in (packages/daemon/test/fixtures/app-channel-child.ts), which opens the channel the way
     /// the daemon does and reports what the children it spawns see on fd 3. Needs Node 24 on PATH
     /// (or `GENTLE_DOT_TEST_NODE`): `cargo test a_node_daemon -- --ignored`.
+    #[cfg(unix)]
     #[test]
     #[ignore = "needs Node 24 and the repository's daemon sources"]
     fn a_node_daemon_keeps_the_channel_from_its_children() {
@@ -909,6 +1030,7 @@ id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
 printf '{"kind":"response","id":%s,"result":{"echo":%s}}\n' "$id" "$id" >&3
 done"#;
 
+    #[cfg(unix)]
     #[test]
     fn a_daemon_this_app_spawned_gets_a_channel_until_it_stops() {
         let handler = Arc::new(Opened::default());
@@ -989,6 +1111,7 @@ done"#;
         assert_eq!(daemon.wait_ready(Duration::from_millis(300)), Ok(()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_pid_file_names_only_the_process_it_recorded() {
         let dir = scratch_dir("pid-file");
@@ -1015,10 +1138,12 @@ done"#;
     }
 
     /// A pid file naming `pid` with its real start time, as `record_launch` would write it.
+    #[cfg(unix)]
     fn launch_line(pid: u32) -> String {
         format!("{pid} {}\n", process_started(pid).expect("a live process"))
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_pid_file_never_names_the_app_its_parent_or_the_system() {
         let dir = scratch_dir("pid-self");
@@ -1037,6 +1162,7 @@ done"#;
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_pid_file_that_is_a_symlink_is_not_read_and_its_target_is_untouched() {
         let dir = scratch_dir("pid-symlink-read");
@@ -1053,6 +1179,7 @@ done"#;
         child.wait().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn recording_a_launch_never_writes_through_a_symlink() {
         let dir = scratch_dir("pid-symlink-write");
@@ -1071,6 +1198,7 @@ done"#;
         child.wait().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn recording_a_launch_replaces_the_pid_file_whole() {
         use std::os::unix::fs::MetadataExt;
@@ -1092,6 +1220,7 @@ done"#;
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_pid_file_that_is_not_a_small_regular_file_is_not_read() {
         let dir = scratch_dir("pid-odd");
@@ -1110,6 +1239,7 @@ done"#;
         child.wait().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_refused_app_announces_its_assistant_once_a_restart_starts_it() {
         let dir = scratch_dir("ready-after-restart");
@@ -1140,6 +1270,7 @@ done"#;
         daemon.stop();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_relaunched_app_after_a_crashed_one_gets_a_channel() {
         let dir = scratch_dir("relaunch");
@@ -1179,6 +1310,7 @@ done"#;
         assert!(!dir.join(PID_FILE).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn stop_child_terminates_with_sigterm() {
         let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
@@ -1190,6 +1322,7 @@ done"#;
         assert_eq!(status.signal(), Some(libc::SIGTERM));
     }
 
+    #[cfg(unix)]
     #[test]
     fn stop_child_kills_after_the_grace_period() {
         let mut child = Command::new("/bin/sh").args(["-c", "trap '' TERM; sleep 30"]).spawn().unwrap();
@@ -1198,5 +1331,69 @@ done"#;
         let status = child.try_wait().unwrap().expect("child has exited");
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    /// `cmd /c <script>`, for the Windows tests.
+    #[cfg(windows)]
+    fn cmd_spec(script: &str) -> LaunchSpec {
+        LaunchSpec { program: "cmd.exe".into(), args: vec!["/d".into(), "/c".into(), script.into()], envs: vec![] }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_refuses_a_daemon_that_needs_the_channel_and_starts_nothing() {
+        let dir = scratch_dir("windows-no-channel");
+        let marker = dir.join("started");
+        let handler = Arc::new(Opened::default());
+        let daemon = Daemon::new(1, dir.clone(), None)
+            .with_channel(handler.clone())
+            .with_launch(cmd_spec(&format!("echo started> \"{}\"", marker.display())));
+        let error = daemon.spawn().unwrap_err();
+        assert_eq!(error, format!("cannot open the assistant's channel: {CHANNEL_UNSUPPORTED}"));
+        thread::sleep(Duration::from_millis(500));
+        assert!(!marker.exists(), "a daemon ran without its channel");
+        assert!(!daemon.owns_running());
+        assert!(daemon.channel().is_none());
+        assert_eq!(*handler.0.lock().unwrap(), 0);
+        assert!(!dir.join(PID_FILE).exists());
+        let refused = channel_pair().map(|_| ()).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_starts_a_daemon_without_a_channel_with_its_output_in_the_log() {
+        let dir = scratch_dir("windows-spawn");
+        let mut child = spawn_daemon(&cmd_spec("echo ready"), open_private_log(&dir).unwrap(), None).unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(fs::read_to_string(dir.join("daemon.log")).unwrap(), "ready\r\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_stop_child_ends_a_running_process() {
+        let mut child = Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        stop_child(&mut child, Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let status = child.try_wait().unwrap().expect("child has exited");
+        assert!(!status.success());
+    }
+
+    /// Without a start time to tell a process from a later one with its pid, no launch is recorded.
+    #[cfg(windows)]
+    #[test]
+    fn windows_records_no_launch_and_finds_no_orphan() {
+        let dir = scratch_dir("windows-pid");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(record_launch(&dir, std::process::id()).is_err());
+        assert!(!dir.join(PID_FILE).exists());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0, "no temporary file is left behind");
+        fs::write(dir.join(PID_FILE), format!("{} 1\n", std::process::id() + 4)).unwrap();
+        assert_eq!(live_orphan(&dir), None);
     }
 }
