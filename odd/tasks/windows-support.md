@@ -1,7 +1,7 @@
 # Windows support for Gentle Dot
 
 Port the desktop app (Tauri 2 shell + Node daemon) to Windows 10/11 x64 without weakening the security model of `docs/design.md` (§4 App channel, Secrets, Integrity; §8).
-Delivered in phases as chained PRs from a fork (`Feanor90/gentle-dot`, branch per phase) toward `Gentleman-Programming/gentle-dot`. Engram mirror: `odd/windows-support/tasks`.
+Delivered in phases on the fork `Feanor90/gentle-dot` (branch `feat/windows-support`, pushed after every task); no PR to `Gentleman-Programming/gentle-dot` until the app works on Windows (L7). Engram mirror: `odd/windows-support/tasks`.
 
 ## Specs
 
@@ -41,3 +41,4 @@ Delivered in phases as chained PRs from a fork (`Feanor90/gentle-dot`, branch pe
   - `pnpm lint`: 202 format errors, all CRLF from the system Git `core.autocrlf=true`. With repo-local `core.autocrlf=false` and a fresh checkout: 1 error, `.atl/.skill-registry.cache.json` (harness cache; Biome ignores only root ignore rules). Fix for contributors -> T2: add `.gitattributes` with `* text=auto eol=lf`.
   - `pnpm test`: 24 failed files / 65 failed tests / 729 passed. Groups: POSIX modes (`expected 438 to be 384/448/420`, ~20 tests) -> T6; Unix socket `listen EACCES ...\pair.sock` and app channel timeouts (`app-channel-fd`, `cli`, `gateway`, `uploads`, `vps-gateway`, `vps-auth-helper`, `rotation` waitFor) -> T1/T3; uid/gid and server-mode engine user (`supervisor`, `engine-access`, `child-guard`) -> T5/T6; path separators and drive letters in expectations (`config`, `runtime`, `auth`, `isolation` `node_modules/.bin`) -> T6, fix in tests or code per case; `runtime-build` exit codes -> T8; UI `computer.test.ts` / `web-pin` `transformCallback` (Tauri mock) -> T2 check.
   - `cargo check --target x86_64-pc-windows-msvc` from Git Bash: `bzip2-sys`/`lzma-sys` fail, `cl.exe` C1083 `stdlib.h` (no `INCLUDE` outside the VS developer environment). Inside `vcvars64.bat` C dependencies compile; then `build.rs:64` panics: `icons/icon.ico not found; required for generating a Windows Resource file` -> T2 (add `icon.ico` to `icons/` and `tauri.conf.json`). Rust compile errors of the crate itself are not visible yet; T2 starts there. Builds run via `vcvars64.bat` (document in T9).
+- L7 (user, 2026-10-12): "no no vamos a hacer PR al repo , nosotros al fork, luego cuando la tengamos lista la app si eso hacemso un PR como lo ves ??? de momento todo al fork no ??" Decision: push every task to `origin` (fork); no upstream issue or PR for now; keep work-unit commits per task so a later PR can be sliced; periodically `git fetch upstream` and rebase.
