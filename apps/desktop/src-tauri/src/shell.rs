@@ -715,6 +715,14 @@ fn toggle_autostart(app: &AppHandle, menu: &Menu<tauri::Wry>) -> CommandResult {
     Ok(())
 }
 
+/// Windows: the native yes/no alert that guards limiting an existing data folder to the user; anything
+/// but a click on "Limit access" refuses (`alert::ask`).
+#[cfg(windows)]
+fn adoption_confirmation(app: AppHandle) -> daemon::Confirm {
+    const CHOICE: crate::alert::Choice = crate::alert::Choice { allow: "Limit access", refuse: "Cancel" };
+    Arc::new(move |title, message| crate::alert::ask(&app, title, message, CHOICE))
+}
+
 fn restart_daemon(app: AppHandle) {
     let (daemon, port) = (app.state::<Shell>().daemon.clone(), app.state::<Shell>().config.port);
     thread::spawn(move || match daemon.restart(DAEMON_START_TIMEOUT) {
@@ -831,21 +839,29 @@ pub fn run() {
             app.manage(computer);
             let runtime_dir = daemon::runtime_dir(|key| std::env::var(key).ok(), app.path().resource_dir().ok());
             let announcer = handle.clone();
-            let daemon = Arc::new(
-                Daemon::new(config.port, config.data_dir.clone(), runtime_dir)
-                    .with_channel(Arc::new(service))
-                    .on_ready(Arc::new(move || {
-                        if let Err(error) = announcer.emit(ASSISTANT_READY, ()) {
-                            eprintln!("gentle-dot: cannot tell the windows the assistant is ready: {error}");
-                        }
-                    })),
-            );
+            let daemon = Daemon::new(config.port, config.data_dir.clone(), runtime_dir)
+                .with_channel(Arc::new(service))
+                .on_ready(Arc::new(move || {
+                    if let Err(error) = announcer.emit(ASSISTANT_READY, ()) {
+                        eprintln!("gentle-dot: cannot tell the windows the assistant is ready: {error}");
+                    }
+                }));
+            // Windows: an existing data folder is limited to the user only after this native confirmation.
+            // Starts run off the main thread, so the blocking alert is safe.
+            #[cfg(windows)]
+            let daemon = daemon.with_adoption(adoption_confirmation(handle.clone()));
+            let daemon = Arc::new(daemon);
             let (starter, notifier) = (daemon.clone(), handle.clone());
             thread::spawn(move || {
                 if let Err(error) = starter.ensure_running(DAEMON_START_TIMEOUT) {
                     eprintln!("gentle-dot: {error}");
                     // Another daemon holds the port (S35.2): say so, with the way out, instead of using it.
                     if starter.refusal().is_some() {
+                        show_message(&notifier, MessageDialogKind::Warning, &error);
+                    }
+                    // Windows: the data folder could not be made private, or the user declined.
+                    #[cfg(windows)]
+                    if starter.data_dir_refusal().is_some() {
                         show_message(&notifier, MessageDialogKind::Warning, &error);
                     }
                 }

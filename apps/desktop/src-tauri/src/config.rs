@@ -61,10 +61,23 @@ pub fn parse_config(
     DesktopConfig { data_dir, port, shortcut }
 }
 
+/// The home folder: `HOME`. Windows usually has no `HOME`, so there it falls back to `USERPROFILE`,
+/// as the daemon's `HOME || homedir()` does; both sides must name the same data folder.
+pub fn home_dir(var: impl Fn(&str) -> Option<std::ffi::OsString>, windows: bool) -> PathBuf {
+    if !windows {
+        return var("HOME").map(PathBuf::from).unwrap_or_default();
+    }
+    ["HOME", "USERPROFILE"]
+        .into_iter()
+        .find_map(|key| var(key).filter(|value| !value.is_empty()))
+        .map(PathBuf::from)
+        .unwrap_or_default()
+}
+
 /// Reads the real environment and `<data dir>/config.json`.
 pub fn load_config() -> DesktopConfig {
     let env = |key: &str| std::env::var(key).ok();
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = home_dir(|key| std::env::var_os(key), cfg!(windows));
     let dir = data_dir(env, &home);
     let file = std::fs::read_to_string(dir.join("config.json")).ok();
     parse_config(dir, file.as_deref(), env)
@@ -142,6 +155,32 @@ mod tests {
 
     fn dir() -> PathBuf {
         PathBuf::from("/data")
+    }
+
+    fn os_env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> + 'a {
+        move |key| pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| std::ffi::OsString::from(v))
+    }
+
+    #[test]
+    fn windows_home_is_home_else_userprofile() {
+        let both = [("HOME", r"C:\h"), ("USERPROFILE", r"C:\Users\me")];
+        assert_eq!(home_dir(os_env_of(&both), true), PathBuf::from(r"C:\h"));
+        assert_eq!(home_dir(os_env_of(&[("USERPROFILE", r"C:\Users\me")]), true), PathBuf::from(r"C:\Users\me"));
+        // An empty HOME is unset, as in the daemon's `HOME || homedir()`.
+        assert_eq!(home_dir(os_env_of(&[("HOME", ""), ("USERPROFILE", r"C:\Users\me")]), true), PathBuf::from(r"C:\Users\me"));
+        assert_eq!(home_dir(os_env_of(&[]), true), PathBuf::new());
+        // The default data folder follows it, so the app and the daemon agree.
+        let home = home_dir(os_env_of(&[("USERPROFILE", r"C:\Users\me")]), true);
+        assert_eq!(data_dir(env_of(&[]), &home), PathBuf::from(r"C:\Users\me").join(".gentle-dot"));
+    }
+
+    #[test]
+    fn unix_home_is_home_only() {
+        let both = [("HOME", "/h"), ("USERPROFILE", "/u")];
+        assert_eq!(home_dir(os_env_of(&both), false), PathBuf::from("/h"));
+        assert_eq!(home_dir(os_env_of(&[("USERPROFILE", "/u")]), false), PathBuf::new());
+        assert_eq!(home_dir(os_env_of(&[("HOME", "")]), false), PathBuf::new());
+        assert_eq!(home_dir(os_env_of(&[]), false), PathBuf::new());
     }
 
     #[test]

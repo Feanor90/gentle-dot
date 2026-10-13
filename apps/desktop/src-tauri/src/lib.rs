@@ -18,6 +18,8 @@ pub mod shortcut;
 pub mod status;
 pub mod voice;
 #[cfg(windows)]
+pub mod win_file;
+#[cfg(windows)]
 pub mod win_pipe;
 #[cfg(windows)]
 pub mod win_spawn;

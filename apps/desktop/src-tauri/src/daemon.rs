@@ -11,7 +11,9 @@
 pub use crate::app_channel::APP_FD;
 use crate::app_channel::{AppChannel, ChannelStream, Handler};
 use crate::health::check_health;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::io;
 #[cfg(unix)]
 use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd};
@@ -117,6 +119,7 @@ pub fn process_started(_pid: u32) -> Option<u64> {
 
 /// Records the daemon just spawned as `pid` (private, 0600). A new file in the same folder renamed
 /// over the pid file: never written through a symlink there, and never seen half written.
+#[cfg(unix)]
 pub fn record_launch(data_dir: &Path, pid: u32) -> io::Result<()> {
     let started = process_started(pid).ok_or_else(|| io::Error::other("the assistant is not running"))?;
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
@@ -141,14 +144,31 @@ fn create_private_new(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-/// A new file at `path`: `create_new` refuses any entry already there, a symlink included. It takes
-/// the data folder's access list.
+/// Records the daemon just spawned as `pid`: a private new file renamed over the pid file, through
+/// the pinned private data folder (`win_file`), so it is never seen half written, never written
+/// through a link there, and never into a folder that is not private.
 #[cfg(windows)]
-fn create_private_new(path: &Path) -> io::Result<File> {
-    OpenOptions::new().write(true).create_new(true).open(path)
+pub fn record_launch(data_dir: &Path, pid: u32) -> io::Result<()> {
+    let started = process_started(pid).ok_or_else(|| io::Error::other("the assistant is not running"))?;
+    ready_dir(data_dir, false)?.publish_pid(&format!("{pid} {started}\n"))
+}
+
+/// The data folder, pinned and private. A folder that is not private yet needs the user's
+/// confirmation first (`adopt_data_dir`, before the daemon starts); here it is refused. `create`
+/// makes a missing folder, private from the start.
+#[cfg(windows)]
+fn ready_dir(data_dir: &Path, create: bool) -> io::Result<crate::win_file::PrivateDir> {
+    use crate::win_file::{existing, inspect, DirectoryState};
+    match if create { inspect(data_dir)? } else { existing(data_dir)? } {
+        DirectoryState::Ready(dir) => Ok(dir),
+        DirectoryState::Pending(_) => {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "the data folder is not private to the current Windows user"))
+        }
+    }
 }
 
 /// A pid file holds `<pid> <start time>`, far below this.
+#[cfg(unix)]
 const PID_FILE_MAX: u64 = 64;
 
 /// Whether a pid read from the pid file may name a daemon to signal: never this app, its parent,
@@ -198,6 +218,7 @@ fn windows_parent_pid() -> Option<u32> {
 
 /// The daemon the pid file names, if it holds a launch. Only a small regular file is read: a
 /// symlink, a FIFO, or anything else there is ignored (opened without following or blocking).
+#[cfg(unix)]
 pub fn recorded_launch(data_dir: &Path) -> Option<Launched> {
     let file = open_without_following(&data_dir.join(PID_FILE)).ok()?;
     let meta = file.metadata().ok()?;
@@ -217,13 +238,20 @@ fn open_without_following(path: &Path) -> io::Result<File> {
     OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)
 }
 
-/// Opens `path` for reading; a symlink there is opened itself (`FILE_FLAG_OPEN_REPARSE_POINT`),
-/// never its target, so its metadata is not a regular file's.
+/// The daemon the pid file names, if it holds a launch. Read through the pinned private data folder
+/// (`win_file`): a record in a folder that is not private, a link, a hardlink, or one over 64 bytes
+/// is ignored.
 #[cfg(windows)]
-fn open_without_following(path: &Path) -> io::Result<File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(path)
+pub fn recorded_launch(data_dir: &Path) -> Option<Launched> {
+    parse_launch(&ready_dir(data_dir, false).ok()?.read_pid().ok()??)
+}
+
+/// `<pid> <start time>` and nothing else, for a pid that may be a daemon.
+#[cfg(windows)]
+fn parse_launch(text: &str) -> Option<Launched> {
+    let mut parts = text.split_whitespace();
+    let launched = Launched { pid: parts.next()?.parse().ok()?, started: parts.next()?.parse().ok()? };
+    (parts.next().is_none() && may_be_daemon(launched.pid)).then_some(launched)
 }
 
 /// The recorded daemon, while that same process still runs (a reused pid has another start time).
@@ -232,9 +260,18 @@ pub fn live_orphan(data_dir: &Path) -> Option<Launched> {
 }
 
 /// Removes the pid file when it names `pid`.
+#[cfg(unix)]
 fn forget_launch(data_dir: &Path, pid: u32) {
     if recorded_launch(data_dir).is_some_and(|launch| launch.pid == pid) {
         let _ = fs::remove_file(data_dir.join(PID_FILE));
+    }
+}
+
+/// Removes the pid file when it names `pid` exactly, deciding on the very file it deletes.
+#[cfg(windows)]
+fn forget_launch(data_dir: &Path, pid: u32) {
+    if let Ok(dir) = ready_dir(data_dir, false) {
+        let _ = dir.remove_pid_if(|record| parse_launch(record).is_some_and(|launch| launch.pid == pid));
     }
 }
 
@@ -303,6 +340,99 @@ fn stop_orphan(launch: Launched, grace: Duration) {
         // SAFETY: same owned handle; bounded wait for the end to complete.
         unsafe { WaitForSingleObject(process.as_raw_handle(), millis(Duration::from_secs(2))) };
     }
+}
+
+/// Asks the user, natively: `(title, message)` -> whether they approved. Blocking.
+#[cfg(windows)]
+pub type Confirm = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+
+#[cfg(windows)]
+const ADOPTION_TITLE: &str = "Gentle Dot: protect the data folder";
+
+/// Why the assistant did not start for want of a private data folder, naming the folder and the way out.
+#[cfg(windows)]
+fn data_dir_failure(data_dir: &Path, why: &str) -> String {
+    format!(
+        "Gentle Dot did not start the assistant: the data folder {} cannot be made private to your Windows user \
+because {why}. No file was moved, copied or deleted. To keep its data somewhere else, create a dedicated \
+folder and set GENTLE_DOT_DATA_DIR to its path, then start Gentle Dot again.",
+        data_dir.display()
+    )
+}
+
+/// A path without the `\\?\` prefix of the resolved form, for people to read.
+#[cfg(windows)]
+fn readable(path: &Path) -> String {
+    let text = path.display().to_string();
+    text.strip_prefix(r"\\?\").map_or(text.clone(), str::to_owned)
+}
+
+/// What the confirmation says: the resolved folder and every object whose access changes.
+#[cfg(windows)]
+fn adoption_message(folder: &Path, objects: &[crate::win_file::ObjectPreview]) -> String {
+    let mut text = format!(
+        "Gentle Dot keeps the assistant's private data (its access token, connector records and logs) in this \
+folder:\n\n{}\n\nTo protect it, access to the items below will be limited to the current Windows user. Nothing \
+is moved, copied or deleted, and nothing else changes: other files and folders keep the access they have.\n\n\
+Items that change:\n",
+        readable(folder)
+    );
+    for object in objects {
+        text.push_str(&format!("\n- {}: {}", object.name, readable(&object.resolved_path)));
+    }
+    text.push_str("\n\nLimit access to the current Windows user?");
+    text
+}
+
+/// Why `folder` (as resolved) may never be adopted, whoever asks: it is a whole drive, or a home folder.
+#[cfg(windows)]
+fn refused_location(folder: &Path, homes: &[PathBuf]) -> Option<&'static str> {
+    use std::path::Component;
+    if !folder.components().any(|part| matches!(part, Component::Normal(_))) {
+        return Some("it is a whole drive");
+    }
+    let same = |a: &Path, b: &Path| {
+        let text = |path: &Path| path.display().to_string().trim_end_matches('\\').to_lowercase();
+        text(a) == text(b)
+    };
+    homes
+        .iter()
+        .filter(|home| !home.as_os_str().is_empty())
+        .any(|home| same(folder, home) || fs::canonicalize(home).is_ok_and(|resolved| same(folder, &resolved)))
+        .then_some("it is your home folder, which holds far more than Gentle Dot's data")
+}
+
+/// Windows: before the daemon starts, the data folder must be private to the user. A folder that
+/// already is, is used as it is. One that is not (an older build's, or Node's own) is changed only
+/// after `confirm` has shown the user the resolved folder and every object that changes and they
+/// approved: the only place an adoption is approved, by the trusted desktop and never the daemon. A
+/// home folder or a drive is refused without asking; declining or any failure changes nothing more.
+#[cfg(windows)]
+pub fn adopt_data_dir(data_dir: &Path, homes: &[PathBuf], confirm: &dyn Fn(&str, &str) -> bool) -> Result<(), String> {
+    use crate::win_file::{apply_adoption, inspect, DirectoryState};
+    let preview = match inspect(data_dir) {
+        Ok(DirectoryState::Ready(_)) => return Ok(()),
+        Ok(DirectoryState::Pending(preview)) => preview,
+        Err(error) => return Err(data_dir_failure(data_dir, &format!("it cannot be opened safely ({error})"))),
+    };
+    let objects = preview.objects();
+    let folder = objects.first().map(|object| object.resolved_path.clone()).unwrap_or_else(|| data_dir.to_path_buf());
+    if let Some(why) = refused_location(&folder, homes) {
+        return Err(data_dir_failure(data_dir, why));
+    }
+    if !confirm(ADOPTION_TITLE, &adoption_message(&folder, &objects)) {
+        return Err(data_dir_failure(data_dir, "you chose not to limit access to it"));
+    }
+    apply_adoption(preview.explicitly_approve())
+        .map(drop)
+        .map_err(|error| data_dir_failure(data_dir, &format!("limiting its access failed ({error})")))
+}
+
+/// The user's home folders, as the app and the daemon both name them.
+#[cfg(windows)]
+fn home_folders() -> Vec<PathBuf> {
+    let var = |key: &str| std::env::var_os(key);
+    vec![crate::config::home_dir(var, true), var("USERPROFILE").map(PathBuf::from).unwrap_or_default()]
 }
 
 /// What [`Daemon::ensure_running`] does, from what it finds.
@@ -412,11 +542,12 @@ pub fn open_private_log(data_dir: &Path) -> io::Result<File> {
     Ok(log)
 }
 
-/// Opens `<data_dir>/daemon.log` for appending; both take the user profile's access list.
+/// Opens `<data_dir>/daemon.log` for appending, through the pinned private data folder (`win_file`):
+/// the folder is made private if it is new, the log is private, and a folder that is not private
+/// yet (`adopt_data_dir`) or a log that is not is refused.
 #[cfg(windows)]
 pub fn open_private_log(data_dir: &Path) -> io::Result<File> {
-    fs::create_dir_all(data_dir)?;
-    OpenOptions::new().create(true).append(true).open(data_dir.join("daemon.log"))
+    ready_dir(data_dir, true)?.open_log()
 }
 
 /// A spawned process the app polls, stops, and reaps: a `std::process::Child`, or on macOS a
@@ -627,6 +758,12 @@ pub struct Daemon {
     ready: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Replaces [`launch_spec`] (tests).
     launch: Option<LaunchSpec>,
+    /// Windows: asks the user before the data folder's access is limited to them (`adopt_data_dir`).
+    #[cfg(windows)]
+    confirm: Option<Confirm>,
+    /// Windows: why the last start did not begin, for want of a private data folder.
+    #[cfg(windows)]
+    data_dir_refused: Mutex<Option<String>>,
     /// Replaces the `/health` probe (tests).
     #[cfg(test)]
     health: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
@@ -644,9 +781,20 @@ impl Daemon {
             refused: Mutex::new(None),
             ready: None,
             launch: None,
+            #[cfg(windows)]
+            confirm: None,
+            #[cfg(windows)]
+            data_dir_refused: Mutex::new(None),
             #[cfg(test)]
             health: None,
         }
+    }
+
+    /// Windows: the native confirmation shown before an existing data folder is limited to the user.
+    #[cfg(windows)]
+    pub fn with_adoption(mut self, confirm: Confirm) -> Self {
+        self.confirm = Some(confirm);
+        self
     }
 
     /// Every daemon this app spawns gets a channel served by `handler`.
@@ -688,6 +836,25 @@ impl Daemon {
             return health();
         }
         check_health(self.port, HEALTH_TIMEOUT)
+    }
+
+    /// Windows: why the last start did not begin because the data folder is not private, if so.
+    #[cfg(windows)]
+    pub fn data_dir_refusal(&self) -> Option<String> {
+        self.data_dir_refused.lock().unwrap().clone()
+    }
+
+    /// Windows: makes the data folder private (asking the user first when it is an existing one),
+    /// or says why it cannot. Without a confirmation to ask, an existing folder is never changed.
+    #[cfg(windows)]
+    fn prepare_data_dir(&self) -> Result<(), String> {
+        let homes = home_folders();
+        let result = match &self.confirm {
+            Some(confirm) => adopt_data_dir(&self.data_dir, &homes, confirm.as_ref()),
+            None => adopt_data_dir(&self.data_dir, &homes, &|_, _| false),
+        };
+        *self.data_dir_refused.lock().unwrap() = result.clone().err();
+        result
     }
 
     /// Why the last start refused the daemon on the port, if it did.
@@ -738,6 +905,8 @@ impl Daemon {
     }
 
     fn start(&self, timeout: Duration) -> Result<(), String> {
+        #[cfg(windows)]
+        self.prepare_data_dir()?;
         let wants_channel = self.handler.is_some();
         let owns_child = self.owns_running();
         let orphan = if wants_channel && !owns_child { live_orphan(&self.data_dir) } else { None };
@@ -1001,7 +1170,11 @@ mod tests {
 
     fn scratch_dir(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        std::env::temp_dir().join(format!("gentle-dot-{name}-{}-{nanos}", std::process::id()))
+        #[cfg(unix)]
+        let root = std::env::temp_dir();
+        #[cfg(windows)]
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/daemon-tests");
+        root.join(format!("gentle-dot-{name}-{}-{nanos}", std::process::id()))
     }
 
     #[cfg(unix)]
@@ -1705,7 +1878,7 @@ done"#;
         }
         let parent = parent.expect("the current process appears in its snapshot");
         let dir = scratch_dir("windows-protected-pids");
-        fs::create_dir_all(&dir).unwrap();
+        drop(crate::win_file::inspect(&dir).unwrap()); // the pid file now lives in a private folder
         for pid in [0, 4, std::process::id(), parent] {
             let text = format!("{pid} {}\n", process_started(pid).unwrap_or(1));
             fs::write(dir.join(PID_FILE), &text).unwrap();
@@ -1716,11 +1889,189 @@ done"#;
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A data folder in the state an older build or standalone Node leaves it: default access list.
+    #[cfg(windows)]
+    fn legacy_folder(name: &str) -> PathBuf {
+        let dir = scratch_dir(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("daemon.log"), "keep\n").unwrap();
+        fs::write(dir.join("token"), "secret\n").unwrap();
+        fs::write(dir.join("notes.txt"), "unrelated\n").unwrap();
+        dir
+    }
+
+    #[cfg(windows)]
+    fn snapshot(dir: &Path) -> Vec<(String, String)> {
+        crate::win_file::prepare_adoption(dir).unwrap().objects().into_iter().map(|o| (o.name, o.security)).collect()
+    }
+
+    #[cfg(windows)]
+    fn is_private(dir: &Path) -> bool {
+        matches!(crate::win_file::existing(dir), Ok(crate::win_file::DirectoryState::Ready(_)))
+    }
+
+    /// A long-running stand-in daemon that is "healthy" while its launch is recorded and alive.
+    #[cfg(windows)]
+    fn recorded_daemon(dir: &Path) -> Daemon {
+        let health = {
+            let dir = dir.to_path_buf();
+            Arc::new(move || recorded_launch(&dir).is_some_and(|launch| process_started(launch.pid) == Some(launch.started)))
+        };
+        Daemon::new(1, dir.to_path_buf(), None).with_launch(crate::win_spawn::tests::helper_spec("sleep")).with_health(health)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_log_and_pid_live_in_a_private_folder_and_a_plain_folder_is_not_used() {
+        let dir = scratch_dir("windows-private-files");
+        drop(open_private_log(&dir).unwrap());
+        assert!(is_private(&dir), "a folder the app creates is private from the start");
+        let pid = std::process::id();
+        let started = process_started(pid).unwrap();
+        record_launch(&dir, pid).unwrap();
+        assert_eq!(fs::read_to_string(dir.join(PID_FILE)).unwrap(), format!("{pid} {started}\n"));
+        assert!(is_private(&dir), "log and pid file are private too");
+
+        // A plain folder is never trusted: no log, no pid record written, none read.
+        let plain = scratch_dir("windows-plain-folder");
+        fs::create_dir_all(&plain).unwrap();
+        let before = snapshot(&plain);
+        assert!(open_private_log(&plain).is_err());
+        assert!(record_launch(&plain, pid).is_err());
+        assert!(!plain.join("daemon.log").exists() && !plain.join(PID_FILE).exists());
+        assert_eq!(snapshot(&plain), before, "refusing changes no access list");
+        let mut other = Command::new("ping").args(["-n", "30", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+        fs::write(plain.join(PID_FILE), format!("{} {}\n", other.id(), process_started(other.id()).unwrap())).unwrap();
+        assert_eq!(recorded_launch(&plain), None, "a record in a folder that is not private names nobody");
+        other.kill().unwrap();
+        other.wait().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(plain).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_forgetting_a_launch_removes_the_record_only_for_the_exact_pid() {
+        let dir = scratch_dir("windows-forget");
+        drop(open_private_log(&dir).unwrap());
+        let mut child = Command::new("ping").args(["-n", "30", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+        record_launch(&dir, child.id()).unwrap();
+        let record = fs::read_to_string(dir.join(PID_FILE)).unwrap();
+        assert_eq!(recorded_launch(&dir).map(|launch| launch.pid), Some(child.id()));
+        forget_launch(&dir, child.id() + 4);
+        assert_eq!(fs::read_to_string(dir.join(PID_FILE)).unwrap(), record, "another pid leaves the record");
+        forget_launch(&dir, child.id());
+        assert!(!dir.join(PID_FILE).exists());
+        forget_launch(&dir, child.id());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_declined_adoption_changes_nothing_starts_nothing_and_names_the_folder() {
+        let dir = legacy_folder("windows-adopt-decline");
+        let (before, contents) = (snapshot(&dir), fs::read_to_string(dir.join("token")).unwrap());
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let confirm: Confirm = {
+            let asked = asked.clone();
+            Arc::new(move |title, message| {
+                asked.lock().unwrap().push((title.to_string(), message.to_string()));
+                false
+            })
+        };
+        let daemon = recorded_daemon(&dir).with_adoption(confirm);
+        let error = daemon.ensure_running(Duration::from_secs(5)).unwrap_err();
+        assert!(error.contains(&dir.display().to_string()), "{error}");
+        assert!(error.contains("GENTLE_DOT_DATA_DIR"), "{error}");
+        assert!(!daemon.owns_running());
+        assert_eq!(snapshot(&dir), before, "access lists are unchanged");
+        assert_eq!(fs::read_to_string(dir.join("token")).unwrap(), contents);
+        assert!(!dir.join(PID_FILE).exists());
+        assert_eq!(fs::read_to_string(dir.join("daemon.log")).unwrap(), "keep\n");
+        assert!(!is_private(&dir));
+        // It asked once and listed the folder and every object it would change.
+        let asked = asked.lock().unwrap();
+        assert_eq!(asked.len(), 1);
+        let message = &asked[0].1;
+        for object in crate::win_file::prepare_adoption(&dir).unwrap().objects() {
+            assert!(message.contains(&object.name), "{} missing from: {message}", object.name);
+            assert!(message.contains(readable(&object.resolved_path).as_str()), "{:?} missing from: {message}", object.resolved_path);
+        }
+        assert!(message.contains("current Windows user"), "{message}");
+        assert!(!message.contains("notes.txt"), "objects it does not change are not listed: {message}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_without_a_confirmation_an_existing_folder_is_never_adopted() {
+        let dir = legacy_folder("windows-adopt-unasked");
+        let before = snapshot(&dir);
+        let daemon = recorded_daemon(&dir);
+        assert!(daemon.ensure_running(Duration::from_secs(5)).is_err());
+        assert!(!daemon.owns_running());
+        assert_eq!(snapshot(&dir), before);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_approved_adoption_makes_the_folder_and_listed_files_private_then_starts() {
+        let dir = legacy_folder("windows-adopt-approve");
+        let confirm: Confirm = Arc::new(|_, _| true);
+        let daemon = recorded_daemon(&dir).with_adoption(confirm);
+        daemon.ensure_running(Duration::from_secs(20)).unwrap();
+        assert!(daemon.owns_running());
+        assert!(is_private(&dir), "directory, daemon.log and token are now private");
+        assert_eq!(fs::read_to_string(dir.join("daemon.log")).unwrap(), "keep\n");
+        assert_eq!(fs::read_to_string(dir.join("token")).unwrap(), "secret\n");
+        assert_eq!(fs::read_to_string(dir.join("notes.txt")).unwrap(), "unrelated\n");
+        daemon.stop();
+        assert!(!dir.join(PID_FILE).exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_private_folder_is_never_confirmed_again() {
+        let dir = scratch_dir("windows-adopt-ready");
+        drop(open_private_log(&dir).unwrap());
+        let asked = std::cell::Cell::new(0);
+        adopt_data_dir(&dir, &[], &|_, _| {
+            asked.set(asked.get() + 1);
+            true
+        })
+        .unwrap();
+        assert_eq!(asked.get(), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_the_home_folder_and_volume_roots_are_refused_without_asking() {
+        let home = legacy_folder("windows-adopt-home");
+        let before = snapshot(&home);
+        let never = |_: &str, _: &str| -> bool { panic!("a refused folder must not be offered for confirmation") };
+        let error = adopt_data_dir(&home, std::slice::from_ref(&home), &never).unwrap_err();
+        assert!(error.contains(&home.display().to_string()) && error.contains("GENTLE_DOT_DATA_DIR"), "{error}");
+        assert_eq!(snapshot(&home), before);
+        // A home spelled in another case is the same folder.
+        let respelled = PathBuf::from(home.display().to_string().to_uppercase());
+        assert!(adopt_data_dir(&home, &[respelled], &never).is_err());
+        assert_eq!(snapshot(&home), before);
+        let root = PathBuf::from(format!("{}\\", std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into())));
+        let error = adopt_data_dir(&root, &[], &never).unwrap_err();
+        assert!(error.contains("GENTLE_DOT_DATA_DIR"), "{error}");
+        fs::remove_dir_all(home).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_records_a_live_creation_time_and_rejects_missing_processes() {
         let dir = scratch_dir("windows-pid");
-        fs::create_dir_all(&dir).unwrap();
+        drop(crate::win_file::inspect(&dir).unwrap()); // the pid file now lives in a private folder
         let pid = std::process::id();
         let started = process_started(pid).expect("a live process has a creation time");
         assert!(started > 0);
