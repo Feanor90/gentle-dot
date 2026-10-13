@@ -132,6 +132,11 @@ export function ensureMemoryProject(workspace: string, access: EngineAccess = di
  * Without a `TMPDIR` (the installed app's launch on Linux), the engine gets a
  * private one under its home: it caches compiled extensions in the temporary
  * folder, and a shared `/tmp` would let another local user plant that cache.
+ * On Windows, USERPROFILE and AppData also live under the engine home; TEMP,
+ * TMP and TMPDIR always use its own temporary folder, never inherited profile paths.
+ * These environment redirects are not a sandbox. On Windows ensurePrivateDir's
+ * modes are no-ops: privacy comes from the data folder's inheritable owner-only
+ * DACL, set by the desktop app (win_file.rs), which every folder made here inherits.
  *
  * An installed app (`GENTLE_DOT_RUNTIME`) also names the Engram binary
  * (`ENGRAM_BIN`, see `resolveEngramBin`), since its PATH has no user folders.
@@ -141,9 +146,11 @@ export function isolatedAgentEnv(
 	dataDir: string,
 	access: EngineAccess = directAccess,
 ): NodeJS.ProcessEnv {
+	// Capture the original home before redirecting Windows' profile variables.
+	const windows = process.platform === "win32";
+	const realHome = base.HOME || (windows ? base.USERPROFILE : undefined) || homedir();
 	const home = join(dataDir, "home");
 	access(() => ensurePrivateDir(home));
-	const realHome = base.HOME || homedir();
 	const env: NodeJS.ProcessEnv = {
 		...base,
 		HOME: home,
@@ -153,9 +160,24 @@ export function isolatedAgentEnv(
 		XDG_STATE_HOME: join(home, ".local", "state"),
 	};
 	for (const key of [...INHERITED_HOMES, ...SUBAGENT_VARIABLES, ...DAEMON_ONLY]) delete env[key];
-	if (!base.TMPDIR) {
+	if (windows) {
+		env.USERPROFILE = home;
+		const roaming = join(home, "AppData", "Roaming");
+		const local = join(home, "AppData", "Local");
+		env.APPDATA = roaming;
+		env.LOCALAPPDATA = local;
+		access(() => {
+			ensurePrivateDir(roaming);
+			ensurePrivateDir(local);
+		});
+	}
+	if (windows || !base.TMPDIR) {
 		const tmp = join(home, ".cache", "tmp");
 		env.TMPDIR = tmp;
+		if (windows) {
+			env.TEMP = tmp;
+			env.TMP = tmp;
+		}
 		access(() => ensurePrivateDir(tmp));
 	}
 	const bin = bundledBinDir(base);
