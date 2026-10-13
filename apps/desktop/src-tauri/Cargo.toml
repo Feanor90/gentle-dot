@@ -64,12 +64,14 @@ dbus-secret-service = "4.1"
 dbus = "0.9"
 
 # The app's private channel on Windows (S25.1): an owner-only named pipe (`win_pipe`), and the
-# daemon spawned with exactly the handles it needs (`win_spawn`). Already linked through tauri.
+# daemon spawned with exactly the handles it needs (`win_spawn`); connector secrets in the
+# Credential Manager (`secure_store::windows`, S25.5). Already linked through tauri.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Security",
   "Win32_Security_Authorization",
+  "Win32_Security_Credentials",
   "Win32_Storage_FileSystem",
   "Win32_System_IO",
   "Win32_System_Pipes",

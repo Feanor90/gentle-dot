@@ -103,3 +103,11 @@ Keep the `./` with `apt`. The package manager adds WebKitGTK and tray support. T
 - Remove: `sudo apt remove gentle-dot` or `sudo pacman -R gentle-dot` (your data in `~/.gentle-dot` stays).
 - Build the packages (needs Docker): `pnpm package:linux --arch <arm64|amd64>` (amd64 also builds the Arch package); check them in clean containers with `pnpm package:linux:check --arch <arm64|amd64>`. `node scripts/package/linux-cargo-check.mjs --arch <arm64|amd64>` runs the desktop crate's tests and clippy on Linux, the keyring store against a real GNOME Keyring on a private session bus, and the app channel checks.
 - Developers can still build from source with `scripts/linux/setup-debian.sh` or `scripts/linux/setup-arch.sh` (app at `~/.local/bin/gentle-dot`).
+
+## Windows (port in progress)
+
+There is no Windows installer yet; the port lives on the `feat/windows-support` branch of the fork and is tracked in `odd/tasks/windows-support.md`. What already holds:
+
+- Connector secrets (tokens and sign-ins) are kept in the Windows Credential Manager as generic credentials named `dev.gentleman.gentle-dot.connectors/<id>`, each capital letter of the id shown as `^` and the small letter (for example `header/^authorization`) (Control Panel > Credential Manager > Windows Credentials shows them as "Gentle Dot connector: …"), stored on this computer only and encrypted on disk by Windows, never in `%USERPROFILE%\.gentle-dot`. A long sign-in is split over a few more credentials named `…/<id>#<generation>-2`, `-3`, …
+- **Limit on Windows:** the Credential Manager has no way to restrict which program reads a credential, so any program running as your Windows user can read those secrets, including commands the assistant runs in its shell. This is the same limit as the Linux keyring; on macOS the Keychain lets only the signed app read them without asking. Connect only the accounts you want the assistant to use.
+- A Windows logon that cannot keep credentials (a service or a network logon) makes connectors that need a secret fail closed; nothing is written to disk instead.

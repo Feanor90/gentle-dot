@@ -8,6 +8,8 @@
 //!   the items' access list follows the app's code signature.
 //! - Linux (`SecretServiceStore`): the Secret Service over D-Bus (GNOME Keyring, KWallet).
 //!   Items are encrypted at rest, but any same-user process can read unlocked items (S25.7).
+//! - Windows (`CredentialManager`): generic credentials `<service>/<id>` in the Credential
+//!   Manager, encrypted at rest; any same-user process can read them (documented limit, as on Linux).
 //! - `MemoryStore`: an in-memory store for tests.
 //!
 //! Secrets are never logged: [`Secret`] and every store redact themselves in `Debug`, have no
@@ -18,14 +20,19 @@ mod memory;
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(windows)]
+mod windows;
 
 pub use memory::MemoryStore;
 #[cfg(target_os = "linux")]
 pub use linux::SecretServiceStore;
 #[cfg(target_os = "macos")]
 pub use macos::Keychain;
+#[cfg(windows)]
+pub use windows::CredentialManager;
 
-/// The keychain service (macOS) or `service` attribute (Linux) of every connector secret.
+/// The keychain service (macOS), `service` attribute (Linux), or target prefix (Windows) of every
+/// connector secret.
 pub const SERVICE: &str = "dev.gentleman.gentle-dot.connectors";
 /// The longest secret id, in bytes.
 pub const MAX_ID_LEN: usize = 200;
@@ -108,14 +115,41 @@ pub trait SecretStore: Send + Sync {
 }
 
 /// The store the app serves connector secrets from: the login keychain on macOS, the Secret
-/// Service on Linux. Nothing is touched until the first request.
+/// Service on Linux, the Credential Manager on Windows. Nothing is touched until the first request.
+/// Any other platform gets a store that refuses every request: never one that would lose secrets
+/// at the next start or keep them anywhere weaker.
 pub fn connector_store() -> Box<dyn SecretStore> {
     #[cfg(target_os = "macos")]
     return Box::new(Keychain::new());
     #[cfg(target_os = "linux")]
     return Box::new(SecretServiceStore::new());
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    return Box::new(MemoryStore::new());
+    #[cfg(windows)]
+    return Box::new(CredentialManager::new());
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    return Box::new(NoStore);
+}
+
+/// The store of a platform without one: every call is [`StoreError::Unavailable`].
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+struct NoStore;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+impl SecretStore for NoStore {
+    fn put(&self, _: &str, _: &Secret) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable("this platform has no secure store".into()))
+    }
+
+    fn get(&self, _: &str) -> Result<Option<Secret>, StoreError> {
+        Err(StoreError::Unavailable("this platform has no secure store".into()))
+    }
+
+    fn delete(&self, _: &str) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable("this platform has no secure store".into()))
+    }
+
+    fn list_ids(&self) -> Result<Vec<String>, StoreError> {
+        Err(StoreError::Unavailable("this platform has no secure store".into()))
+    }
 }
 
 /// Accepts 1 to [`MAX_ID_LEN`] bytes of `[A-Za-z0-9._:@/-]`.
@@ -187,6 +221,22 @@ mod tests {
     fn errors_say_what_failed_without_a_secret() {
         assert_eq!(StoreError::Denied.to_string(), "access to the secret store was denied");
         assert_eq!(StoreError::InvalidId.to_string(), "invalid secret id");
+    }
+
+    /// The app's own store on Windows keeps a secret for the next start (a fresh store reads it),
+    /// which an in-memory one would lose. Uses a throwaway id under the real service and removes it.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "uses the real Credential Manager"]
+    fn real_connector_store_keeps_a_secret_for_the_next_start() {
+        let mut random = [0u8; 8];
+        getrandom::fill(&mut random).unwrap();
+        let id = format!("test/{}", random.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        connector_store().put(&id, &Secret::new("kept")).unwrap();
+        let read = connector_store().get(&id);
+        let removed = connector_store().delete(&id);
+        assert_eq!(read.unwrap().map(|secret| secret.expose().to_owned()), Some("kept".into()));
+        assert_eq!(removed, Ok(true));
     }
 
     #[test]
