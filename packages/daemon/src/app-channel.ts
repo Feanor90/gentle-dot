@@ -213,18 +213,32 @@ function frameLine(frame: Frame): string | undefined {
  * True when a child spawned the way the daemon spawns its children would hold the socket `identity`
  * (`dev:ino`) on `fd`. Node offers no way to mark an inherited descriptor close-on-exec; on macOS
  * libuv spawns with `POSIX_SPAWN_CLOEXEC_DEFAULT`, so children get only their stdio. This checks
- * that instead of assuming it.
+ * that instead of assuming it. On Windows a pipe's `ino` is its handle value, which differs in every
+ * process, so there any open `fd` in the child counts as the channel.
  */
 export function childInherits(
 	fd: number,
 	identity: string,
 	stdio: StdioOptions = ["ignore", "pipe", "ignore"],
 ) {
-	const script = `try{const s=require("fs").fstatSync(${fd},{bigint:true});process.stdout.write(s.dev+":"+s.ino)}catch{}`;
+	const windows = process.platform === "win32";
+	const script = windows
+		? `try{require("fs").fstatSync(${fd});process.stdout.write("open")}catch{}`
+		: `try{const s=require("fs").fstatSync(${fd},{bigint:true});process.stdout.write(s.dev+":"+s.ino)}catch{}`;
 	const probe = spawnSync(process.execPath, ["-e", script], { stdio, encoding: "utf8", timeout: 10_000 });
 	// A probe that could not run proves nothing: treat it as a leak.
 	if (probe.error || probe.status !== 0) return true;
-	return probe.stdout === identity;
+	return probe.stdout === (windows ? "open" : identity);
+}
+
+/** `S_IFIFO`: what the app's end of the channel is on Windows, a pipe handed over as a CRT fd. */
+const S_IFMT = 0o170000;
+const S_IFIFO = 0o010000;
+
+/** True for the kind of descriptor the app hands over: a socket, or on Windows a pipe. */
+function isChannelKind(stat: ReturnType<typeof fstatSync>): boolean {
+	if (stat.isSocket()) return true;
+	return process.platform === "win32" && (Number(stat.mode) & S_IFMT) === S_IFIFO;
 }
 
 export interface InheritedChannelOptions extends AppChannelOptions {
@@ -234,9 +248,9 @@ export interface InheritedChannelOptions extends AppChannelOptions {
 }
 
 /**
- * The socket the app handed over on fd 3, or undefined when there is none (it is not a socket, or it
- * is Node's own IPC channel). When a child would inherit it, it is closed and refused: an agent
- * holding it could act as the app.
+ * The socket the app handed over on fd 3, or undefined when there is none (it is not a socket, or on
+ * Windows a pipe, or it is Node's own IPC channel). When a child would inherit it, it is closed and
+ * refused: an agent holding it could act as the app.
  */
 export function inheritedAppSocket(options: InheritedChannelOptions = {}): Socket | undefined {
 	const fd = options.fd ?? APP_FD;
@@ -244,7 +258,7 @@ export function inheritedAppSocket(options: InheritedChannelOptions = {}): Socke
 	let identity: string;
 	try {
 		const stat = fstatSync(fd, { bigint: true });
-		if (!stat.isSocket()) return undefined;
+		if (!isChannelKind(stat)) return undefined;
 		identity = `${stat.dev}:${stat.ino}`;
 	} catch {
 		return undefined;

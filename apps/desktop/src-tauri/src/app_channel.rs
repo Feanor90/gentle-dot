@@ -1,6 +1,7 @@
 //! The private channel to the daemon this app launched (S25.1–S25.3). When the app spawns the
-//! daemon it creates a connected pair of Unix sockets and hands one end to the daemon as fd 3
-//! (`daemon::spawn_daemon`); it keeps the other. That connection is the authentication: nothing is
+//! daemon it creates a connected pair of Unix sockets (on Windows, a private named pipe connected to
+//! itself, `win_pipe`) and hands one end to the daemon as fd 3 (`daemon::spawn_daemon`); it keeps
+//! the other. That connection is the authentication: nothing is
 //! written to a file or an environment variable and nothing listens, so another process (the agent
 //! included) cannot reach it. A daemon the app only attached to gets no channel.
 //!
@@ -36,40 +37,10 @@ pub const APP_FD: i32 = 3;
 #[cfg(unix)]
 pub type ChannelStream = std::os::unix::net::UnixStream;
 
-/// The app's end of the channel on Windows, which has none yet: the type has no values, so no
-/// channel can be opened and a daemon that needs one is not started (`daemon::channel_pair`).
+/// The app's end of the channel on Windows: an owner-only, single-instance named pipe connected to
+/// itself (`win_pipe`), handed to the daemon as CRT fd 3.
 #[cfg(windows)]
-#[derive(Debug)]
-pub enum ChannelStream {}
-
-#[cfg(windows)]
-impl ChannelStream {
-    pub fn try_clone(&self) -> io::Result<Self> {
-        match *self {}
-    }
-
-    pub fn shutdown(&self, _how: Shutdown) -> io::Result<()> {
-        match *self {}
-    }
-}
-
-#[cfg(windows)]
-impl Read for ChannelStream {
-    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
-        match *self {}
-    }
-}
-
-#[cfg(windows)]
-impl Write for ChannelStream {
-    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
-        match *self {}
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match *self {}
-    }
-}
+pub type ChannelStream = crate::win_pipe::PipeStream;
 /// A command may wait for a native confirmation (120 s) before the daemon answers.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(150);
 /// Registering the computer helper waits for the daemon to start reading the channel.
@@ -326,20 +297,49 @@ impl AppChannel {
     }
 }
 
-// The tests drive the channel over a Unix socket pair.
-#[cfg(all(test, unix))]
+// The tests drive the channel over the pair the app makes: Unix sockets, or the Windows pipe.
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::approvals::fake::{Answer, FakePrompt};
     use crate::approvals::{Approvals, Decision};
     use crate::secure_store::{MemoryStore, MAX_ID_LEN};
-    use std::os::unix::net::UnixStream;
     use std::time::Instant;
+
+    /// The daemon's end of the pair.
+    #[cfg(unix)]
+    type DaemonStream = std::os::unix::net::UnixStream;
+    #[cfg(windows)]
+    type DaemonStream = crate::win_pipe::PipeStream;
+
+    #[cfg(unix)]
+    fn stream_pair() -> (ChannelStream, DaemonStream) {
+        DaemonStream::pair().unwrap()
+    }
+
+    #[cfg(windows)]
+    fn stream_pair() -> (ChannelStream, DaemonStream) {
+        let (app, daemon) = crate::win_pipe::private_pair().unwrap();
+        (app, DaemonStream::from_owned(daemon))
+    }
+
+    /// True when nothing waits to be read on `stream`.
+    #[cfg(unix)]
+    fn nothing_to_read(stream: &DaemonStream) -> bool {
+        stream.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 1];
+        matches!((&*stream).read(&mut buf), Err(e) if e.kind() == io::ErrorKind::WouldBlock)
+    }
+
+    #[cfg(windows)]
+    fn nothing_to_read(stream: &DaemonStream) -> bool {
+        stream.available().unwrap() == 0
+    }
 
     /// The daemon's side of the pair, read and written frame by frame.
     struct FakeDaemon {
-        reader: BufReader<UnixStream>,
-        writer: UnixStream,
+        reader: BufReader<DaemonStream>,
+        writer: DaemonStream,
     }
 
     impl FakeDaemon {
@@ -372,7 +372,7 @@ mod tests {
     }
 
     fn pair(handler: Arc<dyn Handler>) -> (Arc<AppChannel>, FakeDaemon) {
-        let (app, daemon) = UnixStream::pair().unwrap();
+        let (app, daemon) = stream_pair();
         let channel = AppChannel::start(app, handler).unwrap();
         let reader = BufReader::new(daemon.try_clone().unwrap());
         (channel, FakeDaemon { reader, writer: daemon })
@@ -433,9 +433,7 @@ mod tests {
         let sent = channel.command("w", json!({"type": "computer_register", "url": "http://127.0.0.1:1/mcp", "token": "t"}));
         assert!(sent.is_err());
         assert!(channel.command("w", json!({"type": "send", "text": "hi"})).is_err());
-        daemon.writer.set_nonblocking(true).unwrap();
-        let mut buf = [0u8; 1];
-        assert!(matches!((&daemon.writer).read(&mut buf), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
+        assert!(nothing_to_read(&daemon.writer));
     }
 
     #[test]

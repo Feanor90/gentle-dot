@@ -351,18 +351,11 @@ pub fn channel_pair() -> io::Result<(ChannelStream, OwnedFd)> {
     Ok((app, unsafe { OwnedFd::from_raw_fd(copy) }))
 }
 
-/// Why a daemon that needs the app's channel is not started on Windows.
-pub const CHANNEL_UNSUPPORTED: &str = "the app's private channel to the assistant is not available on Windows yet";
-
-/// The daemon's end of the channel on Windows, which has none yet (see [`ChannelStream`]).
+/// The private pipe pair on Windows (`win_pipe`): the app's end, and the daemon's, which no other
+/// process can open and which is not inheritable until `spawn_daemon` hands it over.
 #[cfg(windows)]
-#[derive(Debug)]
-pub enum DaemonEnd {}
-
-/// Always refused on Windows, so a daemon that needs a channel is never started without one.
-#[cfg(windows)]
-pub fn channel_pair() -> io::Result<(ChannelStream, DaemonEnd)> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, CHANNEL_UNSUPPORTED))
+pub fn channel_pair() -> io::Result<(ChannelStream, std::os::windows::io::OwnedHandle)> {
+    crate::win_pipe::private_pair()
 }
 
 /// Starts the daemon with stdin from `/dev/null`, its output in `log`, and `channel` (from
@@ -437,25 +430,17 @@ fn cloexec_from(first: libc::c_int) {
     }
 }
 
-/// Starts the daemon without a window, with stdin from `NUL` and its output in `log`. There is no
-/// channel to pass ([`channel_pair`] refuses).
+/// As on macOS and Linux, the daemon gets stdio and `channel` (from [`channel_pair`]) on fd 3 and no
+/// other handle of the app (`win_spawn`: a handle list, and the C runtime's descriptor table). It
+/// runs without a window, with stdin from `NUL` and its output in `log`.
 #[cfg(windows)]
-fn spawn_daemon(spec: &LaunchSpec, log: File, channel: Option<&DaemonEnd>) -> io::Result<Box<dyn ChildProcess>> {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    if let Some(end) = channel {
-        match *end {}
-    }
-    let mut command = Command::new(&spec.program);
-    command
-        .args(&spec.args)
-        .envs(spec.envs.iter().map(|(k, v)| (k, v)))
-        .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log)
-        .creation_flags(CREATE_NO_WINDOW);
-    Ok(Box::new(command.spawn()?))
+fn spawn_daemon(
+    spec: &LaunchSpec,
+    log: File,
+    channel: Option<std::os::windows::io::BorrowedHandle<'_>>,
+) -> io::Result<Box<dyn ChildProcess>> {
+    let spawn = crate::win_spawn::Spawn { program: &spec.program, args: &spec.args, envs: &spec.envs };
+    Ok(Box::new(crate::win_spawn::spawn(&spawn, &log, channel)?))
 }
 
 /// Sends SIGTERM, waits up to `grace` for a clean exit, then kills.
@@ -680,7 +665,10 @@ impl Daemon {
             daemon_end.as_fd()
         });
         #[cfg(windows)]
-        let channel_end = pair.as_ref().map(|(_, daemon_end)| daemon_end);
+        let channel_end = pair.as_ref().map(|(_, daemon_end)| {
+            use std::os::windows::io::AsHandle;
+            daemon_end.as_handle()
+        });
         let child = spawn_daemon(&spec, log, channel_end).map_err(|e| format!("cannot start {}: {e}", spec.program))?;
         // A relaunched app can then tell this daemon from one it did not launch (S35.2).
         if let Err(error) = record_launch(&self.data_dir, child.id()) {
@@ -1030,13 +1018,20 @@ id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
 printf '{"kind":"response","id":%s,"result":{"echo":%s}}\n' "$id" "$id" >&3
 done"#;
 
-    #[cfg(unix)]
+    /// A daemon stand-in that answers every request on fd 3 (on Windows, the test binary itself).
+    fn echo_spec() -> LaunchSpec {
+        #[cfg(unix)]
+        return sh_spec(ECHO);
+        #[cfg(windows)]
+        return crate::win_spawn::tests::helper_spec("echo");
+    }
+
     #[test]
     fn a_daemon_this_app_spawned_gets_a_channel_until_it_stops() {
         let handler = Arc::new(Opened::default());
         let daemon = Daemon::new(1, scratch_dir("channel-own"), None)
             .with_channel(handler.clone())
-            .with_launch(sh_spec(ECHO));
+            .with_launch(echo_spec());
         assert!(daemon.channel().is_none());
         daemon.spawn().unwrap();
         let channel = daemon.channel().expect("a channel to the spawned daemon");
@@ -1339,25 +1334,65 @@ done"#;
         LaunchSpec { program: "cmd.exe".into(), args: vec!["/d".into(), "/c".into(), script.into()], envs: vec![] }
     }
 
+    /// Windows: the spawn hands fd 3 to Node running the daemon's stand-in, as on Unix above. Node
+    /// sees descriptors only, so each kind of grandchild also runs this test binary's `pipe:` probe
+    /// on the channel's handle value (its control: `win_spawn`'s
+    /// `the_channel_probe_sees_a_child_that_holds_the_pipe`). `cargo test a_node_daemon -- --ignored`.
     #[cfg(windows)]
     #[test]
-    fn windows_refuses_a_daemon_that_needs_the_channel_and_starts_nothing() {
-        let dir = scratch_dir("windows-no-channel");
-        let marker = dir.join("started");
-        let handler = Arc::new(Opened::default());
-        let daemon = Daemon::new(1, dir.clone(), None)
-            .with_channel(handler.clone())
-            .with_launch(cmd_spec(&format!("echo started> \"{}\"", marker.display())));
-        let error = daemon.spawn().unwrap_err();
-        assert_eq!(error, format!("cannot open the assistant's channel: {CHANNEL_UNSUPPORTED}"));
-        thread::sleep(Duration::from_millis(500));
-        assert!(!marker.exists(), "a daemon ran without its channel");
-        assert!(!daemon.owns_running());
-        assert!(daemon.channel().is_none());
-        assert_eq!(*handler.0.lock().unwrap(), 0);
-        assert!(!dir.join(PID_FILE).exists());
-        let refused = channel_pair().map(|_| ()).unwrap_err();
-        assert_eq!(refused.kind(), io::ErrorKind::Unsupported);
+    #[ignore = "needs Node 24 and the repository's daemon sources"]
+    fn a_node_daemon_keeps_the_channel_from_its_children_on_windows() {
+        let dir = scratch_dir("channel-node-windows");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../packages/daemon/test/fixtures/app-channel-child.ts");
+        let node = std::env::var("GENTLE_DOT_TEST_NODE").unwrap_or_else(|_| "node".into());
+        let helper = crate::win_spawn::tests::helper_spec("");
+        let probe = serde_json::json!({"program": helper.program, "args": helper.args, "server": std::process::id()});
+        let envs = vec![("GENTLE_DOT_TEST_HANDLE_PROBE".to_string(), probe.to_string())];
+        let spec = LaunchSpec { program: node, args: vec![fixture.to_string_lossy().into_owned()], envs };
+        let (app, daemon_end) = channel_pair().unwrap();
+        use std::os::windows::io::AsHandle;
+        // `win_spawn` directly (what `spawn_daemon` calls), to learn the handle value the child got.
+        let spawn = crate::win_spawn::Spawn { program: &spec.program, args: &spec.args, envs: &spec.envs };
+        let mut child = crate::win_spawn::spawn(&spawn, &open_private_log(&dir).unwrap(), Some(daemon_end.as_handle())).unwrap();
+        drop(daemon_end);
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(app.try_clone().unwrap()), &mut line).unwrap();
+        let log = || fs::read_to_string(dir.join("daemon.log")).unwrap_or_default();
+        let frame: serde_json::Value = serde_json::from_str(&line).unwrap_or_else(|_| panic!("no report: {line:?} {}", log()));
+        assert_eq!(frame["method"], "report", "{frame} {}", log());
+        (&app).write_all(format!("{{\"kind\":\"response\",\"id\":{},\"result\":{{}}}}\n", frame["id"]).as_bytes()).unwrap();
+        assert!(child.wait().unwrap().success(), "{}", log());
+        let report = &frame["params"];
+        // The daemon holds the pipe this app handed over; none of its children has an fd 3 at all.
+        assert_eq!(report["fromSpawn"], "none", "{report}");
+        assert_eq!(report["fromSpawnSync"], "none", "{report}");
+        assert_eq!(report["fromShell"], "none", "{report}");
+        // And the daemon's startup probe would have seen a leak, had there been one.
+        assert_eq!(report["detectsALeak"], true, "{report}");
+        // No grandchild holds the pipe handle itself, however it was started.
+        let handles = &report["handles"];
+        // The probes looked at the very handle this app handed over (fd 3's `ino` is its value).
+        assert_eq!(handles["value"], child.channel_value.unwrap().to_string().as_str(), "{report}");
+        for how in ["fromSpawn", "fromSpawnSync", "fromShell"] {
+            assert_eq!(handles[how], "closed", "{how}: {report}");
+        }
+    }
+
+    /// The pair on Windows: the app's end talks to the daemon's, and only to it.
+    #[cfg(windows)]
+    #[test]
+    fn windows_hands_the_daemon_its_end_of_the_channel_on_fd_3() {
+        use std::os::windows::io::AsHandle;
+        let dir = scratch_dir("windows-channel-fd");
+        let (app, daemon_end) = channel_pair().unwrap();
+        let spec = crate::win_spawn::tests::helper_spec("fd3");
+        let mut child = spawn_daemon(&spec, open_private_log(&dir).unwrap(), Some(daemon_end.as_handle())).unwrap();
+        drop(daemon_end);
+        (&app).write_all(b"ping\n").unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(app.try_clone().unwrap()), &mut line).unwrap();
+        assert_eq!(line, "pipe ping\n");
+        assert!(child.wait().unwrap().success());
     }
 
     #[cfg(windows)]

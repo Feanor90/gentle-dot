@@ -42,9 +42,52 @@ const fromSpawn = await new Promise<string>((resolve) => {
 	child.on("close", () => resolve(out.trim()));
 });
 const fromSpawnSync = spawnSync(process.execPath, ["-e", PRINT_FD3], { encoding: "utf8" }).stdout.trim();
-const fromShell = execFileSync("/bin/sh", ["-c", "if [ -e /dev/fd/3 ]; then echo open; else echo none; fi"], {
-	encoding: "utf8",
-}).trim();
+// Through a shell, as sign-in commands run. Windows' cmd.exe cannot look at fd 3: Node behind it does.
+const fromShell =
+	process.platform === "win32"
+		? spawnSync(
+				process.env.ComSpec ?? "cmd.exe",
+				["/d", "/s", "/c", `""${process.execPath}" -e "${PRINT_FD3}""`],
+				{
+					encoding: "utf8",
+					windowsVerbatimArguments: true,
+				},
+			).stdout.trim()
+		: execFileSync("/bin/sh", ["-c", "if [ -e /dev/fd/3 ]; then echo open; else echo none; fi"], {
+				encoding: "utf8",
+			}).trim();
+/**
+ * Windows: Node sees descriptors, not handles. When the app's test passes its handle probe
+ * (`GENTLE_DOT_TEST_HANDLE_PROBE`: `{program, args, server}`), each kind of child runs it on the
+ * value of fd 3's handle (`ino` on Windows), which an inherited handle keeps: "leaked" when that
+ * value is, in the child, an end of the app's pipe.
+ */
+async function handleProbes(): Promise<Record<string, string> | undefined> {
+	const given = process.env.GENTLE_DOT_TEST_HANDLE_PROBE;
+	if (process.platform !== "win32" || !given) return undefined;
+	const probe = JSON.parse(given) as { program: string; args: string[]; server: number };
+	const env = { ...process.env, GENTLE_DOT_TEST_CHILD: `pipe:${own.ino}:${probe.server}` };
+	const verdict = (out: string) => out.match(/probe (leaked|closed)/)?.[1] ?? `unknown: ${out}`;
+	const fromSpawn = await new Promise<string>((resolve) => {
+		const child = spawn(probe.program, probe.args, { stdio: ["pipe", "pipe", "pipe"], env });
+		let out = "";
+		child.stdout.on("data", (chunk: Buffer) => {
+			out += chunk.toString();
+		});
+		child.on("close", () => resolve(verdict(out)));
+	});
+	const fromSpawnSync = verdict(spawnSync(probe.program, probe.args, { encoding: "utf8", env }).stdout);
+	const line = [`"${probe.program}"`, ...probe.args].join(" ");
+	const fromShell = verdict(
+		spawnSync(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", `"${line}"`], {
+			encoding: "utf8",
+			env,
+			windowsVerbatimArguments: true,
+		}).stdout,
+	);
+	return { value: String(own.ino), fromSpawn, fromSpawnSync, fromShell };
+}
+
 channel.handler = async (method, params) => (method === "echo" ? params : undefined);
 await channel.request(
 	"report",
@@ -54,6 +97,7 @@ await channel.request(
 		fromSpawnSync,
 		fromShell,
 		detectsALeak: childInherits(3, identity, ["ignore", "pipe", "ignore", 3]),
+		handles: await handleProbes(),
 	},
 	5000,
 );
