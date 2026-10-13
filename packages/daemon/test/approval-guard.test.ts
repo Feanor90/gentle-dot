@@ -363,6 +363,84 @@ describe("approval guard extension", () => {
 		return handlers[0] as Handler;
 	}
 
+	const privateRefusal =
+		"That file holds the user's private sign-ins or settings, so the assistant cannot use it. Connectors are managed by the user in the Connectors screen; for anything else there, ask the user.";
+	const connectorRefusal =
+		"Connectors are managed by the user in the Connectors screen. Ask the user to make this change there.";
+
+	// Dispatch stand-ins only: no shell, Credential Manager, or real user files are used.
+	async function dispatchCommand(toolName: string, command: string, guarded: ConnectorPolicy) {
+		const handler = load({ [POLICY_ENV]: JSON.stringify(guarded) });
+		const { ctx, asked } = fakeCtx(true);
+		const state = { executions: 0, stored: "fixture", stdout: "", stderr: "" };
+		const result = await handler(
+			{ type: "tool_call", toolName, toolCallId: "command", input: { command } },
+			ctx,
+		);
+		if (!(result as { block?: boolean } | undefined)?.block) {
+			state.executions++;
+			state.stored = "executed";
+			state.stdout = "fixture output";
+		}
+		return { result, asked, state };
+	}
+
+	const windowsPolicy: ConnectorPolicy = {
+		connectors: {},
+		protectedPaths: [String.raw`C:\fixture\agent\auth.json`, String.raw`C:\fixture\token`],
+	};
+	const windowsRules = [
+		["Windows token separator", String.raw`Get-Content C:\fixture\TOKEN`, privateRefusal],
+		["Windows protected basename", String.raw`Get-Content C:\fixture\agent\AUTH.JSON`, privateRefusal],
+		["Windows wildcard separator", String.raw`type C:\fixture\agent\aut*.json`, privateRefusal],
+		["cmdkey", "cmdkey /list", privateRefusal],
+		["cmdkey executable and case", String.raw`& "C:\Windows\System32\CMDKEY.EXE" /list`, privateRefusal],
+		["vaultcmd", "vaultcmd /list", privateRefusal],
+		["vaultcmd executable and case", String.raw`C:\Windows\System32\VAULTCMD.EXE /listcreds`, privateRefusal],
+		["USERPROFILE data folder", String.raw`type %USERPROFILE%\.GENTLE-DOT\token`, privateRefusal],
+		["Windows connector case", "pi MCP ADD notion", connectorRefusal],
+	] as const;
+	for (const toolName of ["bash", "powershell"]) {
+		it.each(windowsRules)(`${toolName} refuses %s without executing the handler`, async (_rule, command, reason) => {
+			expect(await dispatchCommand(toolName, command, windowsPolicy)).toEqual({
+				result: { block: true, reason },
+				asked: [],
+				state: { executions: 0, stored: "fixture", stdout: "", stderr: "" },
+			});
+		});
+
+		it(`${toolName} preserves Unix escaped names, connector and keychain refusals`, async () => {
+			for (const [command, reason] of [
+				[String.raw`cat ../agent/au\th.json`, privateRefusal],
+				[`cat ../agent/"au"'th.json'`, privateRefusal],
+				[`cat ../agent/'auth' + '.json'`, privateRefusal],
+				["cat ../token", privateRefusal],
+				["security find-generic-password -s fixture -w", privateRefusal],
+				["pi mcp remove notion", connectorRefusal],
+			]) {
+				expect(await dispatchCommand(toolName, command as string, windowsPolicy)).toEqual({
+					result: { block: true, reason },
+					asked: [],
+					state: { executions: 0, stored: "fixture", stdout: "", stderr: "" },
+				});
+			}
+		});
+
+		it(`${toolName} preserves harmless commands and look-alike names`, async () => {
+			for (const command of [
+				"git status", "ls -la", "Get-Content README.md", String.raw`type C:\fixture\notes.txt`,
+				"echo $GITHUB_TOKEN", "echo %GITHUB_TOKEN%", "mycmdkey /list", "vaultcmd-helper /list",
+				"pi mcp list", "security help",
+			]) {
+				expect(await dispatchCommand(toolName, command, windowsPolicy)).toEqual({
+					result: undefined,
+					asked: [],
+					state: { executions: 1, stored: "executed", stdout: "fixture output", stderr: "" },
+				});
+			}
+		});
+	}
+
 	it("reads the policy from its own environment and passes read-only tools without asking", async () => {
 		const handler = load({ [POLICY_ENV]: JSON.stringify(policy()) });
 		const { ctx, asked } = fakeCtx(true);

@@ -157,9 +157,11 @@ const PRIVATE_FILE =
 	"That file holds the user's private sign-ins or settings, so the assistant cannot use it. Connectors are managed by the user in the Connectors screen; for anything else there, ask the user.";
 const DECLINED = "The user did not allow this action. Do not try it again unless the user asks.";
 const NO_UI = "This action needs the user's approval, and no one can approve it right now.";
-const CONNECTOR_COMMAND = /\bmcp\s+(?:add|login|logout|remove)\b/;
+const CONNECTOR_COMMAND = /\bmcp\s+(?:add|login|logout|remove)\b/i;
 /** Reads of the macOS keychain. */
 const KEYCHAIN_COMMAND = /\bsecurity\s+(?:find-(?:generic|internet)-password|dump-keychain|export)\b/;
+/** Windows Credential Manager utilities, bare or by executable path (text check, not shell parsing). */
+const CREDENTIAL_COMMAND = /(?:^|[\s/;|&()<>])(?:cmdkey|vaultcmd)(?:\.exe)?(?=$|[\s;|&()<>])/;
 /** Names a command must not mention: the engine's home variable and the data folder. */
 const PRIVATE_NAMES = ["pi_coding_agent_dir", ".gentle-dot"];
 /** The engine's file tools, by the path they take. */
@@ -358,24 +360,34 @@ function show(value: unknown): string {
 }
 
 /**
- * True when a command mentions a private file by name (quotes, backslashes, and string
- * concatenation removed, any case), the data folder, the engine's home variable, or the keychain.
+ * True when a command mentions a private file by name (quotes and concatenation removed,
+ * any case), the data folder, the engine's home variable, or a credential-store utility.
+ * Check both Unix escapes (backslashes removed) and Windows separators (backslashes as slashes).
  * Best effort: a shell can always spell a name some other way.
  */
 function namesPrivateFile(command: string, protectedPaths: string[]): boolean {
-	const text = command
+	const unquoted = command
 		.replace(/(["'`])\s*\+\s*(["'`])/g, "")
-		.replace(/["'`\\]/g, "")
+		.replace(/["'`]/g, "")
 		.toLowerCase();
-	if (KEYCHAIN_COMMAND.test(text) || PRIVATE_NAMES.some((name) => text.includes(name))) return true;
-	const words = text.split(/[\s;|&()<>=,+]+/).map((word) => word.slice(word.lastIndexOf("/") + 1));
-	return protectedPaths.some((path) => {
-		const name = basename(path).toLowerCase();
-		// A name without a dot (`token`) counts only as a word of its own, not inside `$GITHUB_TOKEN`.
-		if (name.includes(".") ? text.includes(name) : words.includes(name)) return true;
-		return words.some(
-			(word) => /[*?[]/.test(word) && word.replace(/[*?[\]]/g, "").length >= 3 && glob(word).test(name),
-		);
+	const spellings = [unquoted.replace(/\\/g, ""), unquoted.replace(/\\/g, "/")];
+	return spellings.some((text) => {
+		if (
+			KEYCHAIN_COMMAND.test(text) ||
+			CREDENTIAL_COMMAND.test(text) ||
+			PRIVATE_NAMES.some((name) => text.includes(name))
+		)
+			return true;
+		const words = text.split(/[\s;|&()<>=,+]+/).map((word) => word.slice(word.lastIndexOf("/") + 1));
+		return protectedPaths.some((path) => {
+			// Policy paths may use either separator, regardless of the host running the guard.
+			const name = path.replace(/\\/g, "/").split("/").pop()?.toLowerCase() ?? "";
+			// A name without a dot (`token`) counts only as a word of its own, not inside `$GITHUB_TOKEN`.
+			if (name.includes(".") ? text.includes(name) : words.includes(name)) return true;
+			return words.some(
+				(word) => /[*?[]/.test(word) && word.replace(/[*?[\]]/g, "").length >= 3 && glob(word).test(name),
+			);
+		});
 	});
 }
 
