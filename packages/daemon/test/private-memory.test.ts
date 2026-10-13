@@ -1,7 +1,8 @@
 // A4: with GENTLE_DOT_ENGRAM=private, the memory server the engine starts outlives it. The daemon
 // stops it when it closes, only when the daemon caused it (nothing listened on the private port
 // at start) and it serves the private data folder. The memory server here is a stand-in on a
-// free port; nothing is stopped by name, only the PIDs this test started.
+// free port; nothing is stopped by name, only the PIDs this test started. Windows asks `netstat`
+// instead of `lsof`, and the same cases run there.
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
@@ -18,6 +19,13 @@ const hasLsof = (() => {
 		return false;
 	}
 })();
+
+/** Whether a server can listen on the IPv6 loopback here (some machines have it disabled). */
+const hasIpv6Loopback = await new Promise<boolean>((resolve) => {
+	const probe = createServer();
+	probe.once("error", () => resolve(false));
+	probe.listen(0, "::1", () => probe.close(() => resolve(true)));
+});
 
 const started: ChildProcess[] = [];
 afterEach(() => {
@@ -36,12 +44,12 @@ function freePort(): Promise<number> {
 }
 
 /** A memory server stand-in: answers /health with its instance id, like Engram. */
-async function memoryServer(port: number, instanceId: string): Promise<ChildProcess> {
+async function memoryServer(port: number, instanceId: string, host = "127.0.0.1"): Promise<ChildProcess> {
 	const child = spawn(
 		process.execPath,
 		[
 			"-e",
-			`require("http").createServer((q, s) => s.end(JSON.stringify({ status: "ok", instance_id: ${JSON.stringify(instanceId)} }))).listen(${port}, "127.0.0.1", () => console.log("up"))`,
+			`require("http").createServer((q, s) => s.end(JSON.stringify({ status: "ok", instance_id: ${JSON.stringify(instanceId)} }))).listen(${port}, ${JSON.stringify(host)}, () => console.log("up"))`,
 		],
 		{ stdio: ["ignore", "pipe", "ignore"] },
 	);
@@ -75,14 +83,15 @@ async function daemon(port: number) {
 	});
 }
 
-describe.skipIf(!hasLsof)("private memory server (A4)", () => {
+describe.skipIf(!hasLsof && process.platform !== "win32")("private memory server (A4)", () => {
 	it("stops the private memory server it caused to start, by PID, when it closes", async () => {
 		const port = await freePort();
 		const d = await daemon(port);
 		const memory = await memoryServer(port, "private-instance");
 		await d.close();
 		await waitFor(() => !running(memory));
-		expect(memory.signalCode).toBe("SIGTERM");
+		// Windows ends a process it did not spawn without a signal name.
+		if (process.platform !== "win32") expect(memory.signalCode).toBe("SIGTERM");
 	});
 
 	it("leaves a memory server that was already running, or that serves other data", async () => {
@@ -97,5 +106,17 @@ describe.skipIf(!hasLsof)("private memory server (A4)", () => {
 		await new Promise((resolve) => setTimeout(resolve, 300));
 		expect(running(already)).toBe(true);
 		expect(running(foreign)).toBe(true);
+	});
+
+	it.skipIf(!hasIpv6Loopback)("never stops anything when the owner of the port cannot be told", async () => {
+		const port = await freePort();
+		const d = await daemon(port);
+		// Two processes own the port (one per address family), both with the private instance id.
+		const v4 = await memoryServer(port, "private-instance");
+		const v6 = await memoryServer(port, "private-instance", "::1");
+		await d.close();
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		expect(running(v4)).toBe(true);
+		expect(running(v6)).toBe(true);
 	});
 });

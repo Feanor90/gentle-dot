@@ -217,11 +217,14 @@ export async function privateMemory(
 ): Promise<{ stop(): Promise<void> } | undefined> {
 	if (base.GENTLE_DOT_ENGRAM !== "private") return undefined;
 	const port = base.GENTLE_DOT_ENGRAM_PORT || PRIVATE_ENGRAM_PORT;
-	if ((await listeningPid(port)) !== undefined) return undefined;
+	// Only a free port means the daemon caused the server: one owner is not ours, unknown cannot be told.
+	if ((await listeningPid(port)).state !== "absent") return undefined;
 	return {
 		async stop() {
-			const pid = await listeningPid(port);
-			if (pid === undefined) return;
+			// Only a single, certain owner may be stopped; no listener or an unknown owner never is.
+			const owner = await listeningPid(port);
+			if (owner.state !== "one") return;
+			const pid = owner.pid;
 			let expected: string;
 			try {
 				const file = join(dataDir, "home", ".engram", ".instance-id");
@@ -244,12 +247,77 @@ export async function privateMemory(
 	};
 }
 
+/** Who listens on a port: nobody, exactly one process, or it cannot be told (never managed or killed). */
+export type ListeningPid = { state: "absent" } | { state: "one"; pid: number } | { state: "unknown" };
+
+const ABSENT: ListeningPid = { state: "absent" };
+const UNKNOWN: ListeningPid = { state: "unknown" };
+
+/** The PID listening on `port` on this computer: `netstat` on Windows, `lsof` elsewhere. */
+export function listeningPid(port: string): Promise<ListeningPid> {
+	return process.platform === "win32" ? netstatListeners(port) : lsofListener(port);
+}
+
+/** The Unix answer: one PID, or absent for everything else, as the daemon always treated it. */
+async function lsofListener(port: string): Promise<ListeningPid> {
+	const pid = await lsofPid(port);
+	return pid === undefined ? ABSENT : { state: "one", pid };
+}
+
 /** The one PID listening on `port` on this computer (`lsof`), if any. */
-function listeningPid(port: string): Promise<number | undefined> {
+function lsofPid(port: string): Promise<number | undefined> {
 	return new Promise((resolve) => {
 		execFile("lsof", ["-t", "-n", "-P", `-iTCP:${port}`, "-sTCP:LISTEN"], (error, stdout) => {
 			const pids = [...new Set(String(stdout).trim().split("\n").filter(Boolean))];
 			resolve(!error && pids.length === 1 && /^\d+$/.test(pids[0] ?? "") ? Number(pids[0]) : undefined);
 		});
 	});
+}
+
+/**
+ * Asks `netstat` by its absolute system path (no shell, no PATH lookup). A tool failure is unknown.
+ * No `-p` filter: `-p TCP` lists IPv4 sockets only, so an IPv6 listener would read as absent.
+ */
+function netstatListeners(port: string): Promise<ListeningPid> {
+	const netstat = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\NETSTAT.EXE`;
+	return new Promise((resolve) => {
+		execFile(
+			netstat,
+			["-ano"],
+			{ windowsHide: true, timeout: 10_000, maxBuffer: 16 * 1024 * 1024 },
+			(error, stdout) => resolve(error ? UNKNOWN : parseNetstatListeners(String(stdout), port)),
+		);
+	});
+}
+
+/**
+ * Reads `netstat -ano` output for the sockets listening on `port` (an exact match, so 74380 and
+ * 17438 are not 7438). A listening TCP socket is recognized by its unconnected foreign address
+ * (`0.0.0.0:0` or `[::]:0`), not by the state text, which Windows localizes. Distinct PIDs, a
+ * malformed TCP row, a non-table output or a bad `port` are unknown; empty output is absent.
+ */
+export function parseNetstatListeners(output: string, port: string): ListeningPid {
+	if (!/^\d+$/.test(port)) return UNKNOWN;
+	const wanted = Number(port);
+	const pids = new Set<number>();
+	let tcpRows = 0;
+	for (const line of output.split(/\r?\n/)) {
+		const fields = line.trim().split(/\s+/);
+		if (fields[0] !== "TCP") continue;
+		tcpRows++;
+		// Proto, local, foreign, state (one word in every locale seen), PID.
+		if (fields.length < 5) return UNKNOWN;
+		const [, local = "", foreign = ""] = fields;
+		const localPort = local.slice(local.lastIndexOf(":") + 1);
+		if (!/^\d+$/.test(localPort)) return UNKNOWN;
+		if (foreign !== "0.0.0.0:0" && foreign !== "[::]:0") continue;
+		if (Number(localPort) !== wanted) continue;
+		const pid = fields[fields.length - 1] ?? "";
+		if (!/^\d+$/.test(pid) || Number(pid) === 0) return UNKNOWN;
+		pids.add(Number(pid));
+	}
+	if (tcpRows === 0) return output.trim() === "" ? ABSENT : UNKNOWN;
+	if (pids.size === 0) return ABSENT;
+	const [only] = pids;
+	return pids.size === 1 && only !== undefined ? { state: "one", pid: only } : UNKNOWN;
 }
