@@ -12,6 +12,12 @@
 //! after it. While they exist, a process another thread of the app spawns with plain inheritance
 //! could get them too; the window is that one call. On macOS and Linux the same choice is made in
 //! the child itself, with no such window.
+//!
+//! The child starts suspended and is placed in a Job of its own before its first instruction runs.
+//! The Job ends every process in it when its last handle closes (`KILL_ON_JOB_CLOSE`), and only the
+//! app holds that handle, so the daemon and everything it starts end with the app, a crash included.
+//! The Job does not allow breakaway, so no descendant can leave it. A child that cannot be placed in
+//! its Job, or resumed, is ended and the spawn fails.
 
 use crate::daemon::ChildProcess;
 use std::ffi::OsString;
@@ -24,12 +30,18 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::{mem, ptr};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS, HANDLE, TRUE, WAIT_OBJECT_0,
+    DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS, HANDLE, TRUE, WAIT_OBJECT_0,
+};
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW};
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess, InitializeProcThreadAttributeList,
-    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
+    ResumeThread, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
+    CREATE_SUSPENDED,
+    CREATE_UNICODE_ENVIRONMENT,
     EXTENDED_STARTUPINFO_PRESENT, INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
@@ -50,6 +62,9 @@ pub struct Spawn<'a> {
 #[derive(Debug)]
 pub struct WinChild {
     process: OwnedHandle,
+    /// The child's Job: closing it (dropping the child, or the app ending) ends the whole tree.
+    /// `None` only for [`spawn_outside_job`].
+    _job: Option<OwnedHandle>,
     pid: u32,
     status: Option<ExitStatus>,
     /// The channel's handle value in the child (an inherited handle keeps its value), for tests.
@@ -58,8 +73,19 @@ pub struct WinChild {
 }
 
 /// Starts `spawn` without a window, stdin `NUL`, stdout and stderr `log`, `channel` on fd 3, and no
-/// other handle of the app.
+/// other handle of the app, in a Job that ends it and its descendants with the app.
 pub fn spawn(spawn: &Spawn<'_>, log: &File, channel: Option<BorrowedHandle<'_>>) -> io::Result<WinChild> {
+    create(spawn, log, channel, true)
+}
+
+/// Starts `spawn` like [`spawn`], without a channel, and outside any Job of this app, in a process
+/// group of its own: it outlives the app. Only for a server other programs share (the user's memory
+/// server), which the app must never end.
+pub fn spawn_outside_job(spawn: &Spawn<'_>, log: &File) -> io::Result<WinChild> {
+    create(spawn, log, None, false)
+}
+
+fn create(spawn: &Spawn<'_>, log: &File, channel: Option<BorrowedHandle<'_>>, contained: bool) -> io::Result<WinChild> {
     let program = resolve(spawn.program, path_of(spawn.envs).as_deref())?;
     let mut command_line = wide_nul(command_line(spawn.program, spawn.args));
     let environment = environment_block(spawn.envs);
@@ -69,6 +95,7 @@ pub fn spawn(spawn: &Spawn<'_>, log: &File, channel: Option<BorrowedHandle<'_>>)
     let nul = inheritable(borrow(&nul))?;
     let out = inheritable(borrow(log))?;
     let channel = channel.map(inheritable).transpose()?;
+    let job = if contained { Some(kill_on_close_job()?) } else { None };
 
     let mut listed: Vec<HANDLE> = vec![raw(&nul), raw(&out)];
     listed.extend(channel.as_ref().map(raw));
@@ -102,7 +129,10 @@ pub fn spawn(spawn: &Spawn<'_>, log: &File, channel: Option<BorrowedHandle<'_>>)
             ptr::null(),
             ptr::null(),
             TRUE,
-            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+            if contained { CREATE_SUSPENDED } else { CREATE_NEW_PROCESS_GROUP }
+                | CREATE_NO_WINDOW
+                | CREATE_UNICODE_ENVIRONMENT
+                | EXTENDED_STARTUPINFO_PRESENT,
             environment.as_ptr().cast(),
             ptr::null(),
             &startup.StartupInfo,
@@ -118,17 +148,59 @@ pub fn spawn(spawn: &Spawn<'_>, log: &File, channel: Option<BorrowedHandle<'_>>)
     if created == 0 {
         return Err(error);
     }
-    // SAFETY: CreateProcessW returned both handles; we keep the process and close the thread.
-    unsafe { CloseHandle(info.hThread) };
-    // SAFETY: the process handle CreateProcessW returned, now owned.
+    // SAFETY: the handles CreateProcessW returned, now owned.
     let process = unsafe { OwnedHandle::from_raw_handle(info.hProcess as RawHandle) };
+    // SAFETY: as above; the thread handle closes at the end of this function.
+    let thread = unsafe { OwnedHandle::from_raw_handle(info.hThread as RawHandle) };
+    // Placed in its Job while suspended, before it can start anything; then resumed.
+    if let Some(job) = &job {
+        // SAFETY: our job and process handles.
+        let placed = unsafe { AssignProcessToJobObject(raw(job), raw(&process)) } != 0;
+        // SAFETY: our suspended thread's handle; u32::MAX is failure.
+        if !placed || unsafe { ResumeThread(raw(&thread)) } == u32::MAX {
+            let error = io::Error::last_os_error();
+            // SAFETY: our process handle; the child never ran an instruction of its own.
+            unsafe { TerminateProcess(raw(&process), 1) };
+            return Err(error);
+        }
+    }
+    drop(thread);
     Ok(WinChild {
         process,
+        _job: job,
         pid: info.dwProcessId,
         status: None,
         #[cfg(test)]
         channel_value,
     })
+}
+
+/// A Job that ends every process in it when its last handle closes, and lets none leave it. The
+/// handle is not inheritable.
+fn kill_on_close_job() -> io::Result<OwnedHandle> {
+    // SAFETY: an unnamed job with default security; the handle is not inheritable.
+    let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+    if job.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: CreateJobObjectW returned a new handle, now owned.
+    let job = unsafe { OwnedHandle::from_raw_handle(job as RawHandle) };
+    // SAFETY: an all-zero limit structure is valid.
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { mem::zeroed() };
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: our job handle and a structure of the size passed.
+    let set = unsafe {
+        SetInformationJobObject(
+            raw(&job),
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if set == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(job)
 }
 
 fn borrow(file: &File) -> BorrowedHandle<'_> {
@@ -404,7 +476,8 @@ pub(crate) mod tests {
     const MODE: &str = "GENTLE_DOT_TEST_CHILD";
 
     /// The test binary as a child, in `mode`: `fd3` answers one line on fd 3 with what fd 3 is,
-    /// `echo` answers every request on fd 3 like a daemon, `handle:<value>:<path>` reports whether
+    /// `echo` answers every request on fd 3 like a daemon; `echo-cleanup` also logs clean channel
+    /// closure. `handle:<value>:<path>` reports whether
     /// the handle `<value>` is open on `<path>` in the child, `pipe:<value>:<pid>` whether it is an
     /// end of a pipe served by `<pid>` (the app's channel), `stdio` prints a line on stdout and
     /// stderr, and `sleep` waits 30 s.
@@ -468,7 +541,7 @@ pub(crate) mod tests {
                 }
                 None => println!("fd3 none"),
             },
-            "echo" => {
+            "echo" | "echo-cleanup" => {
                 let channel = fd3().expect("a channel on fd 3");
                 let mut reader = BufReader::new(channel.try_clone().unwrap());
                 let mut line = String::new();
@@ -479,12 +552,52 @@ pub(crate) mod tests {
                     (&*channel).write_all(answer.as_bytes()).unwrap();
                     line.clear();
                 }
+                if mode == "echo-cleanup" { println!("channel closed cleanly"); }
             }
             "stdio" => {
                 println!("to stdout");
                 eprintln!("to stderr");
             }
             "sleep" => std::thread::sleep(Duration::from_secs(30)),
+            "listen" => {
+                let port: u16 = std::env::var("ENGRAM_PORT").unwrap().parse().unwrap();
+                let _listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+                if let Ok(report) = std::env::var("GENTLE_DOT_TEST_REPORT") {
+                    let var = |key: &str| std::env::var(key).unwrap_or_default();
+                    std::fs::write(report, format!("{}|{}", var("ENGRAM_DATA_DIR"), var("ENGRAM_CLOUD_AUTOSYNC"))).unwrap();
+                }
+                std::thread::sleep(Duration::from_secs(30));
+            }
+            "tree" => {
+                let spec = helper_spec("sleep");
+                let mut grandchild = std::process::Command::new(&spec.program)
+                    .args(&spec.args)
+                    .envs(spec.envs.iter().map(|(k, v)| (k, v)))
+                    .spawn()
+                    .unwrap();
+                println!("grandchild {}", grandchild.id());
+                std::io::stdout().flush().unwrap();
+                // The test ends both through the Job long before this returns.
+                let _ = grandchild.wait();
+            }
+            "breakaway" => {
+                use std::os::windows::process::CommandExt;
+                const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+                let spec = helper_spec("sleep");
+                match std::process::Command::new(&spec.program)
+                    .args(&spec.args)
+                    .envs(spec.envs.iter().map(|(k, v)| (k, v)))
+                    .creation_flags(CREATE_BREAKAWAY_FROM_JOB)
+                    .spawn()
+                {
+                    Ok(mut escaped) => {
+                        println!("breakaway allowed");
+                        let _ = escaped.kill();
+                        let _ = escaped.wait();
+                    }
+                    Err(_) => println!("breakaway denied"),
+                }
+            }
             probe if probe.starts_with("pipe:") => {
                 let (value, server) = probe["pipe:".len()..].split_once(':').unwrap();
                 let held = holds_pipe_of(value.parse::<usize>().unwrap() as HANDLE, server.parse().unwrap());
@@ -578,6 +691,21 @@ pub(crate) mod tests {
         assert!(stray_reaches(false).contains("probe closed"));
     }
 
+    /// The shared memory server, started outside the Job, gets no handle of the app either.
+    #[test]
+    fn no_other_handle_of_the_app_reaches_a_child_outside_the_job() {
+        let dir = scratch("win-stray-outside");
+        let stray_file = File::create(dir.join("stray")).unwrap();
+        let stray = inheritable(borrow(&stray_file)).unwrap();
+        let path = path_of_handle(raw(&stray)).unwrap();
+        let spec = helper_spec(&format!("handle:{}:{path}", raw(&stray) as usize));
+        let log = File::create(dir.join("log")).unwrap();
+        let mut child = spawn_outside_job(&Spawn { program: &spec.program, args: &spec.args, envs: &spec.envs }, &log).unwrap();
+        assert!(child.wait().unwrap().success());
+        drop(stray);
+        assert!(std::fs::read_to_string(dir.join("log")).unwrap().contains("probe closed"));
+    }
+
     #[test]
     fn the_stray_handle_probe_sees_a_leak_when_there_is_one() {
         // `std::process::Command` inherits every inheritable handle: the probe must see it.
@@ -636,6 +764,50 @@ pub(crate) mod tests {
         assert_eq!(child.try_wait().unwrap(), Some(status));
         // Killing an ended child is not an error.
         child.kill().unwrap();
+    }
+
+    /// The log's text once it has a line starting with `prefix`, within `timeout`.
+    fn wait_for_line(path: &Path, prefix: &str, timeout: Duration) -> Option<String> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            if let Some(line) = text.lines().find(|line| line.starts_with(prefix)) {
+                return Some(line.to_string());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        None
+    }
+
+    /// A crash of the app closes every handle it held: the Job's last handle going away ends the
+    /// daemon and everything it started, so nothing of it outlives the app.
+    #[test]
+    fn closing_the_child_ends_its_whole_process_tree() {
+        let dir = scratch("win-job-tree");
+        let log = File::create(dir.join("log")).unwrap();
+        let child = run(&helper_spec("tree"), &log, None);
+        let line = wait_for_line(&dir.join("log"), "grandchild ", Duration::from_secs(20)).expect("the grandchild started");
+        let grandchild: u32 = line["grandchild ".len()..].trim().parse().unwrap();
+        let pid = child.id();
+        assert!(crate::daemon::process_started(grandchild).is_some(), "the grandchild runs");
+        drop(child);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while crate::daemon::process_started(grandchild).is_some() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(crate::daemon::process_started(grandchild), None, "the grandchild ended with the job");
+        assert_eq!(crate::daemon::process_started(pid), None, "the child ended with the job");
+    }
+
+    /// No descendant of the daemon may leave its Job (no `JOB_OBJECT_LIMIT_BREAKAWAY_OK`).
+    #[test]
+    fn no_descendant_can_leave_the_job() {
+        let dir = scratch("win-job-breakaway");
+        let log = File::create(dir.join("log")).unwrap();
+        let mut child = run(&helper_spec("breakaway"), &log, None);
+        assert!(child.wait().unwrap().success());
+        let text = std::fs::read_to_string(dir.join("log")).unwrap();
+        assert!(text.contains("breakaway denied"), "{text}");
     }
 
     #[test]

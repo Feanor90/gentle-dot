@@ -6,6 +6,8 @@ pub mod config;
 pub mod daemon;
 #[cfg(target_os = "macos")]
 pub mod disclaimed;
+#[cfg(windows)]
+pub mod engram_bootstrap;
 pub mod geometry;
 pub mod health;
 pub mod platform;

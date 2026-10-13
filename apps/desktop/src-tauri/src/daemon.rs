@@ -80,7 +80,37 @@ pub fn process_started(pid: u32) -> Option<u64> {
     fields.get(19)?.parse().ok()
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// Windows creation time in 100-nanosecond FILETIME units; only a still-running process qualifies.
+#[cfg(windows)]
+pub fn process_started(pid: u32) -> Option<u64> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{FILETIME, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, WaitForSingleObject,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    };
+
+    // SAFETY: query and synchronize rights only, and the handle is never inheritable.
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, 0, pid) };
+    if raw.is_null() { return None; }
+    // SAFETY: OpenProcess returned a new valid handle, owned here until it is closed on every path.
+    let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let mut created = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let mut exited = created;
+    let mut kernel = created;
+    let mut user = created;
+    // SAFETY: the live owned handle and four writable FILETIME buffers match the API contract.
+    if unsafe { GetProcessTimes(process.as_raw_handle(), &mut created, &mut exited, &mut kernel, &mut user) } == 0 {
+        return None;
+    }
+    // GetProcessTimes also works after exit. Only WAIT_TIMEOUT proves the process is still running;
+    // a signalled handle or a wait failure is never interpreted as a live daemon.
+    // SAFETY: zero-duration wait on the same owned handle with synchronize rights.
+    if unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } != WAIT_TIMEOUT { return None; }
+    Some((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub fn process_started(_pid: u32) -> Option<u64> {
     None
 }
@@ -130,10 +160,40 @@ fn may_be_daemon(pid: u32) -> bool {
     pid > 1 && pid != std::process::id() && Some(pid) != parent
 }
 
-/// On Windows pid 0 is the idle process and 4 the kernel.
+/// On Windows pid 0 is idle and 4 the kernel; never accept this app or its parent.
 #[cfg(windows)]
 fn may_be_daemon(pid: u32) -> bool {
-    pid > 4 && pid != std::process::id()
+    pid > 4 && pid != std::process::id() && windows_parent_pid().is_some_and(|parent| pid != parent)
+}
+
+/// Read the current process's parent from a non-inheritable snapshot. Failure rejects records.
+#[cfg(windows)]
+fn windows_parent_pid() -> Option<u32> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+    // SAFETY: process snapshot; without TH32CS_INHERIT the handle is not inheritable.
+    let handle = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    // SAFETY: a successfully created snapshot transfers one owned handle.
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(handle) };
+    // SAFETY: initialization plus dwSize is the required PROCESSENTRY32W layout.
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    // SAFETY: valid snapshot and writable correctly sized entry.
+    let mut found = unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) } != 0;
+    while found {
+        if entry.th32ProcessID == std::process::id() {
+            return Some(entry.th32ParentProcessID);
+        }
+        // SAFETY: same valid snapshot and entry as above.
+        found = unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) } != 0;
+    }
+    None
 }
 
 /// The daemon the pid file names, if it holds a launch. Only a small regular file is read: a
@@ -202,10 +262,48 @@ fn stop_orphan(launch: Launched, grace: Duration) {
     }
 }
 
-/// Windows records no start time yet ([`process_started`] is `None`), so [`live_orphan`] finds no
-/// orphan and nothing calls this.
+/// Ends a recorded daemon that is not this app's child. One handle is opened and its creation time
+/// checked against the record; waiting and `TerminateProcess` use that same handle, which pins the
+/// process, so a pid reused meanwhile can never be the one ended. The orphan's channel died with the
+/// earlier app, so it gets `grace` to exit on its own first.
 #[cfg(windows)]
-fn stop_orphan(_launch: Launched, _grace: Duration) {}
+fn stop_orphan(launch: Launched, grace: Duration) {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{FILETIME, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    };
+    if !may_be_daemon(launch.pid) {
+        return;
+    }
+    // SAFETY: plain open of a process handle that is never inheritable.
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, launch.pid) };
+    if raw.is_null() {
+        return;
+    }
+    // SAFETY: OpenProcess returned a new valid handle, owned here.
+    let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let mut created = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut exited, mut kernel, mut user) = (created, created, created);
+    // SAFETY: the owned handle and four writable FILETIME buffers.
+    if unsafe { GetProcessTimes(process.as_raw_handle(), &mut created, &mut exited, &mut kernel, &mut user) } == 0 {
+        return;
+    }
+    if (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime) != launch.started {
+        return;
+    }
+    let millis = |wait: Duration| u32::try_from(wait.as_millis()).unwrap_or(u32::MAX - 1);
+    // SAFETY: waits on the same owned handle, which has synchronize rights.
+    if unsafe { WaitForSingleObject(process.as_raw_handle(), millis(grace)) } != WAIT_TIMEOUT {
+        return;
+    }
+    // SAFETY: the very process whose creation time matched the record, through the same handle.
+    if unsafe { TerminateProcess(process.as_raw_handle(), 1) } != 0 {
+        // SAFETY: same owned handle; bounded wait for the end to complete.
+        unsafe { WaitForSingleObject(process.as_raw_handle(), millis(Duration::from_secs(2))) };
+    }
+}
 
 /// What [`Daemon::ensure_running`] does, from what it finds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +371,25 @@ pub fn launch_spec(env: impl Fn(&str) -> Option<String>, dev: bool, runtime: Opt
         args: vec![pick("GENTLE_DOT_DAEMON_SCRIPT", script)],
         envs,
     }
+}
+
+/// Windows: makes sure the user's shared memory server runs outside the daemon's Job before the
+/// daemon starts (`engram_bootstrap`), and hands the daemon the data folder it was started with, so
+/// the engine's memory plugin finds a server of its own instance and starts none inside the Job.
+/// The folder is handed over even when nothing could be started, so both always agree.
+#[cfg(windows)]
+fn with_shared_memory(mut spec: LaunchSpec, env: impl Fn(&str) -> Option<String>, runtime: Option<&Path>) -> LaunchSpec {
+    use crate::engram_bootstrap::{ensure, shared_memory, Outcome, START_TIMEOUT};
+    let Some(memory) = shared_memory(env, runtime) else {
+        return spec;
+    };
+    match ensure(&memory, START_TIMEOUT) {
+        Outcome::Listening => {}
+        Outcome::Started(pid) => eprintln!("gentle-dot: started the shared memory server (pid {pid}); it outlives the app"),
+        Outcome::NotStarted(why) => eprintln!("gentle-dot: {why}"),
+    }
+    spec.envs.push(("GENTLE_DOT_ENGRAM_DATA_DIR".into(), memory.data_dir.display().to_string()));
+    spec
 }
 
 /// Where a bundled runtime would live: `GENTLE_DOT_RUNTIME_DIR`, else the app's `runtime`
@@ -467,11 +584,21 @@ pub fn stop_child(child: &mut dyn ChildProcess, grace: Duration) {
     let _ = child.wait();
 }
 
-/// Windows has no SIGTERM: the process is ended at once, without the grace period.
+/// Windows has no SIGTERM. The caller closes the app channel first, allowing cleanup during
+/// `grace`; a process that still runs after that deadline is terminated through its owned handle.
 #[cfg(windows)]
-pub fn stop_child(child: &mut dyn ChildProcess, _grace: Duration) {
+pub fn stop_child(child: &mut dyn ChildProcess, grace: Duration) {
     if !matches!(child.try_wait(), Ok(None)) {
         return;
+    }
+    let deadline = Instant::now() + grace;
+    loop {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() { break; }
+        thread::sleep(remaining.min(Duration::from_millis(50)));
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -541,7 +668,7 @@ impl Daemon {
         self
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     fn with_health(mut self, health: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
         self.health = Some(health);
         self
@@ -645,15 +772,24 @@ impl Daemon {
     }
 
     fn spawn(&self) -> Result<(), String> {
+        let real_spec = || launch_spec(|key| std::env::var(key).ok(), cfg!(debug_assertions), self.runtime_dir.as_deref());
+        // Windows: the memory server check can wait up to `engram_bootstrap::START_TIMEOUT`, so it runs
+        // before the child lock and never holds up Quit or a status check. Only the real daemon: a
+        // test's stand-in never starts the user's memory server.
+        #[cfg(windows)]
+        let prepared = self
+            .launch
+            .is_none()
+            .then(|| with_shared_memory(real_spec(), |key| std::env::var(key).ok(), self.runtime_dir.as_deref()));
+        #[cfg(not(windows))]
+        let prepared: Option<LaunchSpec> = None;
         let mut slot = self.child.lock().unwrap();
         if let Some(child) = slot.as_mut() {
             if matches!(child.try_wait(), Ok(None)) {
                 return Ok(());
             }
         }
-        let spec = self.launch.clone().unwrap_or_else(|| {
-            launch_spec(|key| std::env::var(key).ok(), cfg!(debug_assertions), self.runtime_dir.as_deref())
-        });
+        let spec = self.launch.clone().or(prepared).unwrap_or_else(real_spec);
         let log = open_private_log(&self.data_dir).map_err(|e| format!("cannot open daemon.log: {e}"))?;
         let pair = match &self.handler {
             Some(_) => Some(channel_pair().map_err(|e| format!("cannot open the assistant's channel: {e}"))?),
@@ -694,7 +830,23 @@ impl Daemon {
         slot.as_mut().is_some_and(|child| matches!(child.try_wait(), Ok(None)))
     }
 
+    /// Windows cleanup is triggered by closing the app channel, before waiting for exit.
+    #[cfg(windows)]
+    pub fn stop(&self) {
+        // Keep the spawn lock until cleanup finishes, so a concurrent launch cannot have its
+        // new channel closed or its launch record removed by this stop.
+        let mut slot = self.child.lock().unwrap();
+        if let Some(channel) = self.channel.lock().unwrap().take() {
+            channel.close();
+        }
+        if let Some(mut child) = slot.take() {
+            stop_child(child.as_mut(), STOP_GRACE);
+            forget_launch(&self.data_dir, child.id());
+        }
+    }
+
     /// Stops the daemon only if this app spawned it, and closes its channel.
+    #[cfg(not(windows))]
     pub fn stop(&self) {
         let child = self.child.lock().unwrap().take();
         if let Some(mut child) = child {
@@ -1041,6 +1193,27 @@ done"#;
         daemon.stop();
         assert!(daemon.channel().is_none());
         assert!(!channel.is_open());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_stop_closes_the_channel_before_waiting_for_cleanup() {
+        let dir = scratch_dir("windows-channel-cleanup");
+        let daemon = Daemon::new(1, dir.clone(), None)
+            .with_channel(Arc::new(Opened::default()))
+            .with_launch(crate::win_spawn::tests::helper_spec("echo-cleanup"));
+        daemon.spawn().unwrap();
+        let channel = daemon.channel().expect("the daemon's channel");
+        assert_eq!(channel.request("ping", serde_json::json!({}), Duration::from_secs(5)).unwrap(), serde_json::json!({"echo": 1}));
+        daemon.stop();
+        assert!(!channel.is_open());
+        assert!(daemon.channel().is_none());
+        assert!(!daemon.owns_running());
+        let log = fs::read_to_string(dir.join("daemon.log")).unwrap();
+        assert_eq!(log.lines().filter(|line| *line == "channel closed cleanly").count(), 1,
+            "the child completes cleanup rather than being forcibly terminated: {log}");
+        assert!(!dir.join(PID_FILE).exists(), "the stopped child's launch record is removed");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// A stand-in for a daemon this app did not launch (`pnpm dev`, or one an older app left): it
@@ -1406,29 +1579,161 @@ done"#;
 
     #[cfg(windows)]
     #[test]
-    fn windows_stop_child_ends_a_running_process() {
+    fn windows_stop_child_waits_for_grace_before_forcing_a_running_process() {
         let mut child = Command::new("ping")
             .args(["-n", "30", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
             .spawn()
             .unwrap();
+        let grace = Duration::from_millis(150);
         let started = Instant::now();
-        stop_child(&mut child, Duration::from_secs(5));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        stop_child(&mut child, grace);
+        assert!(started.elapsed() >= grace, "a running process gets its cleanup grace period");
+        assert!(started.elapsed() < Duration::from_secs(3), "forced termination is bounded");
         let status = child.try_wait().unwrap().expect("child has exited");
         assert!(!status.success());
+        let started = Instant::now();
+        stop_child(&mut child, Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(1), "an exited child is left alone");
     }
 
-    /// Without a start time to tell a process from a later one with its pid, no launch is recorded.
+    /// Windows analog of `a_relaunched_app_after_a_crashed_one_gets_a_channel`: the earlier app's
+    /// daemon outlives it and ignores its channel; the relaunched app stops exactly that process.
     #[cfg(windows)]
     #[test]
-    fn windows_records_no_launch_and_finds_no_orphan() {
+    fn windows_a_relaunched_app_stops_the_orphan_and_gets_a_channel() {
+        let dir = scratch_dir("windows-relaunch");
+        let health = {
+            let dir = dir.clone();
+            Arc::new(move || recorded_launch(&dir).is_some_and(|launch| process_started(launch.pid) == Some(launch.started)))
+        };
+        let crashed = Daemon::new(1, dir.clone(), None)
+            .with_channel(Arc::new(Opened::default()))
+            .with_launch(crate::win_spawn::tests::helper_spec("sleep"))
+            .with_health(health.clone());
+        crashed.spawn().unwrap();
+        let orphan = recorded_launch(&dir).expect("the launch is recorded");
+        // The earlier app is gone without stopping its daemon.
+        std::mem::forget(crashed.child.lock().unwrap().take());
+        drop(crashed);
+        assert_eq!(live_orphan(&dir), Some(orphan));
+
+        let handler = Arc::new(Opened::default());
+        let relaunched = Daemon::new(1, dir.clone(), None)
+            .with_channel(handler.clone())
+            .with_launch(echo_spec())
+            .with_health(health);
+        relaunched.ensure_running(Duration::from_secs(20)).unwrap();
+        assert_eq!(process_started(orphan.pid), None, "the orphan was stopped");
+        let channel = relaunched.channel().expect("a channel to the new daemon");
+        assert_eq!(*handler.0.lock().unwrap(), 1);
+        assert_eq!(channel.request("ping", serde_json::json!({}), Duration::from_secs(5)).unwrap(), serde_json::json!({"echo": 1}));
+        assert_ne!(recorded_launch(&dir).expect("the new launch is recorded").pid, orphan.pid);
+        relaunched.stop();
+        assert!(!dir.join(PID_FILE).exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The daemon always gets the data folder the memory server was started with; private memory
+    /// and an explicit `ENGRAM_URL` leave the launch untouched.
+    #[cfg(windows)]
+    #[test]
+    fn windows_the_daemon_gets_the_shared_memory_data_folder() {
+        let dir = scratch_dir("windows-shared-memory");
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port().to_string();
+        let missing = dir.join("no-such-engram.exe").display().to_string();
+        let home = dir.display().to_string();
+        let vars = |extra: &[(&str, &str)]| {
+            let map: std::collections::HashMap<String, String> =
+                [("USERPROFILE", home.as_str()), ("ENGRAM_BIN", missing.as_str()), ("ENGRAM_PORT", port.as_str())]
+                    .iter()
+                    .chain(extra)
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
+            move |key: &str| map.get(key).cloned()
+        };
+        let base = cmd_spec("echo");
+        let spec = with_shared_memory(base.clone(), vars(&[]), None);
+        let data_dir = dir.join(".engram").display().to_string();
+        assert_eq!(spec.envs.last(), Some(&("GENTLE_DOT_ENGRAM_DATA_DIR".to_string(), data_dir)));
+        assert_eq!(&spec.envs[..spec.envs.len() - 1], &base.envs[..]);
+        assert_eq!(with_shared_memory(base.clone(), vars(&[("GENTLE_DOT_ENGRAM", "private")]), None), base);
+        assert_eq!(with_shared_memory(base.clone(), vars(&[("ENGRAM_URL", "http://127.0.0.1:1")]), None), base);
+        // Nothing was written: the folder named here was never created.
+        assert!(!dir.exists());
+    }
+
+    /// A record whose creation time does not match the running process is never acted on.
+    #[cfg(windows)]
+    #[test]
+    fn windows_stop_orphan_leaves_a_process_with_another_creation_time_alone() {
+        let mut other = Command::new("ping").args(["-n", "30", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+        let started = process_started(other.id()).unwrap();
+        stop_orphan(Launched { pid: other.id(), started: started + 1 }, Duration::from_millis(50));
+        assert_eq!(process_started(other.id()), Some(started), "a reused pid is left running");
+        other.kill().unwrap();
+        other.wait().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pid_record_never_targets_the_app_parent_or_system() {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+        };
+        // Independent OS-derived test input; the assertions exercise the public record reader.
+        // SAFETY: process snapshot, no inheritable-handle flag.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        assert_ne!(snapshot, INVALID_HANDLE_VALUE);
+        // SAFETY: the snapshot returned one owned valid handle.
+        let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
+        // SAFETY: zeroed entry with the required structure size is valid for enumeration.
+        let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        // SAFETY: writable correctly sized entry and valid snapshot.
+        let mut found = unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) } != 0;
+        let mut parent = None;
+        while found {
+            if entry.th32ProcessID == std::process::id() {
+                parent = Some(entry.th32ParentProcessID);
+                break;
+            }
+            // SAFETY: same valid snapshot and entry.
+            found = unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) } != 0;
+        }
+        let parent = parent.expect("the current process appears in its snapshot");
+        let dir = scratch_dir("windows-protected-pids");
+        fs::create_dir_all(&dir).unwrap();
+        for pid in [0, 4, std::process::id(), parent] {
+            let text = format!("{pid} {}\n", process_started(pid).unwrap_or(1));
+            fs::write(dir.join(PID_FILE), &text).unwrap();
+            assert_eq!(recorded_launch(&dir), None, "protected PID {pid}");
+            assert_eq!(live_orphan(&dir), None, "protected PID {pid}");
+            assert_eq!(fs::read_to_string(dir.join(PID_FILE)).unwrap(), text, "rejection changes nothing");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_records_a_live_creation_time_and_rejects_missing_processes() {
         let dir = scratch_dir("windows-pid");
         fs::create_dir_all(&dir).unwrap();
-        assert!(record_launch(&dir, std::process::id()).is_err());
-        assert!(!dir.join(PID_FILE).exists());
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0, "no temporary file is left behind");
-        fs::write(dir.join(PID_FILE), format!("{} 1\n", std::process::id() + 4)).unwrap();
-        assert_eq!(live_orphan(&dir), None);
+        let pid = std::process::id();
+        let started = process_started(pid).expect("a live process has a creation time");
+        assert!(started > 0);
+        assert_eq!(process_started(pid), Some(started), "creation time stays stable");
+        record_launch(&dir, pid).unwrap();
+        let record = format!("{pid} {started}\n");
+        assert_eq!(fs::read_to_string(dir.join(PID_FILE)).unwrap(), record);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "no temporary file is left behind");
+        assert_eq!(live_orphan(&dir), None, "this app is never an orphan target");
+        assert_eq!(process_started(u32::MAX), None);
+        assert!(record_launch(&dir, u32::MAX).is_err());
+        assert_eq!(fs::read_to_string(dir.join(PID_FILE)).unwrap(), record, "rejected input preserves the record");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "rejected input leaves no temporary file");
+        fs::remove_dir_all(dir).unwrap();
     }
 }
