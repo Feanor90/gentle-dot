@@ -2077,49 +2077,33 @@ done"#;
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The record names a live process with the right creation time, but it runs another program:
+    /// it is never stopped, the folder is not changed, and the refusal says how to release it.
     #[cfg(windows)]
     #[test]
-    fn windows_occupied_legacy_folder_refuses_untrusted_pid_and_explains_safe_retry() {
-        use std::os::windows::fs::OpenOptionsExt;
-        let dir = legacy_folder("windows-adopt-occupied");
-        fs::write(dir.join(PID_FILE), "").unwrap();
-        let before = snapshot(&dir);
-        let spec = crate::win_spawn::tests::helper_spec("sleep");
-        let log = fs::OpenOptions::new().append(true).share_mode(3).open(dir.join("daemon.log")).unwrap();
-        let mut old = Command::new(&spec.program).args(&spec.args).envs(spec.envs)
-            .stdout(log.try_clone().unwrap()).stderr(log).spawn().unwrap();
-        let record = format!("{} {}\n", old.id(), process_started(old.id()).unwrap());
-        fs::write(dir.join(PID_FILE), &record).unwrap();
-        let log_before = appended_test_log(&dir, Duration::from_secs(5));
-        // Model the directory LIST handle used by libuv fs.watch (or an Explorer observer).
-        let watcher = fs::OpenOptions::new().access_mode(1).share_mode(7)
-            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS | 0x4000_0000)
-            .open(&dir).unwrap();
+    fn windows_occupied_legacy_folder_never_stops_another_program_and_explains_safe_retry() {
+        let holder = LaunchSpec { program: "ping.exe".into(), args: vec!["-n".into(), "30".into(), "127.0.0.1".into()], envs: vec![] };
+        let (dir, mut other, record, before) = held_legacy_folder("windows-adopt-occupied", &holder);
         let confirmations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let confirm: Confirm = {
-            let confirmations = confirmations.clone();
-            Arc::new(move |_, _| {
-                confirmations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                true
-            })
-        };
-        let daemon = recorded_daemon(&dir).with_adoption(confirm);
-        // A correct live PID/start-time pair in untrusted storage must never authorize a kill.
+        let daemon = Daemon::new(1, dir.clone(), None)
+            .with_channel(Arc::new(Opened::default()))
+            .with_launch(echo_spec())
+            .with_health(alive_record_health(&dir))
+            .with_adoption(counted(&confirmations));
         let result = daemon.ensure_running(Duration::from_secs(5));
-        let alive = old.try_wait().unwrap().is_none();
+        let alive = other.try_wait().unwrap().is_none();
         let no_spawn = !daemon.owns_running();
         let no_confirmation = confirmations.load(std::sync::atomic::Ordering::SeqCst) == 0;
         let unchanged = fs::read_to_string(dir.join(PID_FILE)).unwrap() == record
             && fs::read_to_string(dir.join("token")).unwrap() == "secret\n"
             && fs::read_to_string(dir.join("notes.txt")).unwrap() == "unrelated\n"
-            && fs::read_to_string(dir.join("daemon.log")).unwrap() == log_before;
+            && fs::read_to_string(dir.join("daemon.log")).unwrap() == "keep\n";
         // Only the fixture owner stops this process, using its retained handle, never the PID record.
-        if alive { old.kill().unwrap(); }
-        old.wait().unwrap();
-        drop(watcher);
+        if alive { other.kill().unwrap(); }
+        other.wait().unwrap();
         let still_legacy = !is_private(&dir);
         let after_refusal = snapshot(&dir);
-        // Once the owned lock is released, the ordinary explicit-adoption path still works.
+        // Once the folder is released, the ordinary explicit-adoption path still works.
         let retry = daemon.ensure_running(Duration::from_secs(20));
         let retry_started = daemon.owns_running();
         let adopted = is_private(&dir);
@@ -2134,6 +2118,49 @@ done"#;
         assert!(error.contains("Close the older Gentle Dot instance through its original launcher"), "{error}");
         assert!(error.contains("close any Explorer windows showing this folder, then retry"), "{error}");
         assert!(error.contains("Gentle Dot will not stop a process named by an untrusted PID record"), "{error}");
+    }
+
+    /// A legacy folder held open by `holder` (fd 3 is the folder), with
+    /// a correct record of that process in the untrusted pid file.
+    #[cfg(windows)]
+    fn held_legacy_folder(name: &str, holder: &LaunchSpec) -> (PathBuf, crate::win_spawn::WinChild, String, Vec<(String, String)>) {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsHandle;
+        let dir = legacy_folder(name);
+        // Include the record's ACL in both snapshots; writing its contents later preserves it.
+        fs::write(dir.join(PID_FILE), "").unwrap();
+        let before = snapshot(&dir);
+        let watch = fs::OpenOptions::new()
+            .access_mode(1)
+            .share_mode(7)
+            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&dir)
+            .unwrap();
+        // Only the listed handles reach the holder (`win_spawn`): the folder, as its fd 3. A plain
+        // `Command` would also pass the inheritable copies another test spawns with at that moment.
+        let nul = fs::OpenOptions::new().write(true).open("NUL").unwrap();
+        let spawn = crate::win_spawn::Spawn { program: &holder.program, args: &holder.args, envs: &holder.envs };
+        let held = crate::win_spawn::spawn(&spawn, &nul, Some(watch.as_handle())).unwrap();
+        drop(watch);
+        let record = format!("{} {}\n", held.id(), process_started(held.id()).unwrap());
+        fs::write(dir.join(PID_FILE), &record).unwrap();
+        assert!(crate::win_file::inspect(&dir).is_err(), "the holder's handle blocks adoption");
+        (dir, held, record, before)
+    }
+
+    #[cfg(windows)]
+    fn counted(confirmations: &Arc<std::sync::atomic::AtomicUsize>) -> Confirm {
+        let confirmations = confirmations.clone();
+        Arc::new(move |_, _| {
+            confirmations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        })
+    }
+
+    #[cfg(windows)]
+    fn alive_record_health(dir: &Path) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let dir = dir.to_path_buf();
+        Arc::new(move || recorded_launch(&dir).is_some_and(|launch| process_started(launch.pid) == Some(launch.started)))
     }
 
     #[cfg(windows)]
@@ -2222,5 +2249,132 @@ done"#;
         assert_eq!(fs::read_to_string(dir.join(PID_FILE)).unwrap(), record, "rejected input preserves the record");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "rejected input leaves no temporary file");
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn verifier_assert_process_image(pid: u32, expected: &Path) {
+        use std::os::windows::ffi::OsStringExt;
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, QueryFullProcessImageNameW,
+            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_NAME_WIN32,
+        };
+        assert!(expected.is_absolute(), "image precondition requires an absolute path");
+        // SAFETY: query-only non-inheritable handle to the owned test fixture.
+        let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        assert!(!raw.is_null());
+        // SAFETY: successful OpenProcess transfers one owned handle.
+        let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let mut image = vec![0u16; 32768];
+        let mut len = image.len() as u32;
+        // SAFETY: live query handle and writable buffer of len UTF-16 units.
+        assert_ne!(unsafe {
+            QueryFullProcessImageNameW(process.as_raw_handle(), PROCESS_NAME_WIN32,
+                image.as_mut_ptr(), &mut len)
+        }, 0);
+        let image = PathBuf::from(std::ffi::OsString::from_wide(&image[..len as usize]));
+        let actual = fs::canonicalize(image).unwrap();
+        let expected = fs::canonicalize(expected).unwrap();
+        assert_eq!(actual, expected, "owned process uses exactly the expected executable");
+        eprintln!("F1 absolute image precondition: pid={pid}, image={}", actual.display());
+    }
+
+    #[cfg(windows)]
+    fn verifier_legacy_refusal_preserves_process(spec: LaunchSpec, hardlink: bool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = legacy_folder("verifier-legacy-provenance");
+        fs::write(dir.join(PID_FILE), "").unwrap();
+
+        let nul = fs::OpenOptions::new().write(true).open("NUL").unwrap();
+        let spawn = crate::win_spawn::Spawn {
+            program: &spec.program,
+            args: &spec.args,
+            envs: &spec.envs,
+        };
+        let mut unrelated = crate::win_spawn::spawn(&spawn, &nul, None).unwrap();
+        if !hardlink { verifier_assert_process_image(unrelated.id(), Path::new(&spec.program)); }
+        let started = process_started(unrelated.id()).unwrap();
+        fs::write(
+            dir.join(PID_FILE),
+            format!("{} {}\n", unrelated.id(), started),
+        ).unwrap();
+
+        if hardlink {
+            fs::hard_link(dir.join("token"), dir.join("token-link")).unwrap();
+            assert!(crate::win_file::existing(&dir).is_err());
+        }
+
+        let contents = |path: &Path| {
+            let mut files: Vec<_> = fs::read_dir(path).unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), fs::read(entry.path()).unwrap())
+                })
+                .collect();
+            files.sort_by(|a, b| a.0.cmp(&b.0));
+            files
+        };
+        let before = contents(&dir);
+        let confirmations = Arc::new(AtomicUsize::new(0));
+        let confirm: Confirm = {
+            let confirmations = confirmations.clone();
+            Arc::new(move |_, _| {
+                confirmations.fetch_add(1, Ordering::SeqCst);
+                false
+            })
+        };
+        let daemon = Daemon::new(1, dir.clone(), None)
+            .with_channel(Arc::new(Opened::default()))
+            .with_launch(spec)
+            .with_health(Arc::new(|| false))
+            .with_adoption(confirm);
+
+        let result = daemon.ensure_running(Duration::from_secs(1));
+        let alive = unrelated.try_wait().unwrap().is_none();
+        let after = contents(&dir);
+        let owns = daemon.owns_running();
+        let asked = confirmations.load(Ordering::SeqCst);
+
+        // Fixture owner alone performs cleanup through its retained handle.
+        daemon.stop();
+        if alive { unrelated.kill().unwrap(); }
+        unrelated.wait().unwrap();
+        remove_owned_test_folder(&dir).unwrap();
+
+        assert!(result.is_err(), "{result:?}");
+        assert!(alive, "an untrusted record must not authorize this process's stop");
+        assert!(!owns);
+        assert_eq!(after, before, "rejected startup preserves every file");
+        assert_eq!(asked, if hardlink { 0 } else { 1 });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verifier_unrelated_node_using_the_same_runtime_survives_declined_adoption() {
+        let node = crate::win_spawn::resolve(env!("GENTLE_DOT_BUILD_NODE"), None).unwrap();
+        assert!(node.is_absolute(), "Node resolution must not permit a vacuous relative-path refusal");
+        assert!(node.is_file());
+        assert_eq!(node.file_name().unwrap().to_string_lossy().to_lowercase(), "node.exe");
+        verifier_legacy_refusal_preserves_process(
+            LaunchSpec {
+                program: node.to_str().unwrap().to_owned(),
+                args: vec![
+                    "-e".into(),
+                    "setInterval(() => {}, 1000)".into(),
+                ],
+                envs: vec![],
+            },
+            false,
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verifier_sensitive_hardlink_refusal_precedes_any_process_stop() {
+        verifier_legacy_refusal_preserves_process(
+            crate::win_spawn::tests::helper_spec("sleep"),
+            true,
+        );
     }
 }
