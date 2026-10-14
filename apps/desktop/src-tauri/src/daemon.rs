@@ -413,7 +413,14 @@ pub fn adopt_data_dir(data_dir: &Path, homes: &[PathBuf], confirm: &dyn Fn(&str,
     let preview = match inspect(data_dir) {
         Ok(DirectoryState::Ready(_)) => return Ok(()),
         Ok(DirectoryState::Pending(preview)) => preview,
-        Err(error) => return Err(data_dir_failure(data_dir, &format!("it cannot be opened safely ({error})"))),
+        Err(error) => return Err(format!(
+            "{}\n\nIf an older instance or a directory watcher is keeping this folder open: \
+Close the older Gentle Dot instance through its original launcher and \
+close any Explorer windows showing this folder, then retry. \
+Gentle Dot will not stop a process named by an untrusted PID record. \
+Do not delete the folder or change its permissions to bypass this check.",
+            data_dir_failure(data_dir, &format!("it cannot be opened safely ({error})"))
+        )),
     };
     let objects = preview.objects();
     let folder = objects.first().map(|object| object.resolved_path.clone()).unwrap_or_else(|| data_dir.to_path_buf());
@@ -2068,6 +2075,65 @@ done"#;
         assert!(message.contains("current Windows user"), "{message}");
         assert!(!message.contains("notes.txt"), "objects it does not change are not listed: {message}");
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_occupied_legacy_folder_refuses_untrusted_pid_and_explains_safe_retry() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = legacy_folder("windows-adopt-occupied");
+        fs::write(dir.join(PID_FILE), "").unwrap();
+        let before = snapshot(&dir);
+        let spec = crate::win_spawn::tests::helper_spec("sleep");
+        let log = fs::OpenOptions::new().append(true).share_mode(3).open(dir.join("daemon.log")).unwrap();
+        let mut old = Command::new(&spec.program).args(&spec.args).envs(spec.envs)
+            .stdout(log.try_clone().unwrap()).stderr(log).spawn().unwrap();
+        let record = format!("{} {}\n", old.id(), process_started(old.id()).unwrap());
+        fs::write(dir.join(PID_FILE), &record).unwrap();
+        let log_before = appended_test_log(&dir, Duration::from_secs(5));
+        // Model the directory LIST handle used by libuv fs.watch (or an Explorer observer).
+        let watcher = fs::OpenOptions::new().access_mode(1).share_mode(7)
+            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS | 0x4000_0000)
+            .open(&dir).unwrap();
+        let confirmations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let confirm: Confirm = {
+            let confirmations = confirmations.clone();
+            Arc::new(move |_, _| {
+                confirmations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                true
+            })
+        };
+        let daemon = recorded_daemon(&dir).with_adoption(confirm);
+        // A correct live PID/start-time pair in untrusted storage must never authorize a kill.
+        let result = daemon.ensure_running(Duration::from_secs(5));
+        let alive = old.try_wait().unwrap().is_none();
+        let no_spawn = !daemon.owns_running();
+        let no_confirmation = confirmations.load(std::sync::atomic::Ordering::SeqCst) == 0;
+        let unchanged = fs::read_to_string(dir.join(PID_FILE)).unwrap() == record
+            && fs::read_to_string(dir.join("token")).unwrap() == "secret\n"
+            && fs::read_to_string(dir.join("notes.txt")).unwrap() == "unrelated\n"
+            && fs::read_to_string(dir.join("daemon.log")).unwrap() == log_before;
+        // Only the fixture owner stops this process, using its retained handle, never the PID record.
+        if alive { old.kill().unwrap(); }
+        old.wait().unwrap();
+        drop(watcher);
+        let still_legacy = !is_private(&dir);
+        let after_refusal = snapshot(&dir);
+        // Once the owned lock is released, the ordinary explicit-adoption path still works.
+        let retry = daemon.ensure_running(Duration::from_secs(20));
+        let retry_started = daemon.owns_running();
+        let adopted = is_private(&dir);
+        daemon.stop();
+        remove_owned_test_folder(&dir).unwrap();
+        assert!(alive && no_spawn && no_confirmation && unchanged && still_legacy,
+            "alive={alive} no_spawn={no_spawn} no_confirmation={no_confirmation} unchanged={unchanged} still_legacy={still_legacy}; startup={result:?}");
+        assert_eq!(before, after_refusal);
+        assert!(retry.is_ok() && retry_started && adopted, "retry: {retry:?}");
+        assert_eq!(confirmations.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let error = result.unwrap_err();
+        assert!(error.contains("Close the older Gentle Dot instance through its original launcher"), "{error}");
+        assert!(error.contains("close any Explorer windows showing this folder, then retry"), "{error}");
+        assert!(error.contains("Gentle Dot will not stop a process named by an untrusted PID record"), "{error}");
     }
 
     #[cfg(windows)]
