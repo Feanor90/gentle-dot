@@ -35,7 +35,7 @@
  * This file has no dependencies besides Node, so the engine loads it as is.
  */
 import { realpathSync, statSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, posix, resolve, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { pruneScreenshots } from "./screenshot-context.ts";
 
@@ -157,11 +157,19 @@ const PRIVATE_FILE =
 	"That file holds the user's private sign-ins or settings, so the assistant cannot use it. Connectors are managed by the user in the Connectors screen; for anything else there, ask the user.";
 const DECLINED = "The user did not allow this action. Do not try it again unless the user asks.";
 const NO_UI = "This action needs the user's approval, and no one can approve it right now.";
-const CONNECTOR_COMMAND = /\bmcp\s+(?:add|login|logout|remove)\b/i;
+const CONNECTOR_COMMAND = /\bmcp\s+(?:add|login|logout|remove)\b/;
+/** The same on Windows, where command names are not case-sensitive. */
+const CONNECTOR_COMMAND_WINDOWS = new RegExp(CONNECTOR_COMMAND.source, "i");
 /** Reads of the macOS keychain. */
 const KEYCHAIN_COMMAND = /\bsecurity\s+(?:find-(?:generic|internet)-password|dump-keychain|export)\b/;
-/** Windows Credential Manager utilities, bare or by executable path (text check, not shell parsing). */
-const CREDENTIAL_COMMAND = /(?:^|[\s/;|&()<>])(?:cmdkey|vaultcmd)(?:\.exe)?(?=$|[\s;|&()<>])/;
+/**
+ * Windows Credential Manager utilities, bare or by executable path (text check, not shell parsing).
+ * cmd.exe splits `cmdkey/list` into the program and its option, so a name directly followed by `/`
+ * counts too: at the start of a word, or as `cmdkey.exe` after a path. A bare name inside a path
+ * (`docs/cmdkey/notes.md`) is a folder, and `cmdkeyboard` is another word.
+ */
+const CREDENTIAL_COMMAND =
+	/(?:^|[\s/;|&()<>])(?:cmdkey|vaultcmd)(?:\.exe)?(?=$|[\s;|&()<>])|(?:^|[\s;|&()<>])(?:cmdkey|vaultcmd)(?:\.exe)?(?=\/[^\s;|&()<>])|\/(?:cmdkey|vaultcmd)\.exe(?=\/[^\s;|&()<>])/;
 /** Names a command must not mention: the engine's home variable and the data folder. */
 const PRIVATE_NAMES = ["pi_coding_agent_dir", ".gentle-dot"];
 /** The engine's file tools, by the path they take. */
@@ -243,7 +251,15 @@ export function parsePolicy(raw: string | undefined): ConnectorPolicy | undefine
 	};
 }
 
-export function decide(call: GuardCall, policy: ConnectorPolicy): GuardDecision {
+/**
+ * `platform` picks the spellings the command check reads (the Windows ones only on `win32`); it is a
+ * parameter so tests cover every platform on any host.
+ */
+export function decide(
+	call: GuardCall,
+	policy: ConnectorPolicy,
+	platform: NodeJS.Platform = process.platform,
+): GuardDecision {
 	const { toolName, input } = call;
 	if (FILE_TOOLS.has(toolName)) {
 		const raw = input.path ?? input.file_path;
@@ -258,8 +274,9 @@ export function decide(call: GuardCall, policy: ConnectorPolicy): GuardDecision 
 	}
 	if (COMMAND_TOOLS.has(toolName)) {
 		const command = typeof input.command === "string" ? input.command : "";
-		if (CONNECTOR_COMMAND.test(command)) return { action: "block", reason: USE_CONNECTORS_SCREEN };
-		return namesPrivateFile(command, policy.protectedPaths)
+		const connector = platform === "win32" ? CONNECTOR_COMMAND_WINDOWS : CONNECTOR_COMMAND;
+		if (connector.test(command)) return { action: "block", reason: USE_CONNECTORS_SCREEN };
+		return namesPrivateFile(command, policy.protectedPaths, platform)
 			? { action: "block", reason: PRIVATE_FILE }
 			: { action: "pass" };
 	}
@@ -360,28 +377,32 @@ function show(value: unknown): string {
 }
 
 /**
- * True when a command mentions a private file by name (quotes and concatenation removed,
- * any case), the data folder, the engine's home variable, or a credential-store utility.
- * Check both Unix escapes (backslashes removed) and Windows separators (backslashes as slashes).
- * Best effort: a shell can always spell a name some other way.
+ * True when a command mentions a private file by name (quotes, backslashes, and string
+ * concatenation removed, any case), the data folder, the engine's home variable, or the keychain.
+ * On Windows a backslash is also a path separator, so that spelling is checked too, along with the
+ * credential-store utilities. Best effort: a shell can always spell a name some other way.
  */
-function namesPrivateFile(command: string, protectedPaths: string[]): boolean {
+function namesPrivateFile(command: string, protectedPaths: string[], platform: NodeJS.Platform): boolean {
+	const windows = platform === "win32";
 	const unquoted = command
 		.replace(/(["'`])\s*\+\s*(["'`])/g, "")
 		.replace(/["'`]/g, "")
 		.toLowerCase();
-	const spellings = [unquoted.replace(/\\/g, ""), unquoted.replace(/\\/g, "/")];
+	const spellings = [unquoted.replace(/\\/g, "")];
+	if (windows) spellings.push(unquoted.replace(/\\/g, "/"));
 	return spellings.some((text) => {
 		if (
 			KEYCHAIN_COMMAND.test(text) ||
-			CREDENTIAL_COMMAND.test(text) ||
+			(windows && CREDENTIAL_COMMAND.test(text)) ||
 			PRIVATE_NAMES.some((name) => text.includes(name))
 		)
 			return true;
 		const words = text.split(/[\s;|&()<>=,+]+/).map((word) => word.slice(word.lastIndexOf("/") + 1));
 		return protectedPaths.some((path) => {
-			// Policy paths may use either separator, regardless of the host running the guard.
-			const name = path.replace(/\\/g, "/").split("/").pop()?.toLowerCase() ?? "";
+			// Policy paths follow the target platform's separators, whichever host runs the guard.
+			const name = (
+				windows ? (path.replace(/\\/g, "/").split("/").pop() ?? "") : posix.basename(path)
+			).toLowerCase();
 			// A name without a dot (`token`) counts only as a word of its own, not inside `$GITHUB_TOKEN`.
 			if (name.includes(".") ? text.includes(name) : words.includes(name)) return true;
 			return words.some(

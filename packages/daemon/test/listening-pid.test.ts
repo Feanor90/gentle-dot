@@ -59,6 +59,23 @@ describe("parseNetstatListeners", () => {
 		expect(parseNetstatListeners(out, "7438")).toEqual({ state: "absent" });
 	});
 
+	it("does not count a listener on a prefix or superset port, alone or beside the real one", () => {
+		const prefix = "  TCP    127.0.0.1:74380        0.0.0.0:0              LISTENING       1";
+		const superset = "  TCP    0.0.0.0:17438          0.0.0.0:0              LISTENING       2";
+		const real = "  TCP    127.0.0.1:7438         0.0.0.0:0              LISTENING       3";
+		expect(parseNetstatListeners(table(prefix), "7438")).toEqual({ state: "absent" });
+		expect(parseNetstatListeners(table(superset), "7438")).toEqual({ state: "absent" });
+		expect(parseNetstatListeners(table(prefix, superset, real), "7438")).toEqual({ state: "one", pid: 3 });
+	});
+
+	it("is unknown when two distinct pids listen on the port across IPv4 and IPv6", () => {
+		const out = table(
+			"  TCP    0.0.0.0:7438           0.0.0.0:0              LISTENING       10",
+			"  TCP    [::]:7438              [::]:0                 LISTENING       20",
+		);
+		expect(parseNetstatListeners(out, "7438")).toEqual({ state: "unknown" });
+	});
+
 	it("ignores UDP rows, which have no foreign address column", () => {
 		const out = table(
 			"  UDP    0.0.0.0:7438           *:*                                    5",
@@ -109,15 +126,18 @@ describe("parseNetstatListeners", () => {
 });
 
 describe("listeningPid on Windows", () => {
-	it.runIf(process.platform === "win32")("sees this process as the one owner, then nobody once closed", async () => {
-		const server = createServer();
-		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-		const { port } = server.address() as { port: number };
-		try {
-			expect(await listeningPid(String(port))).toEqual({ state: "one", pid: process.pid });
-		} finally {
-			await new Promise((resolve) => server.close(resolve));
-		}
-		expect(await listeningPid(String(port))).toEqual({ state: "absent" });
-	});
+	it.runIf(process.platform === "win32")(
+		"sees this process as the one owner, then nobody once closed",
+		async () => {
+			const server = createServer();
+			await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+			const { port } = server.address() as { port: number };
+			try {
+				expect(await listeningPid(String(port))).toEqual({ state: "one", pid: process.pid });
+			} finally {
+				await new Promise((resolve) => server.close(resolve));
+			}
+			expect(await listeningPid(String(port))).toEqual({ state: "absent" });
+		},
+	);
 });

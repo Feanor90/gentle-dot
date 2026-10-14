@@ -368,14 +368,30 @@ describe("approval guard extension", () => {
 	const connectorRefusal =
 		"Connectors are managed by the user in the Connectors screen. Ask the user to make this change there.";
 
+	// The guard reads the host platform when it decides; tests pick the platform so Unix and Windows
+	// rules are both exercised on any host.
+	async function onPlatform<T>(platform: NodeJS.Platform, run: () => Promise<T>): Promise<T> {
+		const original = Object.getOwnPropertyDescriptor(process, "platform") as PropertyDescriptor;
+		Object.defineProperty(process, "platform", { ...original, value: platform });
+		try {
+			return await run();
+		} finally {
+			Object.defineProperty(process, "platform", original);
+		}
+	}
+
 	// Dispatch stand-ins only: no shell, Credential Manager, or real user files are used.
-	async function dispatchCommand(toolName: string, command: string, guarded: ConnectorPolicy) {
+	async function dispatchCommand(
+		toolName: string,
+		command: string,
+		guarded: ConnectorPolicy,
+		platform: NodeJS.Platform,
+	) {
 		const handler = load({ [POLICY_ENV]: JSON.stringify(guarded) });
 		const { ctx, asked } = fakeCtx(true);
 		const state = { executions: 0, stored: "fixture", stdout: "", stderr: "" };
-		const result = await handler(
-			{ type: "tool_call", toolName, toolCallId: "command", input: { command } },
-			ctx,
+		const result = await onPlatform(platform, async () =>
+			handler({ type: "tool_call", toolName, toolCallId: "command", input: { command } }, ctx),
 		);
 		if (!(result as { block?: boolean } | undefined)?.block) {
 			state.executions++;
@@ -389,6 +405,11 @@ describe("approval guard extension", () => {
 		connectors: {},
 		protectedPaths: [String.raw`C:\fixture\agent\auth.json`, String.raw`C:\fixture\token`],
 	};
+	const unixPolicy: ConnectorPolicy = {
+		connectors: {},
+		protectedPaths: ["/fixture/agent/auth.json", "/fixture/token"],
+	};
+	const policyFor = (platform: NodeJS.Platform) => (platform === "win32" ? windowsPolicy : unixPolicy);
 	const windowsRules = [
 		["Windows token separator", String.raw`Get-Content C:\fixture\TOKEN`, privateRefusal],
 		["Windows protected basename", String.raw`Get-Content C:\fixture\agent\AUTH.JSON`, privateRefusal],
@@ -399,47 +420,141 @@ describe("approval guard extension", () => {
 		["vaultcmd executable and case", String.raw`C:\Windows\System32\VAULTCMD.EXE /listcreds`, privateRefusal],
 		["USERPROFILE data folder", String.raw`type %USERPROFILE%\.GENTLE-DOT\token`, privateRefusal],
 		["Windows connector case", "pi MCP ADD notion", connectorRefusal],
+		// cmd.exe splits `name/option`; PowerShell does not, so the guard reads both.
+		["cmdkey attached option", "cmdkey/list", privateRefusal],
+		["cmdkey executable attached option", "cmdkey.exe/list", privateRefusal],
+		["cmdkey attached option after cmd /c", "cmd /c cmdkey/list", privateRefusal],
+		["cmdkey attached option and case", "CMDKEY/LIST", privateRefusal],
+		["cmdkey attached option after a separator", "echo ok && cmdkey/list", privateRefusal],
+		["vaultcmd attached option", "vaultcmd/listcreds:x", privateRefusal],
+		["vaultcmd executable attached option", "vaultcmd.exe/listcreds:x", privateRefusal],
+		[
+			"path-qualified executable attached option",
+			String.raw`C:\Windows\System32\cmdkey.exe/list`,
+			privateRefusal,
+		],
 	] as const;
+	// Spellings a Windows shell reads as the credential utilities or private files; harmless elsewhere.
+	const windowsOnlyNegatives = [
+		"docs/cmdkeyboard.md",
+		String.raw`type docs\cmdkeyboard.md`,
+		"cat docs/cmdkey/notes.md",
+		"cat mycmdkey/list",
+		"cat cmdkeys/list",
+		"vaultcmd-helper/list",
+		"echo cmdkeyboard/list",
+	] as const;
+	// Allowed on Unix at baseline 60af1cc: a backslash there is an escape, `MCP` is not `mcp`, and
+	// Windows credential utilities are just words.
+	const unixBaselineAllowed = [
+		String.raw`cat ./build\token`,
+		String.raw`ls build\token`,
+		String.raw`echo foo\token`,
+		"pi MCP ADD notion",
+		"pi Mcp Remove notion",
+		"cmdkey /list",
+		"cmdkey/list",
+		"vaultcmd /list",
+		String.raw`type %USERPROFILE%\notes.txt`,
+	] as const;
+	const blocked = (reason: string) => ({
+		result: { block: true, reason },
+		asked: [],
+		state: { executions: 0, stored: "fixture", stdout: "", stderr: "" },
+	});
+	const allowed = {
+		result: undefined,
+		asked: [],
+		state: { executions: 1, stored: "executed", stdout: "fixture output", stderr: "" },
+	};
+	const unixPlatforms = ["linux", "darwin"] as const;
 	for (const toolName of ["bash", "powershell"]) {
-		it.each(windowsRules)(`${toolName} refuses %s without executing the handler`, async (_rule, command, reason) => {
-			expect(await dispatchCommand(toolName, command, windowsPolicy)).toEqual({
-				result: { block: true, reason },
-				asked: [],
-				state: { executions: 0, stored: "fixture", stdout: "", stderr: "" },
-			});
-		});
+		it.each(windowsRules)(
+			`${toolName} on win32 refuses %s without executing the handler`,
+			async (_rule, command, reason) => {
+				expect(await dispatchCommand(toolName, command, windowsPolicy, "win32")).toEqual(blocked(reason));
+			},
+		);
 
-		it(`${toolName} preserves Unix escaped names, connector and keychain refusals`, async () => {
-			for (const [command, reason] of [
-				[String.raw`cat ../agent/au\th.json`, privateRefusal],
-				[`cat ../agent/"au"'th.json'`, privateRefusal],
-				[`cat ../agent/'auth' + '.json'`, privateRefusal],
-				["cat ../token", privateRefusal],
-				["security find-generic-password -s fixture -w", privateRefusal],
-				["pi mcp remove notion", connectorRefusal],
-			]) {
-				expect(await dispatchCommand(toolName, command as string, windowsPolicy)).toEqual({
-					result: { block: true, reason },
-					asked: [],
-					state: { executions: 0, stored: "fixture", stdout: "", stderr: "" },
-				});
+		it(`${toolName} on win32 allows look-alike names of the credential utilities`, async () => {
+			for (const command of windowsOnlyNegatives) {
+				expect(await dispatchCommand(toolName, command, windowsPolicy, "win32"), command).toEqual(allowed);
 			}
 		});
 
-		it(`${toolName} preserves harmless commands and look-alike names`, async () => {
+		for (const platform of ["linux", "darwin", "win32"] as const) {
+			it(`${toolName} on ${platform} preserves Unix escaped names, connector and keychain refusals`, async () => {
+				for (const [command, reason] of [
+					[String.raw`cat ../agent/au\th.json`, privateRefusal],
+					[`cat ../agent/"au"'th.json'`, privateRefusal],
+					[`cat ../agent/'auth' + '.json'`, privateRefusal],
+					["cat ../token", privateRefusal],
+					["cat ~/.gentle-dot/token", privateRefusal],
+					["security find-generic-password -s fixture -w", privateRefusal],
+					["pi mcp remove notion", connectorRefusal],
+				]) {
+					expect(
+						await dispatchCommand(toolName, command as string, policyFor(platform), platform),
+						command,
+					).toEqual(blocked(reason as string));
+				}
+			});
+
+			it(`${toolName} on ${platform} preserves harmless commands and look-alike names`, async () => {
+				for (const command of [
+					"git status",
+					"ls -la",
+					"Get-Content README.md",
+					String.raw`type C:\fixture\notes.txt`,
+					"echo $GITHUB_TOKEN",
+					"echo %GITHUB_TOKEN%",
+					"mycmdkey /list",
+					"vaultcmd-helper /list",
+					"pi mcp list",
+					"security help",
+				]) {
+					expect(await dispatchCommand(toolName, command, policyFor(platform), platform), command).toEqual(
+						allowed,
+					);
+				}
+			});
+		}
+
+		for (const platform of unixPlatforms) {
+			it(`${toolName} on ${platform} keeps the Unix baseline: Windows spellings are not refused`, async () => {
+				for (const command of unixBaselineAllowed) {
+					expect(await dispatchCommand(toolName, command, unixPolicy, platform), command).toEqual(allowed);
+				}
+			});
+		}
+
+		it(`${toolName} on win32 still refuses the spellings Unix allows`, async () => {
 			for (const command of [
-				"git status", "ls -la", "Get-Content README.md", String.raw`type C:\fixture\notes.txt`,
-				"echo $GITHUB_TOKEN", "echo %GITHUB_TOKEN%", "mycmdkey /list", "vaultcmd-helper /list",
-				"pi mcp list", "security help",
+				String.raw`cat C:\fixture\token`,
+				"pi MCP ADD notion",
+				"cmdkey /list",
+				"vaultcmd /list",
 			]) {
-				expect(await dispatchCommand(toolName, command, windowsPolicy)).toEqual({
-					result: undefined,
-					asked: [],
-					state: { executions: 1, stored: "executed", stdout: "fixture output", stderr: "" },
-				});
+				expect(await dispatchCommand(toolName, command, windowsPolicy, "win32"), command).toEqual(
+					blocked(command.includes("MCP") ? connectorRefusal : privateRefusal),
+				);
 			}
 		});
 	}
+
+	it("decides by the platform it is given, falling back to the host platform", () => {
+		const command = String.raw`cat ./build\token`;
+		const at = (platform?: NodeJS.Platform) =>
+			decide(
+				{ toolName: "bash", input: { command }, cwd: "/data/workspace" },
+				policyFor(platform ?? process.platform),
+				platform,
+			);
+		expect(at("linux")).toEqual({ action: "pass" });
+		expect(at("darwin")).toEqual({ action: "pass" });
+		expect(at("win32")).toEqual({ action: "block", reason: privateRefusal });
+		expect(at()).toEqual(at(process.platform));
+	});
 
 	it("reads the policy from its own environment and passes read-only tools without asking", async () => {
 		const handler = load({ [POLICY_ENV]: JSON.stringify(policy()) });
