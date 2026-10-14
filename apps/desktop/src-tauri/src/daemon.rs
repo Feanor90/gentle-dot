@@ -1378,15 +1378,17 @@ done"#;
         daemon.spawn().unwrap();
         let channel = daemon.channel().expect("the daemon's channel");
         assert_eq!(channel.request("ping", serde_json::json!({}), Duration::from_secs(5)).unwrap(), serde_json::json!({"echo": 1}));
+        let pid = daemon.child.lock().unwrap().as_ref().unwrap().id();
         daemon.stop();
         assert!(!channel.is_open());
         assert!(daemon.channel().is_none());
         assert!(!daemon.owns_running());
+        assert_eq!(process_started(pid), None, "the child has exited before fixture cleanup");
         let log = fs::read_to_string(dir.join("daemon.log")).unwrap();
         assert_eq!(log.lines().filter(|line| *line == "channel closed cleanly").count(), 1,
             "the child completes cleanup rather than being forcibly terminated: {log}");
         assert!(!dir.join(PID_FILE).exists(), "the stopped child's launch record is removed");
-        fs::remove_dir_all(dir).unwrap();
+        remove_owned_test_folder(&dir).unwrap();
     }
 
     /// A stand-in for a daemon this app did not launch (`pnpm dev`, or one an older app left): it
@@ -1900,6 +1902,70 @@ done"#;
         dir
     }
 
+    // Test-only synchronization and cleanup; never used to decide production liveness.
+    #[cfg(windows)]
+    fn appended_test_log(dir: &Path, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let log = fs::read_to_string(dir.join("daemon.log")).unwrap();
+            if log.contains("running 1 test\n") || Instant::now() >= deadline { return log; }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[cfg(windows)]
+    fn remove_owned_test_folder(dir: &Path) -> io::Result<()> {
+        // Test-fixture cleanup only: process exit is asserted separately. An unrelated observer
+        // can briefly retain a non-delete-sharing handle; other errors and persistent locks fail.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match fs::remove_dir_all(dir) {
+                Err(error) if error.raw_os_error() == Some(32) && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                result => return result,
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_partial_log_output_waits_for_the_complete_append_marker() {
+        let dir = scratch_dir("partial-log-marker");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("daemon.log"), "keep\n\nrunning ").unwrap();
+        let path = dir.join("daemon.log");
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+            file.write_all(b"1 test\n").unwrap();
+        });
+        let log = appended_test_log(&dir, Duration::from_secs(2));
+        writer.join().unwrap();
+        remove_owned_test_folder(&dir).unwrap();
+        assert_eq!(log, "keep\n\nrunning 1 test\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owned_fixture_cleanup_waits_for_a_transient_sharing_lock() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = scratch_dir("transient-cleanup-lock");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("daemon.log");
+        fs::write(&path, "preserved\n").unwrap();
+        let held = fs::OpenOptions::new().read(true).share_mode(3).open(&path).unwrap();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            drop(held);
+        });
+        let result = remove_owned_test_folder(&dir);
+        release.join().unwrap();
+        if result.is_err() { fs::remove_dir_all(&dir).unwrap(); }
+        assert!(result.is_ok(), "transient sharing lock: {result:?}");
+        assert!(!dir.exists());
+    }
+
     #[cfg(windows)]
     fn snapshot(dir: &Path) -> Vec<(String, String)> {
         crate::win_file::prepare_adoption(dir).unwrap().objects().into_iter().map(|o| (o.name, o.security)).collect()
@@ -2025,7 +2091,11 @@ done"#;
         daemon.ensure_running(Duration::from_secs(20)).unwrap();
         assert!(daemon.owns_running());
         assert!(is_private(&dir), "directory, daemon.log and token are now private");
-        assert_eq!(fs::read_to_string(dir.join("daemon.log")).unwrap(), "keep\n");
+        // The stand-in daemon appends its libtest header to the same log, so wait for it: the log
+        // must keep its original content as a prefix (not truncated or replaced) with the new output after it.
+        let log = appended_test_log(&dir, Duration::from_secs(20));
+        assert!(log.starts_with("keep\n"), "original log content kept intact: {log:?}");
+        assert!(log["keep\n".len()..].contains("running 1 test"), "later output is appended after it: {log:?}");
         assert_eq!(fs::read_to_string(dir.join("token")).unwrap(), "secret\n");
         assert_eq!(fs::read_to_string(dir.join("notes.txt")).unwrap(), "unrelated\n");
         daemon.stop();

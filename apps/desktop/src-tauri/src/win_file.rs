@@ -677,4 +677,157 @@ mod tests {
         assert!(dir.read_pid().is_err()); drop(dir);
         assert_eq!(fs::read_to_string(path.join("daemon.pid")).unwrap(), "x".repeat(65));
     }
+
+    // Pins of existing behavior found by the independent T6 verification (windows-support.md L63).
+    /// Scratch the pins below own: one root under the crate target directory, removed on drop even when an
+    /// assertion fails. Links are unlinked first, so removal can never follow a junction or symlink into the
+    /// folder it points at (one pin links to the home folder and to the drive root).
+    struct Owned { root: PathBuf, links: std::cell::RefCell<Vec<PathBuf>> }
+    impl Owned {
+        fn new(label: &str) -> Self {
+            let mut random = [0; 8]; getrandom::fill(&mut random).unwrap();
+            let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
+            Owned { root: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/privacy-probes").join(format!("{label}-{suffix}")), links: Default::default() }
+        }
+        fn path(&self, name: &str) -> PathBuf { self.root.join(name) }
+        /// `mklink /J` needs no administrator rights, so a failure here is an environment problem, not a skip.
+        fn junction(&self, link: &Path, target: &Path) {
+            self.links.borrow_mut().push(link.to_path_buf());
+            let windows = |path: &Path| path.to_string_lossy().replace('/', std::path::MAIN_SEPARATOR_STR);
+            let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(windows(link)).arg(windows(target)).output()
+                .unwrap_or_else(|error| panic!("cannot run `cmd /c mklink /J` to make the junction {} -> {}: {error}", link.display(), target.display()));
+            assert!(made.status.success(), "`mklink /J {} {}` failed ({}); a junction needs no administrator rights: {}{}",
+                link.display(), target.display(), made.status, String::from_utf8_lossy(&made.stdout), String::from_utf8_lossy(&made.stderr));
+        }
+    }
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            let mut stuck = Vec::new();
+            for link in self.links.borrow().iter().rev() {
+                if fs::symlink_metadata(link).is_ok() && fs::remove_dir(link).or_else(|_| fs::remove_file(link)).is_err() { stuck.push(link.clone()); }
+            }
+            // With a link left in place, removing the root could reach what it points at: leave it and say so.
+            if !stuck.is_empty() { eprintln!("scratch {} kept: could not unlink {stuck:?}", self.root.display()); return; }
+            if let Err(error) = fs::remove_dir_all(&self.root) { eprintln!("scratch {} not removed: {error}", self.root.display()); }
+        }
+    }
+    #[test]
+    fn private_predicate_rejects_inherited_foreign_owner_deny_generic_and_scoped_aces() {
+        let sid = user_sid().unwrap();
+        let check = |sddl: String, kind, ok| private_descriptor(sd_of(&sddl).0, &sid, kind, ok).unwrap();
+        for (label, kind, ok, sddl) in [
+            ("dir inherited ACE even with inherited_ok=false", Kind::Directory, false, format!("O:{sid}D:AI(A;OICIID;FA;;;{sid})")),
+            ("Administrators owner", Kind::Directory, false, format!("O:BAD:P(A;OICI;FA;;;{sid})")),
+            ("Administrators owner file", Kind::File, true, format!("O:BAD:P(A;;FA;;;{sid})")),
+            ("deny first + allow", Kind::File, true, format!("O:{sid}D:P(D;;FR;;;WD)(A;;FA;;;{sid})")),
+            ("Everyone full", Kind::File, true, format!("O:{sid}D:P(A;;FA;;;WD)")),
+            ("generic all only (not mapped)", Kind::File, true, format!("O:{sid}D:P(A;;GA;;;{sid})")),
+            ("audit-only/empty protected dir", Kind::Directory, true, format!("O:{sid}D:PAI")),
+            ("CI only dir", Kind::Directory, false, format!("O:{sid}D:P(A;CI;FA;;;{sid})")),
+            ("NP dir", Kind::Directory, false, format!("O:{sid}D:P(A;OICINP;FA;;;{sid})")),
+            ("file ID under protected+inherited", Kind::File, true, format!("O:{sid}D:PAI(A;ID;FA;;;{sid})")),
+        ] { assert!(!check(sddl, kind, ok), "wrongly accepted: {label}"); }
+        assert!(check(format!("O:{sid}D:P(A;;0x1f01ff;;;{sid})"), Kind::File, false));
+        assert!(check(format!("O:{sid}D:PAI(A;OICI;FA;;;{sid})"), Kind::Directory, false), "protected + auto-inherited bookkeeping is accepted");
+    }
+    #[test]
+    fn a_pinned_directory_allows_node_style_work_and_blocks_renaming_it() {
+        let owned = Owned::new("pin"); let path = owned.path("data"); let dir = ready(&path);
+        fs::write(path.join("token"), "a").unwrap();
+        fs::write(path.join("token.tmp"), "b").unwrap();
+        fs::rename(path.join("token.tmp"), path.join("token")).unwrap();
+        assert_eq!(fs::read_to_string(path.join("token")).unwrap(), "b");
+        fs::create_dir(path.join("sessions")).unwrap();
+        fs::write(path.join("sessions/x.json"), "{}").unwrap();
+        fs::rename(path.join("sessions/x.json"), path.join("sessions/y.json")).unwrap();
+        fs::remove_file(path.join("sessions/y.json")).unwrap();
+        // ReadDirectoryChangesW-style directory handle as libuv opens it (LIST, share RWD).
+        let watch = OpenOptions::new().access_mode(1).share_mode(7).custom_flags(FILE_FLAG_BACKUP_SEMANTICS | 0x4000_0000).open(&path).unwrap();
+        // The pin is held during every anchored op; the inherited copy is private.
+        assert!(matches!(existing(&path).unwrap(), DirectoryState::Ready(_)));
+        dir.publish_pid("5 6\n").unwrap();
+        assert!(fs::rename(&path, path.with_extension("moved")).is_err());
+        drop(watch); drop(dir);
+    }
+    #[test]
+    fn a_hardlinked_or_oversized_pid_in_a_ready_directory_is_refused_and_kept() {
+        let owned = Owned::new("pidlink"); let path = owned.path("data"); let dir = ready(&path);
+        fs::write(path.join("other"), "1 2\n").unwrap();
+        fs::hard_link(path.join("other"), path.join("daemon.pid")).unwrap();
+        assert!(dir.read_pid().is_err());
+        assert!(dir.remove_pid_if(|_| true).is_err());
+        assert!(dir.publish_pid("7 8\n").is_err());
+        assert_eq!(fs::read_to_string(path.join("daemon.pid")).unwrap(), "1 2\n");
+        let names: Vec<_> = fs::read_dir(&path).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).filter(|n| n.starts_with(".daemon.pid.")).collect();
+        assert!(names.is_empty(), "temporary left: {names:?}");
+        fs::remove_file(path.join("daemon.pid")).unwrap();
+        fs::write(path.join("daemon.pid"), "x".repeat(65)).unwrap();
+        assert!(dir.remove_pid_if(|_| true).is_err());
+        assert!(path.join("daemon.pid").exists());
+        fs::write(path.join("daemon.pid"), format!("{}\n", "1".repeat(63))).unwrap();
+        assert_eq!(dir.read_pid().unwrap().map(|r| r.len()), Some(64));
+        assert!(!dir.remove_pid_if(|_| false).unwrap());
+        assert!(path.join("daemon.pid").exists());
+        assert!(dir.publish_pid(&"9".repeat(65)).is_err());
+    }
+    #[test]
+    fn a_pid_destination_that_is_a_directory_is_refused_without_a_temporary() {
+        let owned = Owned::new("piddir"); let path = owned.path("data"); let dir = ready(&path);
+        fs::create_dir(path.join("daemon.pid")).unwrap();
+        assert!(dir.publish_pid("1 2\n").is_err());
+        assert!(path.join("daemon.pid").is_dir());
+        assert_eq!(fs::read_dir(&path).unwrap().count(), 1);
+    }
+    /// Needs the symlink privilege (administrator or Developer Mode). Without it the test returns early and
+    /// prints `SKIPPED` (visible with `--nocapture`): the symlink case was NOT exercised, whatever the result says.
+    #[test]
+    fn a_leaf_symlink_named_token_is_never_adopted_when_symlinks_can_be_created() {
+        let owned = Owned::new("symlink"); let path = owned.path("data"); drop(ready(&path));
+        let target = owned.path("symlink-target"); fs::create_dir_all(&target).unwrap(); fs::write(target.join("t"), "s").unwrap();
+        if std::os::windows::fs::symlink_file(target.join("t"), path.join("token")).is_err() {
+            eprintln!("SKIPPED (not exercised): no symlink privilege, the leaf symlink case was not tested");
+            return;
+        }
+        owned.links.borrow_mut().push(path.join("token"));
+        assert!(owned.links.borrow().contains(&path.join("token")), "the created symlink must be explicitly unlinked before root cleanup");
+        let before = state(&target.join("t"));
+        assert!(existing(&path).is_err() || matches!(existing(&path), Ok(DirectoryState::Pending(_))));
+        assert!(crate::daemon::adopt_data_dir(&path, &[], &|_, _| true).is_err(), "a leaf link is never adopted");
+        assert_eq!(state(&target.join("t")), before, "link target untouched");
+    }
+    #[test]
+    fn a_junction_to_a_private_folder_is_usable_and_one_to_home_or_a_volume_root_is_refused_unasked() {
+        let owned = Owned::new("junction");
+        let real = owned.path("real"); drop(ready(&real));
+        let parent = owned.path("links"); fs::create_dir_all(&parent).unwrap();
+        let link = parent.join("data"); owned.junction(&link, &real);
+        assert!(matches!(existing(&link).unwrap(), DirectoryState::Ready(_)), "S7: redirected private folder is usable");
+        let home = owned.path("home"); fs::create_dir_all(&home).unwrap(); fs::write(home.join("token"), "t").unwrap();
+        let before = state(&home);
+        let to_home = parent.join("tohome"); owned.junction(&to_home, &home);
+        let never = |_: &str, _: &str| -> bool { panic!("asked for a refused folder") };
+        let error = crate::daemon::adopt_data_dir(&to_home, std::slice::from_ref(&home), &never).unwrap_err();
+        assert!(error.contains("home folder"), "{error}");
+        assert_eq!(state(&home), before);
+        let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        let to_root = parent.join("toroot"); owned.junction(&to_root, Path::new(&format!("{drive}{}", std::path::MAIN_SEPARATOR)));
+        let error = crate::daemon::adopt_data_dir(&to_root, &[], &never).unwrap_err();
+        eprintln!("junction-to-root refusal: {error}");
+    }
+    #[test]
+    fn declined_adoption_changes_nothing_including_unlisted_files() {
+        let owned = Owned::new("decline"); let path = owned.path("data"); fs::create_dir_all(path.join("sessions")).unwrap();
+        fs::write(path.join("token"), "t").unwrap(); fs::write(path.join("secrets.enc.json"), "s").unwrap();
+        let names = ["", "token", "secrets.enc.json", "sessions"];
+        let before: Vec<_> = names.iter().map(|n| state(&path.join(n))).collect();
+        let asked = std::cell::Cell::new(false);
+        assert!(crate::daemon::adopt_data_dir(&path, &[], &|_, msg| { asked.set(true); assert!(msg.contains("token")); false }).is_err());
+        assert!(asked.get());
+        assert_eq!(names.iter().map(|n| state(&path.join(n))).collect::<Vec<_>>(), before);
+        assert!(crate::daemon::adopt_data_dir(&path, &[], &|_, _| true).is_ok());
+        let after: Vec<_> = names.iter().map(|n| state(&path.join(n))).collect();
+        assert_ne!(after[0], before[0]); assert_ne!(after[1], before[1]);
+        assert_eq!(after[2], before[2], "unlisted file unchanged"); assert_eq!(after[3], before[3], "subfolder unchanged");
+        assert!(matches!(existing(&path).unwrap(), DirectoryState::Ready(_)));
+    }
 }
