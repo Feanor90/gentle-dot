@@ -167,10 +167,20 @@ const PID_FILE_MAX: u64 = 64;
 
 /// Whether a pid read from the pid file may name a daemon to signal: never this app, its parent,
 /// init, or the kernel.
+#[cfg(unix)]
 fn may_be_daemon(pid: u32) -> bool {
     // SAFETY: getppid(2) has no preconditions.
     let parent = u32::try_from(unsafe { libc::getppid() }).ok();
     pid > 1 && pid != std::process::id() && Some(pid) != parent
+}
+
+/// Windows has no `getppid` in `std`, and this process's parent is not readable there without a
+/// Win32 call, so the parent check is absent. What remains still refuses this process and the
+/// kernel's low pids. It is also unreachable on Windows by construction: it is consulted only on
+/// the path that wants a channel, and `with_channel` declares none there (L30).
+#[cfg(not(unix))]
+fn may_be_daemon(pid: u32) -> bool {
+    pid > 1 && pid != std::process::id()
 }
 
 /// The daemon the pid file names, if it holds a launch. Only a small regular file is read: a
@@ -202,6 +212,7 @@ fn forget_launch(data_dir: &Path, pid: u32) {
 
 /// SIGTERM to a recorded daemon that is not this app's child, then SIGKILL after `grace`.
 /// Only the process the record names: a pid now used by another process is left alone.
+#[cfg(unix)]
 fn stop_orphan(launch: Launched, grace: Duration) {
     let Ok(pid) = libc::pid_t::try_from(launch.pid) else {
         return;
@@ -222,6 +233,15 @@ fn stop_orphan(launch: Launched, grace: Duration) {
         }
     }
 }
+
+/// Windows has no signal to send and no `std` way to end a process that is not its child; ending
+/// one there means Win32 (`OpenProcess` + `TerminateProcess`). This is not that code, and it does
+/// not need to be: `stop_orphan` is reached only from `StartPlan::ReplaceOrphan`, which
+/// `start_plan` returns only when the app wants a channel, and on Windows `with_channel` declares
+/// none, so nothing calls this. It exists so the match stays whole, and it is unreachable by
+/// construction rather than by assumption (L30, option A).
+#[cfg(not(unix))]
+fn stop_orphan(_launch: Launched, _grace: Duration) {}
 
 /// What [`Daemon::ensure_running`] does, from what it finds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -445,6 +465,7 @@ fn cloexec_from(first: libc::c_int) {
 }
 
 /// Sends SIGTERM, waits up to `grace` for a clean exit, then kills.
+#[cfg(unix)]
 pub fn stop_child(child: &mut dyn ChildProcess, grace: Duration) {
     if !matches!(child.try_wait(), Ok(None)) {
         return;
@@ -462,6 +483,18 @@ pub fn stop_child(child: &mut dyn ChildProcess, grace: Duration) {
             return;
         }
         thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Windows has no `SIGTERM`, and `std` offers no way to ask a child to stop, so the polite phase
+/// cannot exist there: the child is terminated outright and `grace` has nothing to wait for. A
+/// daemon stopped this way is killed rather than asked to finish (L30).
+#[cfg(not(unix))]
+pub fn stop_child(child: &mut dyn ChildProcess, _grace: Duration) {
+    if !matches!(child.try_wait(), Ok(None)) {
+        return;
     }
     let _ = child.kill();
     let _ = child.wait();
