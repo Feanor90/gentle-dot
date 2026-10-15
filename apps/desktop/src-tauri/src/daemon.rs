@@ -9,7 +9,9 @@
 //! [`foreign_daemon_message`], which names the exit. An app without a channel attaches as before.
 
 pub use crate::app_channel::APP_FD;
-use crate::app_channel::{AppChannel, Handler};
+#[cfg(unix)]
+use crate::app_channel::AppChannel;
+use crate::app_channel::Handler;
 use crate::health::check_health;
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -514,6 +516,7 @@ pub struct Daemon {
     runtime_dir: Option<PathBuf>,
     child: Mutex<Option<Box<dyn ChildProcess>>>,
     /// The private channel to the daemon this app spawned; attached daemons have none.
+    #[cfg(unix)]
     channel: Mutex<Option<Arc<AppChannel>>>,
     /// Serves the daemon's requests; without it no channel is made.
     handler: Option<Arc<dyn Handler>>,
@@ -535,6 +538,7 @@ impl Daemon {
             data_dir,
             runtime_dir,
             child: Mutex::new(None),
+            #[cfg(unix)]
             channel: Mutex::new(None),
             handler: None,
             refused: Mutex::new(None),
@@ -581,6 +585,7 @@ impl Daemon {
     }
 
     /// The channel to the daemon, only while one this app spawned runs and the channel is open.
+    #[cfg(unix)]
     pub fn channel(&self) -> Option<Arc<AppChannel>> {
         if !self.owns_running() {
             return None;
@@ -736,6 +741,7 @@ impl Daemon {
             stop_child(child.as_mut(), STOP_GRACE);
             forget_launch(&self.data_dir, child.id());
         }
+        #[cfg(unix)]
         if let Some(channel) = self.channel.lock().unwrap().take() {
             channel.close();
         }

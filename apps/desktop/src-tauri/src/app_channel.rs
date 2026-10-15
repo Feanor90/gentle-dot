@@ -19,14 +19,24 @@
 //! about a secret request is logged. The answer goes back over this channel only.
 
 use crate::approvals::ApprovalRequest;
-use crate::secure_store::{check_id, Secret, SecretStore};
+use crate::secure_store::SecretStore;
+#[cfg(unix)]
+use crate::secure_store::{check_id, Secret};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
+#[cfg(unix)]
+use serde_json::json;
+#[cfg(unix)]
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::io::{self, BufRead, BufReader, Read, Write};
+#[cfg(unix)]
 use std::net::Shutdown;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(unix)]
 use std::sync::{mpsc, Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -39,8 +49,10 @@ pub const REGISTER_TIMEOUT: Duration = Duration::from_secs(60);
 /// A frame longer than this closes the channel. The daemon has the same rule, and a closed channel
 /// stops the daemon (S35.2), so neither side ever sends a longer one: an oversized request fails
 /// here without being written, and an oversized answer goes out as an error instead.
+#[cfg(unix)]
 const MAX_FRAME: u64 = 1024 * 1024;
 /// Why a frame was not sent.
+#[cfg(unix)]
 const TOO_LARGE: &str = "too large to send to the assistant";
 
 /// What the panel may ask the daemon through the app (S25.2): connector changes, approving a draft
@@ -59,6 +71,13 @@ pub const PANEL_COMMANDS: &[&str] = &[
 /// Why the panel cannot change connectors: the daemon was not started by this app.
 pub const NO_CHANNEL: &str = "Gentle Dot did not start this assistant, so its connectors cannot be changed from here. \
 Quit the assistant that is running and open Gentle Dot again.";
+
+/// What the panel is told on Windows, where the app-to-assistant channel does not exist at all, so a
+/// connector change has nothing to travel over. W7 is what gives this platform a channel (L30), and
+/// until then this says so instead of blaming a daemon the app did start.
+#[cfg(not(unix))]
+pub const NO_CHANNEL_WINDOWS: &str = "Connector changes are not available on Windows yet: they need the private \
+channel between Gentle Dot and its assistant, which this platform does not carry yet.";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -88,6 +107,7 @@ pub trait Handler: Send + Sync {
     /// Shows the native dialog and blocks until the answer; true only when the user allowed it.
     fn approve(&self, request: &ApprovalRequest) -> bool;
     /// The channel to a freshly spawned daemon is open (for example, register the computer helper).
+    #[cfg(unix)]
     fn opened(&self, _channel: &Arc<AppChannel>) {}
     /// Where connector secrets live (the Keychain on macOS); `None` refuses secret requests.
     fn secrets(&self) -> Option<&dyn SecretStore> {
@@ -96,17 +116,20 @@ pub trait Handler: Send + Sync {
 }
 
 /// The id (and, for `secret_put`, the secret) of a secret request. Shows the id only.
+#[cfg(unix)]
 pub(crate) struct SecretParams {
     id: String,
     secret: Option<Secret>,
 }
 
+#[cfg(unix)]
 impl std::fmt::Debug for SecretParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SecretParams").field("id", &self.id).field("secret", &self.secret).finish()
     }
 }
 
+#[cfg(unix)]
 impl SecretParams {
     /// Reads `{id, secret?}` by hand, so a refusal never repeats a value the daemon sent.
     pub(crate) fn parse(params: &Value) -> Result<Self, String> {
@@ -122,6 +145,7 @@ impl SecretParams {
 }
 
 /// Answers one secret request from `store`. Errors name what failed, never a secret.
+#[cfg(unix)]
 pub(crate) fn serve_secret(store: &dyn SecretStore, method: &str, params: &Value) -> Result<Value, String> {
     if method == "secret_list" {
         return store.list_ids().map(|ids| json!({ "ids": ids })).map_err(|error| error.to_string());
@@ -143,8 +167,12 @@ pub(crate) fn serve_secret(store: &dyn SecretStore, method: &str, params: &Value
     }
 }
 
+#[cfg(unix)]
 type Reply = mpsc::Sender<Result<Value, String>>;
 
+/// The app's end of the channel. It exists only where the platform can carry one: Windows has no
+/// fd 3 helper, so the type is absent there and `with_channel` declares no handler (L30).
+#[cfg(unix)]
 pub struct AppChannel {
     writer: Mutex<UnixStream>,
     pending: Mutex<HashMap<u64, Reply>>,
@@ -152,6 +180,7 @@ pub struct AppChannel {
     open: AtomicBool,
 }
 
+#[cfg(unix)]
 impl AppChannel {
     /// Reads `stream` on a thread of its own; each daemon request runs on a worker thread.
     pub fn start(stream: UnixStream, handler: Arc<dyn Handler>) -> io::Result<Arc<Self>> {
@@ -288,7 +317,7 @@ impl AppChannel {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::approvals::fake::{Answer, FakePrompt};

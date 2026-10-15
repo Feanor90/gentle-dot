@@ -2,7 +2,11 @@
 //! hiding the rose, the full-screen panel, voice input, the shortcut chosen in Settings,
 //! the daemon lifecycle (design §9), and the app's private channel to the daemon (S25.1–S25.3).
 
-use crate::app_channel::{self, AppChannel, NO_CHANNEL, REGISTER_TIMEOUT};
+use crate::app_channel;
+#[cfg(unix)]
+use crate::app_channel::{AppChannel, NO_CHANNEL, REGISTER_TIMEOUT};
+#[cfg(not(unix))]
+use crate::app_channel::NO_CHANNEL_WINDOWS;
 use crate::approvals::{native::NativePrompt, ApprovalRequest, Approvals, Decision, APPROVAL_TIMEOUT};
 use crate::computer::app as computer;
 use crate::computer::server::Endpoint;
@@ -130,6 +134,9 @@ fn read_connection_info(config: &DesktopConfig) -> CommandResult<ConnectionInfo>
 /// spawned (S24.7, L61).
 struct ChannelService {
     approvals: Approvals,
+    /// The computer endpoint to register with the assistant once the channel opens. It is read
+    /// only on that path, which Windows does not have yet (L30), so it is dead there by design.
+    #[cfg_attr(not(unix), allow(dead_code))]
     computer: Option<Endpoint>,
     secrets: Box<dyn SecretStore>,
 }
@@ -143,6 +150,7 @@ impl app_channel::Handler for ChannelService {
         Some(self.secrets.as_ref())
     }
 
+    #[cfg(unix)]
     fn opened(&self, channel: &Arc<AppChannel>) {
         let Some(endpoint) = self.computer.clone() else {
             return;
@@ -164,8 +172,16 @@ impl app_channel::Handler for ChannelService {
 async fn connector_command(app: AppHandle, client_id: String, message: serde_json::Value) -> CommandResult {
     let daemon = app.state::<Shell>().daemon.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let channel = daemon.channel().ok_or_else(|| NO_CHANNEL.to_string())?;
-        channel.command(&client_id, message)
+        #[cfg(unix)]
+        {
+            let channel = daemon.channel().ok_or_else(|| NO_CHANNEL.to_string())?;
+            channel.command(&client_id, message)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (&daemon, &client_id, &message);
+            Err(NO_CHANNEL_WINDOWS.to_string())
+        }
     })
     .await
     .map_err(err)?
