@@ -14,6 +14,7 @@ use crate::health::check_health;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -84,20 +85,71 @@ pub fn process_started(_pid: u32) -> Option<u64> {
     None
 }
 
+// The app's own files, and only the user who runs it reads them. Unix expresses that with mode
+// bits, and refuses to follow a symlink or block on a FIFO at those paths. Windows has no mode
+// bits, and privacy there comes from the ACL of the profile folder the data folder lives in, so
+// these entries are created and opened plainly (L13, `posix-modes.ts`).
+#[cfg(unix)]
+fn create_private(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn create_private(path: &Path) -> io::Result<File> {
+    OpenOptions::new().write(true).create_new(true).open(path)
+}
+
+/// Opens an app-owned file for reading without following a symlink or blocking on a FIFO there.
+/// Windows has no such entry types to refuse, so it opens plainly.
+#[cfg(unix)]
+fn open_private_read(path: &Path) -> io::Result<File> {
+    OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)
+}
+
+#[cfg(not(unix))]
+fn open_private_read(path: &Path) -> io::Result<File> {
+    OpenOptions::new().read(true).open(path)
+}
+
+/// The folder the app keeps its own files in. Unix also repairs a looser mode on it.
+#[cfg(unix)]
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    fs::DirBuilder::new().recursive(true).create(path)
+}
+
+#[cfg(unix)]
+fn open_appended_private(path: &Path) -> io::Result<File> {
+    let log = OpenOptions::new().create(true).append(true).mode(0o600).open(path)?;
+    log.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(log)
+}
+
+#[cfg(not(unix))]
+fn open_appended_private(path: &Path) -> io::Result<File> {
+    OpenOptions::new().create(true).append(true).open(path)
+}
+
 /// Records the daemon just spawned as `pid` (private, 0600). A new file in the same folder renamed
 /// over the pid file: never written through a symlink there, and never seen half written.
 pub fn record_launch(data_dir: &Path, pid: u32) -> io::Result<()> {
     let started = process_started(pid).ok_or_else(|| io::Error::other("the assistant is not running"))?;
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let temp = data_dir.join(format!(".{PID_FILE}.{}.{nanos}", std::process::id()));
-    let written = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&temp)
+    let written = create_private(&temp)
         .and_then(|mut file| {
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
             use std::io::Write;
             writeln!(file, "{pid} {started}")
         })
@@ -122,11 +174,7 @@ fn may_be_daemon(pid: u32) -> bool {
 /// The daemon the pid file names, if it holds a launch. Only a small regular file is read: a
 /// symlink, a FIFO, or anything else there is ignored (opened without following or blocking).
 pub fn recorded_launch(data_dir: &Path) -> Option<Launched> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(data_dir.join(PID_FILE))
-        .ok()?;
+    let file = open_private_read(&data_dir.join(PID_FILE)).ok()?;
     let meta = file.metadata().ok()?;
     if !meta.file_type().is_file() || meta.len() > PID_FILE_MAX {
         return None;
@@ -253,11 +301,8 @@ pub fn runtime_dir(env: impl Fn(&str) -> Option<String>, resource_dir: Option<Pa
 /// Opens `<data_dir>/daemon.log` for appending. The folder is 0700 and the log
 /// 0600 (looser modes are repaired) because the daemon's output is private.
 pub fn open_private_log(data_dir: &Path) -> io::Result<File> {
-    fs::DirBuilder::new().recursive(true).mode(0o700).create(data_dir)?;
-    fs::set_permissions(data_dir, fs::Permissions::from_mode(0o700))?;
-    let log = OpenOptions::new().create(true).append(true).mode(0o600).open(data_dir.join("daemon.log"))?;
-    log.set_permissions(fs::Permissions::from_mode(0o600))?;
-    Ok(log)
+    create_private_dir(data_dir)?;
+    open_appended_private(&data_dir.join("daemon.log"))
 }
 
 /// A spawned process the app polls, stops, and reaps: a `std::process::Child`, or on macOS a
