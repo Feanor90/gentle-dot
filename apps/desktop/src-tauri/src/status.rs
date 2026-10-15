@@ -8,7 +8,7 @@ use crate::platform::Os;
 /// do not tint icons, so Linux gets 32 px glyphs in a light gray with a dark outline.
 /// Windows does not tint either: a template glyph there would be black on the taskbar
 /// and vanish on a dark background, so it uses the same untinted set as Linux until it
-/// gets artwork of its own (W2, W8).
+/// gets artwork of its own (W8 covers the app icon; no tray-artwork task exists yet).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayGlyph {
     Ready,
