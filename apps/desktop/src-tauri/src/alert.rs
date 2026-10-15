@@ -10,10 +10,16 @@
 //! rfd shows a `CFUserNotification` and reports cancels and failures as `Cancel`, which the plugin
 //! turns into the second label of `OkCancelCustom` (T23c B1).
 //!
+//! Windows: a native task dialog with the refusing button explicitly selected as the default.
+//! Enter without changing the selection, Escape, closing, and native failures all refuse.
+//!
 //! Elsewhere (Linux): the dialog plugin with the allowing label in the OK slot and the refusing one
 //! in the cancel slot, so every outcome rfd reports as `Cancel` (the refusing button, Escape,
 //! closing, a dialog that failed) arrives as the refusing label. rfd's GTK dialog sets no default
 //! response, so Return does not pick the allowing button either (not verified on a Linux desktop).
+
+#[cfg(windows)]
+mod windows;
 
 use tauri::AppHandle;
 use tauri_plugin_dialog::{MessageDialogButtons, MessageDialogResult};
@@ -53,12 +59,17 @@ impl Choice {
     }
 }
 
-/// Shows the alert and waits for the answer. Blocks, so it never runs on the main thread (there it
-/// refuses at once).
+/// Shows the alert and waits for the answer. Blocks, so callers run it off the main thread (on
+/// macOS a call from the main thread refuses at once).
 pub fn ask(app: &AppHandle, title: &str, message: &str, choice: Choice) -> bool {
     #[cfg(target_os = "macos")]
     return macos::ask(app, title, message, choice);
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        let _ = app;
+        windows::ask(title, message, choice)
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
         let result = app
