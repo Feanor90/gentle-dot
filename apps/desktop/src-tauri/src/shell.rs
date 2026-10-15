@@ -758,16 +758,11 @@ fn toggle_on_press(app: &AppHandle, _: &Shortcut, event: ShortcutEvent) {
     }
 }
 
-/// Binds the configured shortcut, or the default one when it is unavailable. Returns the bound one.
-fn register_shortcut(app: &AppHandle, shortcut: &str) -> Option<String> {
-    match app.global_shortcut().on_shortcut(shortcut, toggle_on_press) {
-        Ok(()) => return Some(shortcut.to_string()),
-        Err(error) => eprintln!("gentle-dot: shortcut `{shortcut}` is unavailable ({error}); using {DEFAULT_SHORTCUT}"),
-    }
-    if shortcut != DEFAULT_SHORTCUT && app.global_shortcut().on_shortcut(DEFAULT_SHORTCUT, toggle_on_press).is_ok() {
-        return Some(DEFAULT_SHORTCUT.to_string());
-    }
-    None
+/// Binds the configured shortcut, or the platform's defaults in turn when it is unavailable (S14).
+/// Returns the bound one.
+fn register_shortcut(app: &AppHandle, config: &DesktopConfig) -> Option<String> {
+    let host = ShortcutHost { app, config_file: config.data_dir.join("config.json") };
+    shortcut::bind_at_start(&host, &config.shortcut, platform::default_shortcuts(Os::CURRENT))
 }
 
 /// A launch of `gentle-dot` (usually `--toggle` from a desktop shortcut) reaches the running app.
@@ -886,7 +881,7 @@ pub fn run() {
             build_windows(&handle, &config, places_windows, rose_hidden)?;
             build_tray(&handle, &config, rose_hidden)?;
             if places_windows {
-                let bound = register_shortcut(&handle, &config.shortcut);
+                let bound = register_shortcut(&handle, &config);
                 if let Some(bound) = &bound {
                     label_tray_open(&handle, bound);
                 }

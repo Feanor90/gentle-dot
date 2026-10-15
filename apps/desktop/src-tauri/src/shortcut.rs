@@ -118,6 +118,24 @@ pub fn apply(host: &impl Host, current: Option<&str>, requested: &str) -> Result
     Ok(shortcut)
 }
 
+/// Binds the panel shortcut at start (S14): the configured one, then each default in order,
+/// trying the same keys only once. Nothing is saved, so the configured one is tried again at the
+/// next start. Returns the bound shortcut, or `None` when the system or other apps hold them all.
+pub fn bind_at_start(host: &impl Host, configured: &str, defaults: &[&str]) -> Option<String> {
+    let mut tried: Vec<&str> = Vec::new();
+    for candidate in std::iter::once(configured).chain(defaults.iter().copied()) {
+        if tried.iter().any(|done| *done == candidate || same_keys(done, candidate)) {
+            continue;
+        }
+        tried.push(candidate);
+        match host.bind_toggle(candidate) {
+            Ok(()) => return Some(candidate.to_string()),
+            Err(error) => eprintln!("gentle-dot: shortcut `{candidate}` is unavailable ({error})"),
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,6 +268,54 @@ mod tests {
         let host = FakeHost::default();
         assert_eq!(apply(&host, Some("option+space"), "Alt+Space"), Ok("Alt+Space".to_string()));
         assert_eq!(calls(&host), ["save Alt+Space", "tray Alt+Space"]);
+    }
+
+    const WINDOWS_DEFAULTS: [&str; 2] = ["Alt+Space", "Ctrl+Alt+Space"];
+
+    #[test]
+    fn starts_with_the_configured_shortcut() {
+        let host = FakeHost::default();
+        assert_eq!(bind_at_start(&host, "F5", &WINDOWS_DEFAULTS), Some("F5".to_string()));
+        assert_eq!(calls(&host), ["bind F5"]);
+    }
+
+    #[test]
+    fn a_taken_default_falls_back_to_the_next_one_without_saving_it() {
+        // S14: another app holds Alt+Space, so Ctrl+Alt+Space opens the panel; config.json keeps
+        // Alt+Space, which is tried again at the next start.
+        let host = FakeHost { taken: vec!["Alt+Space"], ..FakeHost::default() };
+        assert_eq!(bind_at_start(&host, "Alt+Space", &WINDOWS_DEFAULTS), Some("Ctrl+Alt+Space".to_string()));
+        assert_eq!(calls(&host), ["bind Alt+Space", "bind Ctrl+Alt+Space"]);
+    }
+
+    #[test]
+    fn a_taken_custom_shortcut_tries_the_defaults_in_order() {
+        let host = FakeHost { taken: vec!["F5"], ..FakeHost::default() };
+        assert_eq!(bind_at_start(&host, "F5", &WINDOWS_DEFAULTS), Some("Alt+Space".to_string()));
+        assert_eq!(calls(&host), ["bind F5", "bind Alt+Space"]);
+
+        let host = FakeHost { taken: vec!["F5", "Alt+Space"], ..FakeHost::default() };
+        assert_eq!(bind_at_start(&host, "F5", &WINDOWS_DEFAULTS), Some("Ctrl+Alt+Space".to_string()));
+        assert_eq!(calls(&host), ["bind F5", "bind Alt+Space", "bind Ctrl+Alt+Space"]);
+    }
+
+    #[test]
+    fn the_same_keys_in_another_spelling_are_tried_once() {
+        let host = FakeHost { taken: vec!["option+space", "Alt+Space"], ..FakeHost::default() };
+        assert_eq!(bind_at_start(&host, "option+space", &WINDOWS_DEFAULTS), Some("Ctrl+Alt+Space".to_string()));
+        assert_eq!(calls(&host), ["bind option+space", "bind Ctrl+Alt+Space"]);
+    }
+
+    #[test]
+    fn binds_nothing_when_every_shortcut_is_taken() {
+        let host = FakeHost { taken: vec!["F5", "Alt+Space", "Ctrl+Alt+Space"], ..FakeHost::default() };
+        assert_eq!(bind_at_start(&host, "F5", &WINDOWS_DEFAULTS), None);
+        assert_eq!(calls(&host), ["bind F5", "bind Alt+Space", "bind Ctrl+Alt+Space"]);
+
+        // macOS and Linux have one default: a taken Alt+Space leaves no shortcut, as before.
+        let host = FakeHost { taken: vec!["Alt+Space"], ..FakeHost::default() };
+        assert_eq!(bind_at_start(&host, "Alt+Space", &["Alt+Space"]), None);
+        assert_eq!(calls(&host), ["bind Alt+Space"]);
     }
 
     #[test]

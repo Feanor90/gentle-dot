@@ -76,6 +76,16 @@ pub fn compositor_places_windows(env: impl Fn(&str) -> Option<String>) -> bool {
     }
 }
 
+/// The shortcuts tried in order when the configured one cannot be bound at start (S14).
+/// On Windows `Alt+Space` opens the window menu and launchers such as PowerToys Run may hold it,
+/// so a second one keeps the panel reachable.
+pub fn default_shortcuts(os: Os) -> &'static [&'static str] {
+    match os {
+        Os::Windows => &[crate::config::DEFAULT_SHORTCUT, "Ctrl+Alt+Space"],
+        Os::MacOs | Os::Linux => &[crate::config::DEFAULT_SHORTCUT],
+    }
+}
+
 /// What a launch asks for: `--toggle` toggles the panel (bind it to a desktop shortcut);
 /// any other launch shows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,6 +201,18 @@ mod tests {
         assert_eq!(panel_url(Os::MacOs), "index.html?surface=panel");
         assert_eq!(panel_url(Os::Linux), "index.html?surface=panel&effects=none");
         assert_eq!(panel_url(Os::Windows), "index.html?surface=panel&effects=none");
+    }
+
+    #[test]
+    fn macos_and_linux_keep_only_alt_space() {
+        assert_eq!(default_shortcuts(Os::MacOs), [crate::config::DEFAULT_SHORTCUT]);
+        assert_eq!(default_shortcuts(Os::Linux), [crate::config::DEFAULT_SHORTCUT]);
+    }
+
+    #[test]
+    fn windows_falls_back_to_ctrl_alt_space_when_alt_space_is_taken() {
+        // Alt+Space is the Windows window-menu key, and launchers such as PowerToys Run may hold it.
+        assert_eq!(default_shortcuts(Os::Windows), [crate::config::DEFAULT_SHORTCUT, "Ctrl+Alt+Space"]);
     }
 
     #[test]
