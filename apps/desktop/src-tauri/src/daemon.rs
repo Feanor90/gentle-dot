@@ -13,9 +13,11 @@ use crate::app_channel::{AppChannel, Handler};
 use crate::health::check_health;
 use std::fs::{self, File, OpenOptions};
 use std::io;
+#[cfg(unix)]
 use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus};
@@ -336,6 +338,7 @@ impl ChildProcess for Child {
 
 /// A connected pair of Unix sockets: the app's end, and the daemon's, numbered above [`APP_FD`] so
 /// placing it on fd 3 in the child never collides with it. Both are close-on-exec here.
+#[cfg(unix)]
 pub fn channel_pair() -> io::Result<(UnixStream, OwnedFd)> {
     let (app, daemon) = UnixStream::pair()?;
     let daemon = OwnedFd::from(daemon);
@@ -366,7 +369,7 @@ fn spawn_daemon(spec: &LaunchSpec, log: File, channel: Option<BorrowedFd<'_>>) -
 /// descriptor some library of the app opened without close-on-exec never reaches the daemon. Node
 /// then marks fd 3 close-on-exec at its own startup (libuv's `uv_disable_stdio_inheritance`), so
 /// the daemon's children never get it either (`app-channel.ts` `childInherits` checks that).
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn spawn_daemon(spec: &LaunchSpec, log: File, channel: Option<BorrowedFd<'_>>) -> io::Result<Box<dyn ChildProcess>> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
@@ -398,9 +401,26 @@ fn spawn_daemon(spec: &LaunchSpec, log: File, channel: Option<BorrowedFd<'_>>) -
     Ok(Box::new(command.spawn()?))
 }
 
+/// Windows has no fd 3 to place a channel on and no other descriptor of the app to withhold, so
+/// the daemon gets its stdio and the log and nothing else. It starts and serves the browser; the
+/// app-provided channel is absent there until W7 replaces the fd-3 mechanism, which is the same
+/// reason [`Daemon::with_channel`] declares no handler on that platform.
+#[cfg(windows)]
+fn spawn_daemon(spec: &LaunchSpec, log: File) -> io::Result<Box<dyn ChildProcess>> {
+    use std::process::{Command, Stdio};
+    let child = Command::new(&spec.program)
+        .args(&spec.args)
+        .envs(spec.envs.iter().map(|(k, v)| (k, v)))
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .spawn()?;
+    Ok(Box::new(child))
+}
+
 /// Marks every descriptor from `first` up close-on-exec. Called between fork and exec: system
 /// calls only.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn cloexec_from(first: libc::c_int) {
     #[cfg(target_os = "linux")]
     if let Ok(low) = libc::c_uint::try_from(first) {
@@ -493,8 +513,18 @@ impl Daemon {
     }
 
     /// Every daemon this app spawns gets a channel served by `handler`.
+    ///
+    /// Windows has no fd 3 to carry one, so no handler is declared there and the daemon is treated
+    /// as one the app never asked a channel from: it attaches to whatever answers on the port, or
+    /// starts its own. W6 gates the channel; W7 replaces the mechanism.
+    #[cfg(unix)]
     pub fn with_channel(mut self, handler: Arc<dyn Handler>) -> Self {
         self.handler = Some(handler);
+        self
+    }
+
+    #[cfg(not(unix))]
+    pub fn with_channel(self, _handler: Arc<dyn Handler>) -> Self {
         self
     }
 
@@ -625,28 +655,36 @@ impl Daemon {
             launch_spec(|key| std::env::var(key).ok(), cfg!(debug_assertions), self.runtime_dir.as_deref())
         });
         let log = open_private_log(&self.data_dir).map_err(|e| format!("cannot open daemon.log: {e}"))?;
+        #[cfg(unix)]
         let pair = match &self.handler {
             Some(_) => Some(channel_pair().map_err(|e| format!("cannot open the assistant's channel: {e}"))?),
             None => None,
         };
+        #[cfg(unix)]
         let channel_end = pair.as_ref().map(|(_, daemon_end)| {
             use std::os::fd::AsFd;
             daemon_end.as_fd()
         });
+        #[cfg(unix)]
         let child = spawn_daemon(&spec, log, channel_end).map_err(|e| format!("cannot start {}: {e}", spec.program))?;
+        #[cfg(not(unix))]
+        let child = spawn_daemon(&spec, log).map_err(|e| format!("cannot start {}: {e}", spec.program))?;
         // A relaunched app can then tell this daemon from one it did not launch (S35.2).
         if let Err(error) = record_launch(&self.data_dir, child.id()) {
             eprintln!("gentle-dot: cannot record the assistant's pid: {error}");
         }
         *slot = Some(child);
         // The daemon's end now lives only in the daemon.
-        if let (Some((app_end, _)), Some(handler)) = (pair, &self.handler) {
-            match AppChannel::start(app_end, handler.clone()) {
-                Ok(channel) => {
-                    handler.opened(&channel);
-                    *self.channel.lock().unwrap() = Some(channel);
+        #[cfg(unix)]
+        {
+            if let (Some((app_end, _)), Some(handler)) = (pair, &self.handler) {
+                match AppChannel::start(app_end, handler.clone()) {
+                    Ok(channel) => {
+                        handler.opened(&channel);
+                        *self.channel.lock().unwrap() = Some(channel);
+                    }
+                    Err(error) => eprintln!("gentle-dot: cannot read the assistant's channel: {error}"),
                 }
-                Err(error) => eprintln!("gentle-dot: cannot read the assistant's channel: {error}"),
             }
         }
         Ok(())
