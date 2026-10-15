@@ -557,10 +557,13 @@ describe("own instance", () => {
 
 	it("shows the access key only on an interactive terminal", () => {
 		const url = "http://127.0.0.1:4317/#token=secret-token";
-		expect(startupMessage(url, "/data", true)).toBe(`Gentle Dot is running at ${url}`);
-		const piped = startupMessage(url, "/data", false);
+		const dataDir = join(tempDir(), "data");
+		expect(startupMessage(url, dataDir, true)).toBe(`Gentle Dot is running at ${url}`);
+		const piped = startupMessage(url, dataDir, false);
 		expect(piped).not.toContain("secret-token");
-		expect(piped).toBe("Gentle Dot is running at http://127.0.0.1:4317/ (the access key is in /data/token)");
+		expect(piped).toBe(
+			`Gentle Dot is running at http://127.0.0.1:4317/ (the access key is in ${join(dataDir, "token")})`,
+		);
 	});
 });
 

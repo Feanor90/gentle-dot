@@ -1,5 +1,5 @@
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.ts";
@@ -41,10 +41,11 @@ describe("installed runtime (GENTLE_DOT_RUNTIME)", () => {
 		expect(loadConfig({ GENTLE_DOT_DATA_DIR: dataDir, GENTLE_DOT_RUNTIME: runtime }).uiDir).toBe(
 			join(runtime, "ui"),
 		);
+		const override = join(dataDir, "ui");
 		expect(
-			loadConfig({ GENTLE_DOT_DATA_DIR: dataDir, GENTLE_DOT_RUNTIME: runtime, GENTLE_DOT_UI_DIR: "/ui" })
+			loadConfig({ GENTLE_DOT_DATA_DIR: dataDir, GENTLE_DOT_RUNTIME: runtime, GENTLE_DOT_UI_DIR: override })
 				.uiDir,
-		).toBe("/ui");
+		).toBe(override);
 	});
 
 	it("runs the launcher and the engine's command line from the runtime's node_modules", () => {
@@ -70,13 +71,13 @@ describe("installed runtime (GENTLE_DOT_RUNTIME)", () => {
 	it("puts the runtime's `pi` first on the engine's PATH, never the pnpm one", () => {
 		const runtime = fakeRuntime();
 		const base = {
-			PATH: "/usr/bin:/bin",
+			PATH: ["/usr/bin", "/bin"].join(delimiter),
 			HOME: tempDir(),
 			GENTLE_DOT_RUNTIME: runtime,
 			ENGRAM_BIN: "/x/engram",
 		};
 		const env = isolatedAgentEnv(base, tempDir());
-		expect(env.PATH).toBe([join(runtime, "bin"), "/usr/bin", "/bin"].join(":"));
+		expect(env.PATH).toBe([join(runtime, "bin"), "/usr/bin", "/bin"].join(delimiter));
 		const again = isolatedAgentEnv({ ...base, PATH: env.PATH }, tempDir());
 		expect(again.PATH).toBe(env.PATH);
 	});
@@ -131,8 +132,8 @@ describe("source checkout (no GENTLE_DOT_RUNTIME)", () => {
 		expect(config.uiDir).toBe(join(PACKAGE, "..", "ui", "dist", "app"));
 		expect(config.agentArgs).toEqual([join(PACKAGE, "node_modules", "gentle-pi", "bin", "gentle-shell.mjs")]);
 		expect(bundledMcpCli({}).args).toEqual([join(PACKAGE, "node_modules", ENGINE_CLI)]);
-		const env = isolatedAgentEnv({ PATH: "/usr/bin:/bin", HOME: tempDir() }, tempDir());
-		expect(env.PATH).toBe([join(PACKAGE, "node_modules", ".bin"), "/usr/bin", "/bin"].join(":"));
+		const env = isolatedAgentEnv({ PATH: ["/usr/bin", "/bin"].join(delimiter), HOME: tempDir() }, tempDir());
+		expect(env.PATH).toBe([join(PACKAGE, "node_modules", ".bin"), "/usr/bin", "/bin"].join(delimiter));
 		expect(env.ENGRAM_BIN).toBeUndefined();
 	});
 });
