@@ -859,8 +859,12 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             register_panic_shortcut(&handle);
 
-            build_windows(&handle, &config, places_windows, rose_hidden)?;
+            // The tray goes up before the windows: a webview starts loading the UI as soon as it is
+            // built, and the UI calls `set_dot_state` as soon as it runs, which needs `tray_by_id`
+            // to find one. Building the tray second lost that race and the UI reported
+            // "tray icon is missing" while the tray appeared a moment later anyway.
             build_tray(&handle, &config, rose_hidden)?;
+            build_windows(&handle, &config, places_windows, rose_hidden)?;
             if places_windows {
                 let bound = register_shortcut(&handle, &config.shortcut);
                 if let Some(bound) = &bound {
