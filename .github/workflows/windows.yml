@@ -70,16 +70,19 @@ jobs:
         run: pnpm test
 
   # Non-blocking on purpose, and the reason is concrete, not decorative: the shell does not
-  # compile on Windows yet. `src/app_channel.rs` and `src/daemon.rs` use `std::os::unix` and
+  # compile on Windows yet. `src/daemon.rs` and `src/app_channel.rs` use `std::os::unix` and
   # `std::os::fd` unconditionally (a Unix socketpair on fd 3), which W6 gates and W7 replaces.
   #
   # It runs anyway because the failure output is the input to that work: it tells us exactly
-  # which modules need a Windows arm, instead of us guessing.
+  # which modules need a Windows arm, instead of us guessing. Measured on Windows 11: 57 errors,
+  # 46 of them in `daemon.rs` (26 in production, 20 in its test module), one in `app_channel.rs`
+  # and one in `voice/app.rs`.
   #
-  # REMOVE `continue-on-error` when W7 lands. A job that is allowed to fail must have a named
-  # condition for no longer being allowed to.
+  # REMOVE `continue-on-error` when the job can compile and run on Windows. That is W6 for the
+  # compilation and W7 for the channel, and it is not W7 alone: the job used to fail before a
+  # single line of this crate compiled, because `tauri-build` needs `icons/icon.ico` (W8).
   rust:
-    name: Rust shell (expected to fail until W7)
+    name: Rust shell (expected to fail until W6 and W7)
     runs-on: windows-latest
     continue-on-error: true
     steps:
