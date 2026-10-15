@@ -1080,6 +1080,16 @@ mod tests {
     }
 
     #[test]
+    fn the_build_time_node_and_daemon_script_are_plain_absolute_files() {
+        // Windows: a `\\?\` verbatim script path makes Node fail before the daemon runs
+        // (`EISDIR: lstat 'C:'`), and the build finds Node only as `node.exe`.
+        for path in [env!("GENTLE_DOT_BUILD_NODE"), env!("GENTLE_DOT_BUILD_DAEMON_SCRIPT")] {
+            assert!(!path.starts_with(r"\\?\"), "{path}");
+            assert!(Path::new(path).is_absolute() && Path::new(path).is_file(), "{path}");
+        }
+    }
+
+    #[test]
     fn launch_spec_honors_runtime_overrides() {
         let spec = launch_spec(
             env_of(&[("GENTLE_DOT_NODE", "/opt/node"), ("GENTLE_DOT_DAEMON_SCRIPT", "/srv/cli.ts")]),

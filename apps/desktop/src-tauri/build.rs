@@ -36,17 +36,27 @@ fn find_in_path(program: &str, path: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// Windows `canonicalize` returns a `\\?\C:\...` verbatim path, which Node cannot run as its main
+/// script (`EISDIR: lstat 'C:'`); without the prefix the drive path names the same file.
+fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+    match path.to_str().and_then(|text| text.strip_prefix(r"\\?\")) {
+        Some(rest) if !rest.starts_with(r"UNC\") => PathBuf::from(rest),
+        _ => path,
+    }
+}
+
 fn main() {
     // Apps launched from Finder get a minimal PATH, so record what the build saw:
     // the absolute `node`, the daemon entry point, and PATH itself (the daemon
     // needs it to find `gentle-shell`). Runtime env vars override the first two.
     let path = env::var("PATH").unwrap_or_default();
-    let node = find_in_path("node", &path)
+    let node_name = if env::var_os("CARGO_CFG_WINDOWS").is_some() { "node.exe" } else { "node" };
+    let node = find_in_path(node_name, &path)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "node".into());
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let script = manifest_dir.join("../../../packages/daemon/src/cli.ts");
-    let script = script.canonicalize().unwrap_or(script);
+    let script = without_verbatim_prefix(script.canonicalize().unwrap_or(script));
 
     println!("cargo:rustc-env=GENTLE_DOT_BUILD_NODE={node}");
     println!("cargo:rustc-env=GENTLE_DOT_BUILD_DAEMON_SCRIPT={}", script.display());
