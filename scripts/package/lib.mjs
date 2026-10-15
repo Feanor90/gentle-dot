@@ -376,3 +376,133 @@ export function modeDifferences(staged, bundled) {
 	}
 	return differences;
 }
+
+// Windows installer (`package-win.mjs`).
+
+export const WIN_USAGE = "usage: package-win [--skip-stage]";
+
+/** Parses package-win's command line. */
+export function parseWinArgs(argv) {
+	const options = { skipStage: false };
+	for (const arg of argv.filter((arg) => arg !== "--")) {
+		if (arg !== "--skip-stage") throw new Error(`Unexpected argument ${arg}.\n${WIN_USAGE}`);
+		options.skipStage = true;
+	}
+	return options;
+}
+
+/** The oldest Go that gentle-pi's Windows source build of Gentle AI accepts. */
+export const MIN_GO_VERSION = "1.25.10";
+
+export const WINDOWS_GO_REQUIRED = `Staging win32-x64 needs Go ${MIN_GO_VERSION} or newer on PATH: gentle-pi builds its Gentle AI binary from source on Windows.`;
+
+/** Whether `go version` output names a release at least `minimum`; a development build does not count. */
+export function goMeetsMinimum(output, minimum = MIN_GO_VERSION) {
+	const found = /\bgo(\d+)\.(\d+)(?:\.(\d+))?\s/.exec(output);
+	if (!found) return false;
+	const have = found.slice(1).map((part) => Number(part ?? 0));
+	const need = minimum.split(".").map(Number);
+	for (let i = 0; i < 3; i++) if (have[i] !== need[i]) return have[i] > need[i];
+	return true;
+}
+
+/**
+ * The configuration `tauri build --config` merges for a Windows release: the staged
+ * runtime as the `runtime` resource (as on macOS, kept out of the platform config so
+ * source builds need no staged runtime); the bundler's NSIS download cached in
+ * `target/.tauri`, never the user's `%LOCALAPPDATA%\tauri`; and a per-user install
+ * (no administrator, HKCU), since the app's data and autostart are per user.
+ */
+export function tauriWindowsReleaseConfig({ runtime }) {
+	return {
+		bundle: {
+			resources: { [runtime]: "runtime" },
+			useLocalToolsDir: true,
+			windows: { nsis: { installMode: "currentUser" } },
+		},
+	};
+}
+
+/** The NSIS installer name Tauri's bundler gives a product, version, and Node-style arch. */
+export function nsisFileName(productName, version, arch) {
+	if (arch !== "x64") throw new Error(`No Windows installer for arch ${arch}.`);
+	return `${productName}_${version}_x64-setup.exe`;
+}
+
+/** The script that sets up the x64 MSVC build environment in a Visual Studio installation. */
+export function vcvars64Path(installationPath) {
+	return win32.join(installationPath, "VC", "Auxiliary", "Build", "vcvars64.bat");
+}
+
+/** The variables `cmd /c set` printed; cmd's hidden per-drive entries (`=C:=…`) and other lines are skipped. */
+export function parseEnvironment(output) {
+	const env = {};
+	for (const line of output.split(/\r?\n/)) {
+		const at = line.indexOf("=");
+		if (at > 0) env[line.slice(0, at)] = line.slice(at + 1);
+	}
+	return env;
+}
+
+const RT_MANIFEST = 24;
+
+/** The RT_MANIFEST resource of a PE file as text, or undefined when it has none or is not PE. */
+export function manifestFromPe(bytes) {
+	const u16 = (at) => (at + 2 <= bytes.length ? bytes.readUInt16LE(at) : undefined);
+	const u32 = (at) => (at + 4 <= bytes.length ? bytes.readUInt32LE(at) : undefined);
+	if (bytes.length < 0x40 || bytes.toString("latin1", 0, 2) !== "MZ") return undefined;
+	const pe = u32(0x3c);
+	if (pe === undefined || pe + 24 > bytes.length || bytes.toString("latin1", pe, pe + 4) !== "PE\0\0")
+		return undefined;
+	const sections = u16(pe + 6);
+	const optionalSize = u16(pe + 20);
+	const optional = pe + 24;
+	const magic = u16(optional);
+	const directories = magic === 0x20b ? optional + 112 : magic === 0x10b ? optional + 96 : undefined;
+	if (directories === undefined || (u32(directories - 4) ?? 0) <= 2) return undefined;
+	const resourceRva = u32(directories + 2 * 8);
+	if (!resourceRva) return undefined;
+	const table = optional + optionalSize;
+	const fileOffset = (rva) => {
+		for (let i = 0; i < sections; i++) {
+			const header = table + i * 40;
+			const virtualAddress = u32(header + 12);
+			const span = Math.max(u32(header + 8) ?? 0, u32(header + 16) ?? 0);
+			if (virtualAddress !== undefined && rva >= virtualAddress && rva < virtualAddress + span)
+				return rva - virtualAddress + (u32(header + 20) ?? 0);
+		}
+		return undefined;
+	};
+	const root = fileOffset(resourceRva);
+	if (root === undefined) return undefined;
+	// Each level is a directory of entries: type, then name, then language; take the first match at each.
+	const firstEntry = (directory, id) => {
+		const named = u16(directory + 12) ?? 0;
+		const ids = u16(directory + 14) ?? 0;
+		for (let i = named; i < named + ids; i++) {
+			const entry = directory + 16 + i * 8;
+			if (id === undefined || u32(entry) === id) return u32(entry + 4);
+		}
+		return undefined;
+	};
+	let offset = firstEntry(root, RT_MANIFEST);
+	for (let level = 0; level < 2; level++) {
+		if (offset === undefined || !(offset & 0x80000000)) return undefined;
+		offset = firstEntry(root + (offset & 0x7fffffff));
+	}
+	if (offset === undefined || offset & 0x80000000) return undefined;
+	const dataRva = u32(root + offset);
+	const size = u32(root + offset + 4);
+	const data = dataRva === undefined ? undefined : fileOffset(dataRva);
+	if (data === undefined || size === undefined || data + size > bytes.length) return undefined;
+	return bytes.toString("utf8", data, data + size);
+}
+
+/** Whether a manifest depends on Common Controls 6, which the native task dialogs need. */
+export function usesCommonControls6(manifest) {
+	return [...manifest.matchAll(/<assemblyIdentity\b[^>]*>/g)].some(
+		([identity]) =>
+			/\bname\s*=\s*"Microsoft\.Windows\.Common-Controls"/.test(identity) &&
+			/\bversion\s*=\s*"6\.0\.0\.0"/.test(identity),
+	);
+}

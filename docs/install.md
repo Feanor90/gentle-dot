@@ -106,7 +106,7 @@ Keep the `./` with `apt`. The package manager adds WebKitGTK and tray support. T
 
 ## Windows (port in progress)
 
-There is no Windows installer yet; the port lives on the `feat/windows-support` branch of the fork and is tracked in `odd/tasks/windows-support.md`. What already holds:
+A Windows installer can be built from source (below), but it is not released yet: it has not passed the Windows acceptance check that comes before any release. The port lives on the `feat/windows-support` branch of the fork and is tracked in `odd/tasks/windows-support.md`. What already holds:
 
 - Connector secrets (tokens and sign-ins) are kept in the Windows Credential Manager as generic credentials named `dev.gentleman.gentle-dot.connectors/<id>`, each capital letter of the id shown as `^` and the small letter (for example `header/^authorization`) (Control Panel > Credential Manager > Windows Credentials shows them as "Gentle Dot connector: …"), stored on this computer only and encrypted on disk by Windows, never in `%USERPROFILE%\.gentle-dot`. A long sign-in is split over a few more credentials named `…/<id>#<generation>-2`, `-3`, …
 - **Limit on Windows:** the Credential Manager has no way to restrict which program reads a credential, so any program running as your Windows user can read those secrets, including commands the assistant runs in its shell. This is the same limit as the Linux keyring; on macOS the Keychain lets only the signed app read them without asking. Connect only the accounts you want the assistant to use.
@@ -117,3 +117,17 @@ There is no Windows installer yet; the port lives on the `feat/windows-support` 
 - **If an older instance blocks adoption:** close the older Gentle Dot instance through its original launcher and close any Explorer windows showing the data folder, then retry. Adoption needs exclusive access. A PID record in a nonprivate folder is not trusted: matching the process ID, creation time and executable path does not prove that the process belongs to Gentle Dot. The app will not stop a process using that record, and filesystem safety refusals remain in force. Do not delete the folder or change permissions to bypass the refusal. After the folder is released, the usual **Limit access** / **Cancel** confirmation still applies. Automatic recovery of legacy instances requires independently verifiable application provenance and is not supported.
 - **Limits on Windows:** programs running as your Windows user and administrators can still read the data folder, as on any desktop. Only the folder and the files the app lists change; other files already inside keep their earlier access until the assistant rewrites them. Files outside the data folder, such as your workspace and the attachments saved in it, keep the access of the folder they are in. The data folder has to be on a drive that supports Windows permissions (NTFS); FAT and exFAT drives are refused. Running Gentle Dot as administrator (elevated) makes Windows give the files it creates to the Administrators group, so they are not treated as private and the app refuses to adopt them; run it as your normal user.
 - The panel shortcut is `Alt+Space`, as on macOS and Linux; while Gentle Dot holds it, `Alt+Space` no longer opens the window menu of other apps (use the title bar or `Win+Arrow` keys instead). When another program already holds `Alt+Space` (PowerToys Run, for example), the app uses `Ctrl+Alt+Space` for that session and shows it on the tray's Open item and in Settings; `config.json` keeps `Alt+Space`, which is tried again at the next start. Choose another one in Settings to keep it.
+
+### Build the installer from source
+
+On Windows 10/11 x64 with Node (the version in `.nvmrc`), pnpm, Rust for the MSVC target (`rustc` on `PATH`), Visual Studio Build Tools with the C++ workload, and Go 1.25.10 or newer on `PATH`:
+
+```sh
+pnpm install
+pnpm package:win                 # stages the runtime, then builds the installer
+pnpm package:win --skip-stage    # reuses build/runtime/win32-x64
+```
+
+The command stages the runtime (`build/runtime/win32-x64`), loads the Visual Studio x64 build environment itself, builds the release app, and writes a per-user NSIS installer (no administrator needed; it installs to `%LOCALAPPDATA%\Gentle Dot`) to `apps/desktop/src-tauri/target/release/bundle/nsis/`. It then checks the result without installing it: the app's embedded Windows manifest, every staged runtime file in the bundle, and the installer's size and SHA-256. The NSIS tools the bundler downloads are kept in `apps/desktop/src-tauri/target/.tauri`, not in `%LOCALAPPDATA%\tauri`.
+
+Go is needed because gentle-pi has no Windows release of its Gentle AI binary and builds it from source while the runtime is staged. That build is checked against the Go checksum database (SumDB), not against a pinned binary hash as on macOS and Linux, and it is not reproducible: each staging produces a binary with a different SHA-256.
