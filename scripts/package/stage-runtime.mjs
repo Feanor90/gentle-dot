@@ -18,22 +18,29 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, resolve, win32 } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import {
+	archiveExtractor,
 	assertHostTarget,
 	buildManifest,
 	checksumFor,
 	engramArchiveName,
+	engramBinaryName,
 	engramReleaseVersion,
 	formatSize,
+	hostCommand,
+	nodeArchiveEntries,
 	nodeArchiveName,
 	nodeVersion,
+	npmCmdWrapper,
+	npmInstallEnv,
 	npmWrapper,
 	parseArgs,
 	symlinksIn,
+	TARGETS,
 	treeSize,
 	verifyChecksum,
 	versionFromReleaseUrl,
@@ -42,7 +49,8 @@ import {
 const REPO = fileURLToPath(new URL("../..", import.meta.url));
 const CACHE = join(REPO, ".cache", "package");
 const ENGRAM_RELEASES = "https://github.com/Gentleman-Programming/engram/releases";
-const SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+const isWindows = (target) => TARGETS[target].platform === "win32";
 
 const say = (line) => process.stdout.write(`${line}\n`);
 
@@ -53,6 +61,12 @@ function run(command, args, options = {}) {
 			`${command} ${args.join(" ")} failed (${result.error?.message ?? `exit ${result.status}`}).`,
 		);
 	return result;
+}
+
+/** `run` for a command found on PATH, such as `pnpm`, which is `pnpm.cmd` on Windows. */
+function runOnPath(command, args, options = {}) {
+	const spawn = hostCommand(command, args);
+	return run(spawn.command, spawn.args, spawn.shell ? { ...options, shell: true } : options);
 }
 
 async function download(url, destination) {
@@ -117,18 +131,22 @@ async function stageNode(out, target) {
 	);
 	const node = join(out, "node");
 	mkdirSync(join(node, "bin"), { recursive: true });
-	const root = archiveName.replace(/\.tar\.gz$/, "");
+	const { entries } = nodeArchiveEntries(version, target);
+	const { command, flags } = archiveExtractor(target);
 	// Only the binary, npm, and the license: headers, docs, and corepack are left out.
-	run("tar", [
-		"-xzf",
-		archive,
-		"-C",
-		node,
-		"--strip-components=1",
-		`${root}/bin/node`,
-		`${root}/lib/node_modules/npm`,
-		`${root}/LICENSE`,
-	]);
+	const members = entries.map((entry) => entry.member);
+	if (isWindows(target)) {
+		// The ZIP keeps node.exe and npm at its top level: unpack them aside, then place them.
+		const extracted = mkdtempSync(join(CACHE, "node-"));
+		run(command, [flags, archive, "-C", extracted, ...members]);
+		for (const { member, path } of entries)
+			cpSync(join(extracted, member), join(node, path), { recursive: true });
+		rmSync(extracted, { recursive: true });
+		writeFileSync(join(node, "bin", "npm.cmd"), npmCmdWrapper("npm-cli.js"));
+		writeFileSync(join(node, "bin", "npx.cmd"), npmCmdWrapper("npx-cli.js"));
+		return version;
+	}
+	run(command, [flags, archive, "-C", node, "--strip-components=1", ...members]);
 	writeFileSync(join(node, "bin", "npm"), npmWrapper("npm-cli.js"), { mode: 0o755 });
 	writeFileSync(join(node, "bin", "npx"), npmWrapper("npx-cli.js"), { mode: 0o755 });
 	return version;
@@ -145,22 +163,49 @@ function openGentleAi(daemon) {
 			for (const name of readdirSync(path)) open(join(path, name));
 		} else if (stat.isFile()) chmodSync(path, stat.mode & 0o111 ? 0o755 : 0o644);
 	};
-	open(dir);
+	// Windows has no mode bits to open: installed files take the install folder's ACL.
+	if (process.platform !== "win32") open(dir);
 	const versions = readdirSync(dir);
 	const integrity = JSON.parse(readFileSync(join(dir, versions[0] ?? "", "integrity.json"), "utf8"));
 	return integrity;
 }
 
-function installDaemonModules(out) {
+/**
+ * The folder of the host's `go.exe`. gentle-pi has no Windows release archive and builds
+ * its Gentle AI binary from source with the local Go, which the clean npm PATH would hide.
+ */
+function windowsGoBin() {
+	let found;
+	try {
+		found = execFileSync(join(process.env.SystemRoot ?? "C:\\Windows", "System32", "where.exe"), ["go.exe"], {
+			encoding: "utf8",
+			timeout: 5000,
+		})
+			.split(/\r?\n/)
+			.find((line) => win32.isAbsolute(line.trim()));
+	} catch {}
+	if (!found)
+		throw new Error(
+			"Staging win32-x64 needs Go 1.25.10 or newer on PATH: gentle-pi builds its Gentle AI binary from source on Windows.",
+		);
+	return win32.dirname(found.trim());
+}
+
+function installDaemonModules(out, target) {
 	const daemon = join(out, "daemon");
-	const npmHome = join(CACHE, "npm-home");
-	mkdirSync(npmHome, { recursive: true });
-	const npmrc = join(CACHE, "npmrc");
-	writeFileSync(npmrc, "");
-	say("Daemon dependencies (npm install --omit=dev)");
 	// A clean npm setup: no user npmrc, a cache of its own, and a scratch HOME for install scripts.
+	const env = npmInstallEnv({
+		platform: TARGETS[target].platform,
+		nodeBin: join(out, "node", "bin"),
+		cache: CACHE,
+		goBin: isWindows(target) ? windowsGoBin() : undefined,
+	});
+	for (const dir of [env.HOME, env.APPDATA, env.LOCALAPPDATA, env.TEMP])
+		if (dir) mkdirSync(dir, { recursive: true });
+	writeFileSync(env.npm_config_userconfig, "");
+	say("Daemon dependencies (npm install --omit=dev)");
 	const result = spawnSync(
-		join(out, "node", "bin", "node"),
+		join(out, "node", "bin", isWindows(target) ? "node.exe" : "node"),
 		[
 			join(out, "node", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
 			"install",
@@ -174,15 +219,7 @@ function installDaemonModules(out) {
 			cwd: daemon,
 			encoding: "utf8",
 			maxBuffer: 64 * 1024 * 1024,
-			env: {
-				HOME: npmHome,
-				PATH: `${join(out, "node", "bin")}:${SYSTEM_PATH}`,
-				TMPDIR: process.env.TMPDIR ?? "/tmp",
-				npm_config_userconfig: npmrc,
-				npm_config_cache: join(CACHE, "npm-cache"),
-				npm_config_registry: "https://registry.npmjs.org/",
-				npm_config_update_notifier: "false",
-			},
+			env,
 		},
 	);
 	process.stdout.write(result.stdout ?? "");
@@ -193,7 +230,11 @@ function installDaemonModules(out) {
 		.filter((line) => /Gentle AI|gentle-pi/.test(line) && !/^>/.test(line.trim()));
 	const gentleAi = openGentleAi(daemon);
 	say(`  gentle-pi postinstall: ${postinstall.join(" | ") || "(no output)"}`);
-	say(`  gentle-ai ${gentleAi.version} from ${gentleAi.asset} (sha256 ${gentleAi.assetSha256})`);
+	// Windows has no release archive: gentle-pi records a verified Go source build instead.
+	say(
+		`  gentle-ai ${gentleAi.version} from ${gentleAi.asset ?? `${gentleAi.method} ${gentleAi.module}@${gentleAi.tag} (${gentleAi.goVersion})`} ` +
+			`(sha256 ${gentleAi.assetSha256 ?? gentleAi.binarySha256})`,
+	);
 	const pkg = (name) =>
 		JSON.parse(readFileSync(join(daemon, "node_modules", name, "package.json"), "utf8")).version;
 	return {
@@ -233,11 +274,13 @@ async function stageEngram(out, target, requested) {
 		checksumFor(await text(`${base}/checksums.txt`), archiveName),
 	);
 	const extracted = mkdtempSync(join(CACHE, "engram-"));
-	run("tar", ["-xzf", archive, "-C", extracted, "engram"]);
-	const binary = join(extracted, "engram");
-	if (!lstatSync(binary).isFile()) throw new Error(`${archiveName} has no regular engram binary.`);
-	copyFileSync(binary, join(out, "bin", "engram"));
-	chmodSync(join(out, "bin", "engram"), 0o755);
+	const { command, flags } = archiveExtractor(target);
+	const name = engramBinaryName(target);
+	run(command, [flags, archive, "-C", extracted, name]);
+	const binary = join(extracted, name);
+	if (!lstatSync(binary).isFile()) throw new Error(`${archiveName} has no regular ${name} binary.`);
+	copyFileSync(binary, join(out, "bin", name));
+	if (!isWindows(target)) chmodSync(join(out, "bin", name), 0o755);
 	rmSync(extracted, { recursive: true });
 	return { version, source };
 }
@@ -265,11 +308,11 @@ async function main() {
 
 	const node = await stageNode(out, target);
 	say("Daemon (build:runtime)");
-	run("pnpm", ["--filter", "@gentle-dot/daemon", "build:runtime", "--", "--out", out], { cwd: REPO });
-	const modules = installDaemonModules(out);
+	runOnPath("pnpm", ["--filter", "@gentle-dot/daemon", "build:runtime", "--", "--out", out], { cwd: REPO });
+	const modules = installDaemonModules(out, target);
 	const engram = await stageEngram(out, target, options.engramVersion);
 	say("Web UI");
-	run("pnpm", ["--filter", "@gentle-dot/ui", "build"], { cwd: REPO });
+	runOnPath("pnpm", ["--filter", "@gentle-dot/ui", "build"], { cwd: REPO });
 	cpSync(join(REPO, "packages", "ui", "dist", "app"), join(out, "ui"), { recursive: true });
 
 	const links = symlinksIn(out);

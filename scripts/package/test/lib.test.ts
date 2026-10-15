@@ -1,15 +1,32 @@
-import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import {
+	copyFileSync,
+	existsSync,
+	linkSync,
+	mkdirSync,
+	mkdtempSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
+import { join, win32 } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import {
+	archiveExtractor,
 	assertHostTarget,
 	buildManifest,
 	checksumFor,
 	engramArchiveName,
+	engramBinaryName,
 	engramReleaseVersion,
+	hostCommand,
 	hostTarget,
+	nodeArchiveEntries,
 	nodeArchiveName,
 	nodeVersion,
+	npmCmdWrapper,
+	npmInstallEnv,
+	npmWrapper,
 	parseArgs,
 	symlinksIn,
 	TARGETS,
@@ -151,6 +168,213 @@ describe("checksums", () => {
 		writeFileSync(file, "hellO");
 		await expect(verifyChecksum(file, hello)).rejects.toThrow(/Checksum mismatch/);
 	});
+});
+
+describe("archive extraction", () => {
+	it("keeps the Unix Node members and maps the Windows ZIP's members into the same layout", () => {
+		expect(nodeArchiveEntries("24.14.1", "linux-x64")).toEqual({
+			root: "node-v24.14.1-linux-x64",
+			entries: [
+				{ member: "node-v24.14.1-linux-x64/bin/node", path: "bin/node" },
+				{ member: "node-v24.14.1-linux-x64/lib/node_modules/npm", path: "lib/node_modules/npm" },
+				{ member: "node-v24.14.1-linux-x64/LICENSE", path: "LICENSE" },
+			],
+		});
+		expect(nodeArchiveEntries("24.14.1", "darwin-arm64").root).toBe("node-v24.14.1-darwin-arm64");
+		expect(nodeArchiveEntries("24.14.1", "win32-x64")).toEqual({
+			root: "node-v24.14.1-win-x64",
+			entries: [
+				{ member: "node-v24.14.1-win-x64/node.exe", path: "bin/node.exe" },
+				{ member: "node-v24.14.1-win-x64/node_modules/npm", path: "lib/node_modules/npm" },
+				{ member: "node-v24.14.1-win-x64/LICENSE", path: "LICENSE" },
+			],
+		});
+	});
+
+	it("names the Engram binary inside each archive", () => {
+		expect(engramBinaryName("darwin-arm64")).toBe("engram");
+		expect(engramBinaryName("linux-x64")).toBe("engram");
+		expect(engramBinaryName("win32-x64")).toBe("engram.exe");
+	});
+
+	it("unpacks with tar -xzf on Unix and with Windows' own tar.exe, which reads ZIP, on Windows", () => {
+		expect(archiveExtractor("linux-x64", {})).toEqual({ command: "tar", flags: "-xzf" });
+		expect(archiveExtractor("darwin-arm64", { SystemRoot: "D:\\Win" })).toEqual({
+			command: "tar",
+			flags: "-xzf",
+		});
+		expect(archiveExtractor("win32-x64", { SystemRoot: "D:\\Win" })).toEqual({
+			command: "D:\\Win\\System32\\tar.exe",
+			flags: "-xf",
+		});
+		expect(archiveExtractor("win32-x64", {})).toEqual({
+			command: "C:\\Windows\\System32\\tar.exe",
+			flags: "-xf",
+		});
+	});
+});
+
+describe("npm install environment", () => {
+	const npmConfig = (cache: string, join: (...parts: string[]) => string) => ({
+		npm_config_userconfig: join(cache, "npmrc"),
+		npm_config_cache: join(cache, "npm-cache"),
+		npm_config_registry: "https://registry.npmjs.org/",
+		npm_config_update_notifier: "false",
+	});
+
+	it("keeps the Unix environment: scratch HOME, the staged Node then the system PATH, TMPDIR", () => {
+		const cache = join("repo", ".cache", "package");
+		const nodeBin = join("out", "node", "bin");
+		const unix = (env: Record<string, string>) => npmInstallEnv({ platform: "linux", nodeBin, cache, env });
+		expect(unix({ TMPDIR: "/var/tmp", HOME: "/home/me", PATH: "/home/me/bin" })).toEqual({
+			HOME: join(cache, "npm-home"),
+			PATH: `${nodeBin}:/usr/bin:/bin:/usr/sbin:/sbin`,
+			TMPDIR: "/var/tmp",
+			...npmConfig(cache, join),
+		});
+		expect(unix({})).toMatchObject({ TMPDIR: "/tmp" });
+		expect(npmInstallEnv({ platform: "darwin", nodeBin, cache, env: {} }).PATH).toBe(
+			`${nodeBin}:/usr/bin:/bin:/usr/sbin:/sbin`,
+		);
+	});
+
+	it("gives Windows a project-local profile and temp, the staged Node then System32, and no user PATH", () => {
+		const cache = "C:\\repo\\.cache\\package";
+		const nodeBin = "C:\\repo\\build\\runtime\\win32-x64\\node\\bin";
+		const home = "C:\\repo\\.cache\\package\\npm-home";
+		const scratch = "C:\\repo\\.cache\\package\\tmp";
+		const env = npmInstallEnv({
+			platform: "win32",
+			nodeBin,
+			cache,
+			env: {
+				SystemRoot: "C:\\WINDOWS",
+				ComSpec: "C:\\WINDOWS\\system32\\cmd.exe",
+				PATHEXT: ".COM;.EXE;.CMD",
+				USERPROFILE: "C:\\Users\\me",
+				APPDATA: "C:\\Users\\me\\AppData\\Roaming",
+				PATH: "C:\\Users\\me\\bin",
+				TEMP: "C:\\Users\\me\\AppData\\Local\\Temp",
+			},
+		});
+		expect(env).toEqual({
+			HOME: home,
+			USERPROFILE: home,
+			APPDATA: `${home}\\AppData\\Roaming`,
+			LOCALAPPDATA: `${home}\\AppData\\Local`,
+			TEMP: scratch,
+			TMP: scratch,
+			SystemRoot: "C:\\WINDOWS",
+			windir: "C:\\WINDOWS",
+			ComSpec: "C:\\WINDOWS\\system32\\cmd.exe",
+			PATHEXT: ".COM;.EXE;.CMD",
+			PATH: `${nodeBin};C:\\WINDOWS\\System32;C:\\WINDOWS`,
+			...npmConfig(cache, win32.join),
+		});
+		// gentle-pi builds its Gentle AI binary from source on Windows with the host's Go.
+		expect(
+			npmInstallEnv({ platform: "win32", nodeBin, cache, goBin: "C:\\Program Files\\Go\\bin", env: {} }).PATH,
+		).toBe(`${nodeBin};C:\\Program Files\\Go\\bin;C:\\Windows\\System32;C:\\Windows`);
+		// Windows keeps a second spelling of PATH and Go's own variables: none of them reaches npm.
+		const inherited = npmInstallEnv({
+			platform: "win32",
+			nodeBin,
+			cache,
+			goBin: "C:\\Go\\bin",
+			env: { Path: "C:\\Users\\me\\tools", GOPATH: "C:\\Users\\me\\go", SystemRoot: "C:\\Windows" },
+		});
+		expect(JSON.stringify(inherited)).not.toMatch(/Users/);
+		expect(inherited.PATH).toBe(`${nodeBin};C:\\Go\\bin;C:\\Windows\\System32;C:\\Windows`);
+		expect(npmInstallEnv({ platform: "win32", nodeBin, cache, env: {} })).toMatchObject({
+			SystemRoot: "C:\\Windows",
+			ComSpec: "C:\\Windows\\System32\\cmd.exe",
+			PATHEXT: ".COM;.EXE;.BAT;.CMD",
+			PATH: `${nodeBin};C:\\Windows\\System32;C:\\Windows`,
+		});
+	});
+});
+
+describe("host commands", () => {
+	it("spawns commands directly on Unix", () => {
+		expect(hostCommand("pnpm", ["--filter", "@gentle-dot/ui", "build"], "darwin")).toEqual({
+			command: "pnpm",
+			args: ["--filter", "@gentle-dot/ui", "build"],
+			shell: false,
+		});
+	});
+
+	it("runs Windows commands such as pnpm.cmd through the shell with quoted arguments", () => {
+		expect(
+			hostCommand(
+				"pnpm",
+				["--filter", "@gentle-dot/daemon", "build:runtime", "--", "--out", "C:\\My Apps\\rt"],
+				"win32",
+			),
+		).toEqual({
+			command: 'pnpm --filter @gentle-dot/daemon build:runtime -- --out "C:\\My Apps\\rt"',
+			args: [],
+			shell: true,
+		});
+		for (const unsafe of ['a"b', "50%", "a&b", "a|b", "a^b", "a<b", "a>b"])
+			expect(() => hostCommand("pnpm", [unsafe], "win32")).toThrow(
+				`Cannot pass ${unsafe} through the Windows shell.`,
+			);
+		// The command name goes through the same shell, so it is checked too.
+		expect(() => hostCommand("pn&pm", [], "win32")).toThrow("Cannot pass pn&pm through the Windows shell.");
+	});
+});
+
+describe("npm wrappers", () => {
+	it("keeps the Unix bin/npm script unchanged", () => {
+		expect(npmWrapper("npm-cli.js")).toBe(`#!/bin/sh
+# Runs the npm bundled with this Node; a script rather than Node's symlink, so copies that follow links work.
+self=$0
+while [ -L "$self" ]; do
+	link=$(readlink "$self")
+	case $link in
+		/*) self=$link ;;
+		*) self=$(dirname "$self")/$link ;;
+	esac
+done
+bin=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd -P) || exit 1
+exec "$bin/node" "$bin/../lib/node_modules/npm/bin/npm-cli.js" "$@"
+`);
+	});
+
+	it("writes Windows npm.cmd / npx.cmd that run the staged npm next to themselves", () => {
+		expect(npmCmdWrapper("npx-cli.js")).toBe(
+			"@echo off\r\n" +
+				"rem Runs the npm bundled with this Node, wherever the runtime folder is copied.\r\n" +
+				'"%~dp0node.exe" "%~dp0..\\lib\\node_modules\\npm\\bin\\npx-cli.js" %*\r\n',
+		);
+	});
+
+	it.runIf(process.platform === "win32")(
+		"runs npm.cmd from a moved folder with spaces, passing arguments and the exit code",
+		() => {
+			const bin = join(fixtureDir(), "moved runtime", "node", "bin");
+			const npm = join(bin, "..", "lib", "node_modules", "npm", "bin");
+			mkdirSync(npm, { recursive: true });
+			mkdirSync(bin, { recursive: true });
+			try {
+				linkSync(process.execPath, join(bin, "node.exe"));
+			} catch {
+				copyFileSync(process.execPath, join(bin, "node.exe"));
+			}
+			writeFileSync(
+				join(npm, "npm-cli.js"),
+				'console.log(JSON.stringify(process.argv.slice(1))); process.exit(process.argv.includes("fail") ? 3 : 0);\n',
+			);
+			writeFileSync(join(bin, "npm.cmd"), npmCmdWrapper("npm-cli.js"));
+			const npmCmd = (...args: string[]) =>
+				spawnSync([`"${join(bin, "npm.cmd")}"`, ...args].join(" "), { shell: true, encoding: "utf8" });
+			const ok = npmCmd("--version", '"a b"');
+			expect(ok.stderr).toBe("");
+			expect(ok.status).toBe(0);
+			expect(JSON.parse(ok.stdout)).toEqual([join(npm, "npm-cli.js"), "--version", "a b"]);
+			expect(npmCmd("fail").status).toBe(3);
+		},
+	);
 });
 
 describe("tree and manifest", () => {

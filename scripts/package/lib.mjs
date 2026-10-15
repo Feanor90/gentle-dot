@@ -1,7 +1,7 @@
 // Pure helpers for staging the installed app's runtime (`stage-runtime.mjs`).
 import { createHash } from "node:crypto";
 import { createReadStream, lstatSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, win32 } from "node:path";
 
 /**
  * The targets a runtime can be staged for, with the names Node's and Engram's
@@ -74,6 +74,98 @@ export function nodeArchiveName(version, target) {
 
 export function engramArchiveName(version, target) {
 	return `engram_${version}_${TARGETS[target].engram}.${TARGETS[target].platform === "win32" ? "zip" : "tar.gz"}`;
+}
+
+/**
+ * The members staged from a Node archive and where each lands under `node/`. The
+ * Windows ZIP keeps `node.exe` and npm at its top level; they land in the Unix layout.
+ */
+export function nodeArchiveEntries(version, target) {
+	const root = nodeArchiveName(version, target).replace(/\.(tar\.gz|zip)$/, "");
+	const windows = TARGETS[target].platform === "win32";
+	const entries = windows
+		? [
+				{ member: `${root}/node.exe`, path: "bin/node.exe" },
+				{ member: `${root}/node_modules/npm`, path: "lib/node_modules/npm" },
+			]
+		: [
+				{ member: `${root}/bin/node`, path: "bin/node" },
+				{ member: `${root}/lib/node_modules/npm`, path: "lib/node_modules/npm" },
+			];
+	return { root, entries: [...entries, { member: `${root}/LICENSE`, path: "LICENSE" }] };
+}
+
+/** The Engram executable inside its release archive. */
+export function engramBinaryName(target) {
+	return TARGETS[target].platform === "win32" ? "engram.exe" : "engram";
+}
+
+/** The Windows folder, from the environment, else its default. */
+function windowsRoot(env) {
+	return env.SystemRoot || env.SYSTEMROOT || env.windir || "C:\\Windows";
+}
+
+/**
+ * The `tar` that unpacks a target's archives. On Windows it is the system's own
+ * `tar.exe` (bsdtar), which reads ZIP; the GNU tar Git Bash puts first on PATH does not.
+ */
+export function archiveExtractor(target, env = process.env) {
+	if (TARGETS[target].platform !== "win32") return { command: "tar", flags: "-xzf" };
+	return { command: win32.join(windowsRoot(env), "System32", "tar.exe"), flags: "-xf" };
+}
+
+/**
+ * The environment of the staging `npm install`: no user npmrc, a cache of its own, and a
+ * scratch profile for install scripts, all under `cache`. Windows gets a project-local
+ * profile and temp folder, and a PATH of the staged Node, the host's Go (`goBin`; gentle-pi
+ * builds its Gentle AI binary from source there), and the system folders only.
+ * @param {{ platform: string, nodeBin: string, cache: string, goBin?: string, env?: Record<string, string | undefined> }} options
+ */
+export function npmInstallEnv({ platform, nodeBin, cache, goBin, env = process.env }) {
+	const path = platform === "win32" ? win32 : { join };
+	const npmConfig = {
+		npm_config_userconfig: path.join(cache, "npmrc"),
+		npm_config_cache: path.join(cache, "npm-cache"),
+		npm_config_registry: "https://registry.npmjs.org/",
+		npm_config_update_notifier: "false",
+	};
+	const home = path.join(cache, "npm-home");
+	if (platform !== "win32")
+		return {
+			HOME: home,
+			PATH: `${nodeBin}:/usr/bin:/bin:/usr/sbin:/sbin`,
+			TMPDIR: env.TMPDIR ?? "/tmp",
+			...npmConfig,
+		};
+	const root = windowsRoot(env);
+	const scratch = win32.join(cache, "tmp");
+	return {
+		HOME: home,
+		USERPROFILE: home,
+		APPDATA: win32.join(home, "AppData", "Roaming"),
+		LOCALAPPDATA: win32.join(home, "AppData", "Local"),
+		TEMP: scratch,
+		TMP: scratch,
+		SystemRoot: root,
+		windir: root,
+		ComSpec: env.ComSpec || win32.join(root, "System32", "cmd.exe"),
+		PATHEXT: env.PATHEXT || ".COM;.EXE;.BAT;.CMD",
+		PATH: [nodeBin, goBin, win32.join(root, "System32"), root].filter(Boolean).join(";"),
+		...npmConfig,
+	};
+}
+
+/**
+ * How to spawn a command found on PATH. Windows finds `pnpm.cmd` only through its
+ * shell, so the command line is quoted for `cmd.exe`; characters it would expand are refused.
+ */
+export function hostCommand(command, args, platform = process.platform) {
+	if (platform !== "win32") return { command, args, shell: false };
+	const quote = (arg) => {
+		if (/["%^&|<>\r\n]/.test(arg)) throw new Error(`Cannot pass ${arg} through the Windows shell.`);
+		return arg === "" || /[\s()]/.test(arg) ? `"${arg}"` : arg;
+	};
+	return { command: [command, ...args].map(quote).join(" "), args: [], shell: true };
 }
 
 /** The SHA-256 a `SHASUMS256.txt` / `checksums.txt` listing gives `fileName`; throws when it is absent. */
@@ -173,6 +265,16 @@ done
 bin=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd -P) || exit 1
 exec "$bin/node" "$bin/../lib/node_modules/npm/bin/${cli}" "$@"
 `;
+}
+
+/** A Windows `bin\npm.cmd` or `bin\npx.cmd` that runs the staged Node's own npm, wherever the folder is copied. */
+export function npmCmdWrapper(cli) {
+	return [
+		"@echo off",
+		"rem Runs the npm bundled with this Node, wherever the runtime folder is copied.",
+		`"%~dp0node.exe" "%~dp0..\\lib\\node_modules\\npm\\bin\\${cli}" %*`,
+		"",
+	].join("\r\n");
 }
 
 // macOS installer (`package-mac.mjs`).
