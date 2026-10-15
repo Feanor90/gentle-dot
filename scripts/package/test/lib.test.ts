@@ -1,7 +1,6 @@
-import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import {
 	assertHostTarget,
 	buildManifest,
@@ -13,12 +12,30 @@ import {
 	nodeVersion,
 	parseArgs,
 	symlinksIn,
+	TARGETS,
 	treeSize,
+	USAGE,
 	verifyChecksum,
 	versionFromReleaseUrl,
 } from "../lib.mjs";
 
 describe("parseArgs", () => {
+	it("accepts the canonical Windows target and advertises it in usage", () => {
+		expect(parseArgs(["--target", "win32-x64"])).toEqual({ target: "win32-x64" });
+		expect(USAGE).toBe(
+			"usage: stage-runtime --target <darwin-arm64|linux-arm64|linux-x64|win32-x64> [--out <dir>] [--engram-version <x.y.z>]",
+		);
+		expect(() => parseArgs([])).toThrow(`Missing --target.\n${USAGE}`);
+		expect(() => parseArgs(["--target", "windows-x64"])).toThrow(
+			"Unknown target windows-x64; expected one of darwin-arm64, linux-arm64, linux-x64, win32-x64.",
+		);
+	});
+
+	it("keeps every existing target accepted", () => {
+		for (const target of ["darwin-arm64", "linux-arm64", "linux-x64"])
+			expect(parseArgs(["--target", target])).toEqual({ target });
+	});
+
 	it("reads the target, the output folder, and an Engram version, ignoring pnpm's --", () => {
 		expect(
 			parseArgs(["--", "--target", "linux-x64", "--out", "/tmp/r", "--engram-version", "3.2.1"]),
@@ -35,9 +52,29 @@ describe("parseArgs", () => {
 });
 
 describe("host target", () => {
+	it("maps only Windows x64 and enforces native staging in both directions", () => {
+		expect(TARGETS["win32-x64"]).toEqual({
+			platform: "win32",
+			arch: "x64",
+			node: "win-x64",
+			engram: "windows_amd64",
+		});
+		expect(hostTarget("win32", "x64")).toBe("win32-x64");
+		expect(hostTarget("win32", "arm64")).toBeUndefined();
+		expect(() => assertHostTarget("win32-x64", "win32-x64")).not.toThrow();
+		for (const [target, host] of [
+			["win32-x64", "linux-x64"],
+			["linux-x64", "win32-x64"],
+		])
+			expect(() => assertHostTarget(target, host)).toThrow(
+				`Cannot stage ${target} on ${host}: the runtime's dependencies include native pieces for the machine that installs them. Stage ${target} on a ${target} machine or container (Linux targets are staged inside a container).`,
+			);
+	});
+
 	it("maps Node's platform and arch to a target", () => {
 		expect(hostTarget("darwin", "arm64")).toBe("darwin-arm64");
 		expect(hostTarget("linux", "x64")).toBe("linux-x64");
+		expect(hostTarget("linux", "arm64")).toBe("linux-arm64");
 		expect(hostTarget("darwin", "x64")).toBeUndefined();
 	});
 
@@ -56,7 +93,15 @@ describe("versions and asset names", () => {
 		expect(() => nodeVersion("22", "24.14.1")).toThrow(/Node 22/);
 	});
 
+	it("names the official Windows ZIP archives", () => {
+		expect(nodeArchiveName("24.14.1", "win32-x64")).toBe("node-v24.14.1-win-x64.zip");
+		expect(engramArchiveName("3.4.0", "win32-x64")).toBe("engram_3.4.0_windows_amd64.zip");
+	});
+
 	it("names the official archives", () => {
+		expect(nodeArchiveName("24.14.1", "darwin-arm64")).toBe("node-v24.14.1-darwin-arm64.tar.gz");
+		expect(nodeArchiveName("24.14.1", "linux-arm64")).toBe("node-v24.14.1-linux-arm64.tar.gz");
+		expect(engramArchiveName("3.2.1", "linux-arm64")).toBe("engram_3.2.1_linux_arm64.tar.gz");
 		expect(nodeArchiveName("24.14.1", "linux-x64")).toBe("node-v24.14.1-linux-x64.tar.gz");
 		expect(engramArchiveName("3.2.1", "linux-x64")).toBe("engram_3.2.1_linux_amd64.tar.gz");
 		expect(engramArchiveName("3.2.1", "darwin-arm64")).toBe("engram_3.2.1_darwin_arm64.tar.gz");
@@ -75,6 +120,19 @@ describe("versions and asset names", () => {
 	});
 });
 
+const fixtureDirs: string[] = [];
+
+function fixtureDir() {
+	const dir = mkdtempSync(join(process.cwd(), ".package-lib-fixture-"));
+	fixtureDirs.push(dir);
+	return dir;
+}
+
+afterAll(() => {
+	for (const dir of fixtureDirs) rmSync(dir, { recursive: true });
+	for (const dir of fixtureDirs) expect(existsSync(dir)).toBe(false);
+});
+
 describe("checksums", () => {
 	const hello = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 	const listing = `${"a".repeat(64)}  node-v24.14.1-linux-x64.tar.gz\n${hello}  hello.txt\n${"b".repeat(64)} *bin.zip\n`;
@@ -86,7 +144,7 @@ describe("checksums", () => {
 	});
 
 	it("accepts a matching file and rejects a tampered one", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "stage-runtime-"));
+		const dir = fixtureDir();
 		const file = join(dir, "hello.txt");
 		writeFileSync(file, "hello");
 		await expect(verifyChecksum(file, hello)).resolves.toBeUndefined();
@@ -97,7 +155,7 @@ describe("checksums", () => {
 
 describe("tree and manifest", () => {
 	it("sizes a tree without following links, and lists the links", () => {
-		const dir = mkdtempSync(join(tmpdir(), "stage-runtime-"));
+		const dir = fixtureDir();
 		writeFileSync(join(dir, "a"), "12345");
 		symlinkSync("a", join(dir, "link"));
 		expect(treeSize(dir)).toBe(5 + 1);

@@ -11,13 +11,14 @@ export const TARGETS = Object.freeze({
 	"darwin-arm64": { platform: "darwin", arch: "arm64", node: "darwin-arm64", engram: "darwin_arm64" },
 	"linux-arm64": { platform: "linux", arch: "arm64", node: "linux-arm64", engram: "linux_arm64" },
 	"linux-x64": { platform: "linux", arch: "x64", node: "linux-x64", engram: "linux_amd64" },
+	"win32-x64": { platform: "win32", arch: "x64", node: "win-x64", engram: "windows_amd64" },
 });
 
 /** The Node release staged when `.nvmrc` names only a major version; it must stay on that major. */
 export const PINNED_NODE_VERSION = "24.14.1";
 
 export const USAGE =
-	"usage: stage-runtime --target <darwin-arm64|linux-arm64|linux-x64> [--out <dir>] [--engram-version <x.y.z>]";
+	"usage: stage-runtime --target <darwin-arm64|linux-arm64|linux-x64|win32-x64> [--out <dir>] [--engram-version <x.y.z>]";
 
 /** Parses the command line; throws with the usage on anything unexpected. */
 export function parseArgs(argv) {
@@ -68,11 +69,11 @@ export function nodeVersion(nvmrc, pinned = PINNED_NODE_VERSION) {
 }
 
 export function nodeArchiveName(version, target) {
-	return `node-v${version}-${TARGETS[target].node}.tar.gz`;
+	return `node-v${version}-${TARGETS[target].node}.${TARGETS[target].platform === "win32" ? "zip" : "tar.gz"}`;
 }
 
 export function engramArchiveName(version, target) {
-	return `engram_${version}_${TARGETS[target].engram}.tar.gz`;
+	return `engram_${version}_${TARGETS[target].engram}.${TARGETS[target].platform === "win32" ? "zip" : "tar.gz"}`;
 }
 
 /** The SHA-256 a `SHASUMS256.txt` / `checksums.txt` listing gives `fileName`; throws when it is absent. */
