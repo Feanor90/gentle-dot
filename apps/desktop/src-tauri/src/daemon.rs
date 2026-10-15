@@ -487,7 +487,15 @@ pub fn launch_spec(env: impl Fn(&str) -> Option<String>, dev: bool, runtime: Opt
     let (node, script, mut envs) = match bundled {
         Some(dir) => {
             #[cfg(windows)]
-            let dir = std::path::absolute(dir).expect("the bundled runtime needs an absolute path");
+            let dir = {
+                let absolute = std::path::absolute(dir).expect("the bundled runtime needs an absolute path");
+                // As for the build-time script in build.rs, Node rejects a verbatim drive
+                // path as its main script (EISDIR on C:). Keep UNC paths unchanged.
+                match absolute.to_str().and_then(|text| text.strip_prefix(r"\\?\")) {
+                    Some(rest) if !rest.starts_with(r"UNC\") => PathBuf::from(rest),
+                    _ => absolute,
+                }
+            };
             let root = dir.display().to_string();
             #[cfg(unix)]
             let path = format!("{root}/bin:{root}/node/bin:/usr/bin:/bin:/usr/sbin:/sbin");
@@ -517,15 +525,16 @@ pub fn launch_spec(env: impl Fn(&str) -> Option<String>, dev: bool, runtime: Opt
             } else {
                 "node/bin/node"
             };
-            let mut runtime_envs = Vec::new();
-            // Preserve the user's search path before replacing PATH with the runtime's tools.
-            #[cfg(windows)]
-            runtime_envs.push((
-                "GENTLE_DOT_USER_PATH".to_string(),
-                env("PATH").unwrap_or_default(),
-            ));
-            runtime_envs.push(("PATH".to_string(), path));
-            runtime_envs.push(("GENTLE_DOT_RUNTIME".to_string(), root));
+            let runtime_envs = vec![
+                // Preserve the user's search path before replacing PATH with the runtime's tools.
+                #[cfg(windows)]
+                (
+                    "GENTLE_DOT_USER_PATH".to_string(),
+                    env("PATH").unwrap_or_default(),
+                ),
+                ("PATH".to_string(), path),
+                ("GENTLE_DOT_RUNTIME".to_string(), root),
+            ];
             (
                 dir.join(node).display().to_string(),
                 dir.join("daemon/cli.mjs").display().to_string(),
@@ -1199,6 +1208,30 @@ mod tests {
             env_value(&dev, "GENTLE_DOT_ALLOWED_ORIGINS"),
             Some(DEV_ALLOWED_ORIGINS)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn launch_spec_normalizes_verbatim_bundled_paths_for_node() {
+        let runtime = fake_runtime("runtime verbatim with spaces", true);
+        let canonical = fs::canonicalize(&runtime).unwrap();
+        assert!(canonical.display().to_string().starts_with(r"\\?\"));
+        let spec = launch_spec(env_of(&[("PATH", r"D:\User Tools")]), false, Some(&canonical));
+        for path in [&spec.program, &spec.args[0], env_value(&spec, "GENTLE_DOT_RUNTIME").unwrap()] {
+            assert!(!path.starts_with(r"\\?\"), "{path}");
+            assert!(Path::new(path).is_absolute(), "{path}");
+        }
+        assert_eq!(fs::canonicalize(&spec.args[0]).unwrap(), canonical.join("daemon/cli.mjs"));
+        assert_eq!(Path::new(&spec.program), runtime.join("node/bin/node.exe"));
+        assert_eq!(env_value(&spec, "GENTLE_DOT_USER_PATH"), Some(r"D:\User Tools"));
+        assert!(!env_value(&spec, "PATH").unwrap().contains(r"\\?\"));
+        let overridden = launch_spec(
+            env_of(&[("GENTLE_DOT_NODE", "custom-node"), ("GENTLE_DOT_DAEMON_SCRIPT", "custom-script")]),
+            false,
+            Some(&canonical),
+        );
+        assert_eq!(overridden.program, "custom-node");
+        assert_eq!(overridden.args, vec!["custom-script"]);
     }
 
     #[cfg(unix)]

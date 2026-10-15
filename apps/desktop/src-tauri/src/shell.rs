@@ -31,6 +31,7 @@ use tauri::{
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, RunEvent, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder, WindowEvent,
 };
+#[cfg(not(windows))]
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt as _};
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
@@ -606,7 +607,13 @@ fn tray_menu_ids(conversations: bool, computer_control: bool) -> Vec<&'static st
 }
 
 fn build_tray(app: &AppHandle, config: &DesktopConfig, rose_hidden: bool) -> tauri::Result<TrayIcon> {
+    #[cfg(not(windows))]
     let autostart = app.autolaunch().is_enabled().unwrap_or(false);
+    #[cfg(windows)]
+    let autostart = autostart_enabled(app).unwrap_or_else(|error| {
+        eprintln!("gentle-dot: cannot query launch at login: {error}");
+        false
+    });
     // The accelerator is only a label here; an unparsable one must not break the menu.
     let open = MenuItem::with_id(app, "open", "Open", true, Some(config.shortcut.as_str()))
         .or_else(|_| MenuItem::with_id(app, "open", "Open", true, None::<&str>))?;
@@ -703,16 +710,71 @@ fn open_in_browser(app: &AppHandle) -> CommandResult {
 }
 
 fn toggle_autostart(app: &AppHandle, menu: &Menu<tauri::Wry>) -> CommandResult {
-    let autolaunch = app.autolaunch();
-    if autolaunch.is_enabled().map_err(err)? {
-        autolaunch.disable().map_err(err)?;
-    } else {
-        autolaunch.enable().map_err(err)?;
+    #[cfg(windows)]
+    {
+        use crate::autostart_windows::{disable, enable, CurrentUser};
+        let name = &app.package_info().name;
+        let result: CommandResult = (|| {
+            if autostart_enabled(app)? {
+                disable(&mut CurrentUser, name)?;
+            } else {
+                let exe = std::env::current_exe().map_err(err)?;
+                // No startup arguments, as in the Unix plugin setup below.
+                enable(&mut CurrentUser, name, &exe.display().to_string(), &[])?;
+            }
+            Ok(())
+        })();
+        // Native check items can toggle before their callback. Restore the observed state even
+        // on a failed operation; an unknown state must never be displayed as enabled.
+        let enabled = autostart_enabled(app);
+        if let Some(item) = menu
+            .get("autostart")
+            .and_then(|item| item.as_check_menuitem().cloned())
+        {
+            item.set_checked(enabled.as_ref().copied().unwrap_or(false))
+                .map_err(err)?;
+        }
+        result?;
+        enabled?;
     }
-    if let Some(item) = menu.get("autostart").and_then(|item| item.as_check_menuitem().cloned()) {
-        item.set_checked(autolaunch.is_enabled().unwrap_or(false)).map_err(err)?;
+    #[cfg(not(windows))]
+    {
+        let autolaunch = app.autolaunch();
+        if autolaunch.is_enabled().map_err(err)? {
+            autolaunch.disable().map_err(err)?;
+        } else {
+            autolaunch.enable().map_err(err)?;
+        }
+    }
+    #[cfg(not(windows))]
+    if let Some(item) = menu
+        .get("autostart")
+        .and_then(|item| item.as_check_menuitem().cloned())
+    {
+        item.set_checked(app.autolaunch().is_enabled().unwrap_or(false))
+            .map_err(err)?;
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn autostart_enabled(app: &AppHandle) -> Result<bool, String> {
+    crate::autostart_windows::is_enabled(
+        &crate::autostart_windows::CurrentUser,
+        &app.package_info().name,
+    )
+}
+
+#[cfg(windows)]
+fn reconcile_autostart(app: &AppHandle) {
+    use crate::autostart_windows::{reconcile, CurrentUser};
+    let message = match reconcile(&mut CurrentUser, &app.package_info().name) {
+        Ok(false) => return,
+        Ok(true) => "Removed an unsafe legacy launch-at-login entry. Enable Launch at login again from the installed Gentle Dot to register its quoted path.".to_string(),
+        Err(error) => error,
+    };
+    eprintln!("gentle-dot: {message}");
+    show_message(app, MessageDialogKind::Warning, &message);
 }
 
 /// Windows: the native yes/no alert that guards limiting an existing data folder to the user; anything
@@ -785,11 +847,17 @@ pub fn run() {
     }
     let places_windows = !platform::compositor_places_windows(|key| std::env::var(key).ok());
     let config = config::load_config();
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         // First, so a second launch forwards its arguments and exits before anything else starts.
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| handle_launch(app, &args)))
-        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build());
+    // Windows uses only HKCU operations; do not expose the plugin's unquoted IPC enable either.
+    #[cfg(not(windows))]
+    let builder = builder.plugin(tauri_plugin_autostart::init(
+        MacosLauncher::LaunchAgent,
+        None,
+    ));
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -823,6 +891,8 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             let handle = app.handle().clone();
+            #[cfg(windows)]
+            reconcile_autostart(&handle);
 
             // Computer control first: a daemon this app spawns gets the helper over its channel.
             let computer = computer::start(&handle, Arc::new(ShellWindows(handle.clone())));

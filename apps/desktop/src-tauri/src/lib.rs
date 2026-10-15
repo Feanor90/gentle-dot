@@ -1,5 +1,7 @@
 pub mod alert;
 pub mod app_channel;
+#[cfg(windows)]
+pub mod autostart_windows;
 pub mod approvals;
 pub mod computer;
 pub mod config;
