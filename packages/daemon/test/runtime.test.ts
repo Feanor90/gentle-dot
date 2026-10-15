@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.ts";
 import { bundledMcpCli } from "../src/connectors.ts";
 import { isolatedAgentEnv } from "../src/isolation.ts";
-import { resolveEngramBin } from "../src/runtime.ts";
+import { engramBinaryName, resolveEngramBin } from "../src/runtime.ts";
 import { tempDir } from "./helpers.ts";
 
 const PACKAGE = fileURLToPath(new URL("..", import.meta.url));
@@ -98,30 +98,66 @@ describe("installed runtime (GENTLE_DOT_RUNTIME)", () => {
 			{ PATH: "/bin", HOME: tempDir(), GENTLE_DOT_RUNTIME: runtime, SHELL: fakeShell(userEngram) },
 			tempDir(),
 		);
+		// Windows has no login shell and no `command -v`, so there is no probe to consult and the
+		// runtime's own copy is used (L22, option (a)); the injected-platform test below pins that.
+		if (process.platform === "win32") {
+			expect(env.ENGRAM_BIN).toBe(join(runtime, "bin", "engram.exe"));
+			return;
+		}
 		expect(env.ENGRAM_BIN).toBe(userEngram);
 	});
 });
 
 describe("resolveEngramBin", () => {
-	it("prefers ENGRAM_BIN, then the login PATH, then the known folders, then the runtime's own", () => {
+	const hostBinary = engramBinaryName(process.platform);
+
+	it("prefers ENGRAM_BIN, then the known folders, then the runtime's own", () => {
 		const runtime = fakeRuntime();
 		const home = tempDir();
 		const known = tempDir();
-		const loginEngram = touch(join(tempDir(), "engram"), "", 0o755);
 		const failing = fakeShell(undefined);
 		const options = { home, knownDirs: [join(home, "missing"), known] };
 		expect(resolveEngramBin({ ENGRAM_BIN: "/x/engram", SHELL: failing }, runtime, options)).toBe("/x/engram");
-		expect(resolveEngramBin({ SHELL: fakeShell(loginEngram) }, runtime, options)).toBe(loginEngram);
-		expect(resolveEngramBin({ SHELL: failing }, runtime, options)).toBe(join(runtime, "bin", "engram"));
-		const knownEngram = touch(join(known, "engram"), "", 0o755);
+		expect(resolveEngramBin({ SHELL: failing }, runtime, options)).toBe(join(runtime, "bin", hostBinary));
+		const knownEngram = touch(join(known, hostBinary), "", 0o755);
 		expect(resolveEngramBin({ SHELL: failing }, runtime, options)).toBe(knownEngram);
 		// A login shell answer that is not an executable file is ignored.
 		expect(resolveEngramBin({ SHELL: fakeShell("/nowhere/engram") }, runtime, options)).toBe(knownEngram);
 	});
 
+	// This one spawns a real login shell, so it can only run where one exists. The Windows
+	// contract it would otherwise cover is asserted by the injected-platform test below.
+	it.skipIf(process.platform === "win32")(
+		"prefers the Engram the user's login shell finds, before the known folders",
+		() => {
+			const runtime = fakeRuntime();
+			const home = tempDir();
+			const known = tempDir();
+			const loginEngram = touch(join(tempDir(), "engram"), "", 0o755);
+			const options = { home, knownDirs: [join(home, "missing"), known] };
+			expect(resolveEngramBin({ SHELL: fakeShell(loginEngram) }, runtime, options)).toBe(loginEngram);
+		},
+	);
+
+	it("never asks a login shell on Windows, and looks for engram.exe there", () => {
+		const runtime = fakeRuntime();
+		const home = tempDir();
+		const bare = tempDir();
+		const wouldAnswer = touch(join(tempDir(), "engram"), "", 0o755);
+		touch(join(bare, "engram"), "", 0o755);
+		const options = { home, knownDirs: [bare], platform: "win32" as const };
+		// A shell that would answer is never consulted, and a bare `engram` is not the file
+		// Windows resolves, so with nothing to find the runtime's own copy is the answer.
+		expect(resolveEngramBin({ SHELL: fakeShell(wouldAnswer) }, runtime, options)).toBe(
+			join(runtime, "bin", "engram.exe"),
+		);
+		const winEngram = touch(join(bare, "engram.exe"), "", 0o755);
+		expect(resolveEngramBin({ SHELL: fakeShell(wouldAnswer) }, runtime, options)).toBe(winEngram);
+	});
+
 	it("looks in ~/go/bin, Homebrew, /usr/local/bin and ~/.local/bin by default", () => {
 		const home = tempDir();
-		const userEngram = touch(join(home, "go", "bin", "engram"), "", 0o755);
+		const userEngram = touch(join(home, "go", "bin", hostBinary), "", 0o755);
 		expect(resolveEngramBin({ SHELL: fakeShell(undefined) }, fakeRuntime(), { home })).toBe(userEngram);
 	});
 });
