@@ -3,17 +3,32 @@ import {
 	copyFileSync,
 	existsSync,
 	mkdirSync,
+	mkdtempSync,
 	readdirSync,
 	readFileSync,
 	realpathSync,
+	rmSync,
 	statSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { beforeAll, describe, expect, it } from "vitest";
-import { tempDir } from "./helpers.ts";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+const fixtureDirs: string[] = [];
+
+function tempDir(): string {
+	const root = fileURLToPath(new URL("../../../", import.meta.url));
+	const dir = mkdtempSync(join(root, ".runtime-build-fixture-"));
+	fixtureDirs.push(dir);
+	return dir;
+}
+
+afterAll(() => {
+	for (const dir of fixtureDirs) rmSync(dir, { recursive: true });
+	for (const dir of fixtureDirs) expect(existsSync(dir)).toBe(false);
+});
 
 const PACKAGE = fileURLToPath(new URL("..", import.meta.url));
 const BUILD = join(PACKAGE, "scripts", "build-runtime.ts");
@@ -104,7 +119,19 @@ describe("build:runtime", () => {
 		expect(realpathSync(report.identity)).toBe(join(real, "daemon", "identity.md"));
 	});
 
-	it("emits a `pi` wrapper that runs the runtime's node and engine wherever the runtime is", () => {
+	it("emits a relocatable `pi` shell wrapper, executable on Unix", () => {
+		const wrapper = readFileSync(join(out, "bin", "pi"), "utf8");
+		expect(wrapper.startsWith("#!/bin/sh\n")).toBe(true);
+		expect(wrapper).toContain('while [ -L "$self" ]; do');
+		expect(wrapper).toContain('runtime=$(CDPATH= cd -- "$(dirname -- "$self")/.." && pwd -P) || exit 1');
+		expect(wrapper).toContain(
+			`exec "$runtime/node/bin/node" "$runtime/daemon/node_modules/${ENGINE_CLI.replaceAll("\\", "/")}" "$@"\n`,
+		);
+		expect(existsSync(join(PACKAGE, "node_modules", ENGINE_CLI))).toBe(true);
+		// Windows has no Unix execute bits or native /bin/sh execution. The
+		// generated shell-wrapper contract above still holds; native wrappers
+		// and their execution belong to Windows runtime staging (T8d).
+		if (process.platform === "win32") return;
 		expect(statSync(join(out, "bin", "pi")).mode & 0o111).toBe(0o111);
 		const moved = tempDir();
 		mkdirSync(join(moved, "bin"));
@@ -127,6 +154,5 @@ describe("build:runtime", () => {
 				"",
 			]);
 		}
-		expect(existsSync(join(PACKAGE, "node_modules", ENGINE_CLI))).toBe(true);
 	});
 });

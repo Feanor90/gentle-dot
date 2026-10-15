@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { accessSync, constants, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, resolve, win32 } from "node:path";
 
 /**
  * The installed app's runtime folder (`GENTLE_DOT_RUNTIME`), or undefined in a
@@ -17,8 +17,9 @@ export function runtimeModules(runtime: string): string {
 	return join(runtime, "daemon", "node_modules");
 }
 
-/** Where a user's own Engram usually lives, after the login PATH. */
-export function engramKnownDirs(home: string): string[] {
+/** Where a user's own Engram usually lives, after their PATH. */
+export function engramKnownDirs(home: string, platform: NodeJS.Platform = process.platform): string[] {
+	if (platform === "win32") return [join(home, "go", "bin"), join(home, ".local", "bin")];
 	return [join(home, "go", "bin"), "/opt/homebrew/bin", "/usr/local/bin", join(home, ".local", "bin")];
 }
 
@@ -54,21 +55,38 @@ function loginShellEngram(env: NodeJS.ProcessEnv, home: string): string | undefi
 
 /**
  * The Engram binary of an installed app: `ENGRAM_BIN`, then an `engram` on the
- * user's login PATH or in the usual folders, so the user's own version keeps
- * serving `~/.engram`, and only then the one the runtime carries.
+ * user's login PATH (GENTLE_DOT_USER_PATH, or PATH minus this runtime's bins,
+ * on Windows) or in the usual folders,
+ * so the user's own version keeps serving `~/.engram`, and only then the one
+ * the runtime carries. Windows searches for `engram.exe` without invoking a shell.
  */
 export function resolveEngramBin(
 	env: NodeJS.ProcessEnv,
 	runtime: string,
-	options: { home?: string; knownDirs?: string[] } = {},
+	options: { home?: string; knownDirs?: string[]; platform?: NodeJS.Platform } = {},
 ): string {
 	if (env.ENGRAM_BIN) return env.ENGRAM_BIN;
-	const home = options.home ?? (env.HOME || homedir());
-	const fromLogin = loginShellEngram(env, home);
-	if (fromLogin) return fromLogin;
-	for (const dir of options.knownDirs ?? engramKnownDirs(home)) {
-		const bin = join(dir, "engram");
+	const platform = options.platform ?? process.platform;
+	const windows = platform === "win32";
+	const home = options.home ?? (env.HOME || (windows ? env.USERPROFILE : undefined) || homedir());
+	const executable = windows ? "engram.exe" : "engram";
+	if (!windows) {
+		const fromLogin = loginShellEngram(env, home);
+		if (fromLogin) return fromLogin;
+	}
+	// Like the desktop's Windows bootstrap, prefer the user's PATH, never the
+	// current directory (empty or relative entries), over the bundled binary.
+	const runtimeBins = [join(runtime, "bin"), join(runtime, "node", "bin")].map((dir) =>
+		win32.resolve(dir).toLowerCase(),
+	);
+	const pathDirs = windows
+		? (env.GENTLE_DOT_USER_PATH ?? env.PATH ?? "")
+				.split(";")
+				.filter((dir) => isAbsolute(dir) && !runtimeBins.includes(win32.resolve(dir).toLowerCase()))
+		: [];
+	for (const dir of [...pathDirs, ...(options.knownDirs ?? engramKnownDirs(home, platform))]) {
+		const bin = join(dir, executable);
 		if (isExecutableFile(bin)) return bin;
 	}
-	return join(runtime, "bin", "engram");
+	return join(runtime, "bin", executable);
 }

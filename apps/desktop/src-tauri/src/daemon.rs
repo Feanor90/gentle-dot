@@ -486,12 +486,50 @@ pub fn launch_spec(env: impl Fn(&str) -> Option<String>, dev: bool, runtime: Opt
     let bundled = runtime.filter(|dir| dir.join("daemon/cli.mjs").is_file());
     let (node, script, mut envs) = match bundled {
         Some(dir) => {
+            #[cfg(windows)]
+            let dir = std::path::absolute(dir).expect("the bundled runtime needs an absolute path");
             let root = dir.display().to_string();
+            #[cfg(unix)]
             let path = format!("{root}/bin:{root}/node/bin:/usr/bin:/bin:/usr/sbin:/sbin");
+            #[cfg(windows)]
+            let path = {
+                let system = PathBuf::from(
+                    env("SystemRoot")
+                        .filter(|v| !v.is_empty())
+                        .or_else(|| env("WINDIR").filter(|v| !v.is_empty()))
+                        .unwrap_or_else(|| r"C:\Windows".into()),
+                );
+                [
+                    dir.join("bin"),
+                    dir.join("node/bin"),
+                    system.join("System32"),
+                    system.clone(),
+                    system.join("System32/Wbem"),
+                    system.join("System32/WindowsPowerShell/v1.0"),
+                ]
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(";")
+            };
+            let node = if cfg!(windows) {
+                "node/bin/node.exe"
+            } else {
+                "node/bin/node"
+            };
+            let mut runtime_envs = Vec::new();
+            // Preserve the user's search path before replacing PATH with the runtime's tools.
+            #[cfg(windows)]
+            runtime_envs.push((
+                "GENTLE_DOT_USER_PATH".to_string(),
+                env("PATH").unwrap_or_default(),
+            ));
+            runtime_envs.push(("PATH".to_string(), path));
+            runtime_envs.push(("GENTLE_DOT_RUNTIME".to_string(), root));
             (
-                format!("{root}/node/bin/node"),
-                format!("{root}/daemon/cli.mjs"),
-                vec![("PATH".to_string(), path), ("GENTLE_DOT_RUNTIME".to_string(), root)],
+                dir.join(node).display().to_string(),
+                dir.join("daemon/cli.mjs").display().to_string(),
+                runtime_envs,
             )
         }
         None => (
@@ -1119,8 +1157,50 @@ mod tests {
         runtime
     }
 
-    // The bundled runtime's layout (`node/bin/node`, a `:` PATH with `/usr/bin`) is the macOS and
-    // Linux one; Windows has no bundled runtime yet.
+    #[cfg(windows)]
+    #[test]
+    fn launch_spec_runs_the_windows_bundled_runtime_when_present() {
+        let runtime = fake_runtime("runtime bundled with spaces", true);
+        let spec = launch_spec(
+            env_of(&[
+                ("SystemRoot", r"D:\Windows"),
+                ("PATH", r"D:\User Tools;D:\Go\bin"),
+            ]),
+            false,
+            Some(&runtime),
+        );
+        assert!(Path::new(&spec.program).is_absolute());
+        assert_eq!(Path::new(&spec.program), runtime.join("node/bin/node.exe"));
+        assert_eq!(spec.args.len(), 1);
+        assert_eq!(Path::new(&spec.args[0]), runtime.join("daemon/cli.mjs"));
+        let expected = [
+            runtime.join("bin"),
+            runtime.join("node/bin"),
+            PathBuf::from(r"D:\Windows\System32"),
+            PathBuf::from(r"D:\Windows"),
+            PathBuf::from(r"D:\Windows\System32\Wbem"),
+            PathBuf::from(r"D:\Windows\System32\WindowsPowerShell\v1.0"),
+        ];
+        let path = env_value(&spec, "PATH").unwrap();
+        assert_eq!(std::env::split_paths(path).collect::<Vec<_>>(), expected);
+        assert_eq!(path.matches(';').count(), expected.len() - 1);
+        assert_eq!(
+            Path::new(env_value(&spec, "GENTLE_DOT_RUNTIME").unwrap()),
+            runtime
+        );
+        assert_eq!(env_value(&spec, "GENTLE_DOT_ALLOWED_ORIGINS"), None);
+        assert_eq!(
+            env_value(&spec, "GENTLE_DOT_USER_PATH"),
+            Some(r"D:\User Tools;D:\Go\bin")
+        );
+        let dev = launch_spec(env_of(&[]), true, Some(&runtime));
+        assert_eq!(env_value(&dev, "GENTLE_DOT_USER_PATH"), Some(""));
+        assert_eq!(
+            env_value(&dev, "GENTLE_DOT_ALLOWED_ORIGINS"),
+            Some(DEV_ALLOWED_ORIGINS)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn launch_spec_runs_the_bundled_runtime_when_present() {
@@ -1152,9 +1232,8 @@ mod tests {
         assert_eq!(launch_spec(env_of(&[]), false, None), today);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn overrides_win_over_the_bundled_runtime() {
+    fn launch_spec_overrides_win_over_the_bundled_runtime() {
         let runtime = fake_runtime("runtime-override", true);
         let spec = launch_spec(
             env_of(&[("GENTLE_DOT_NODE", "/opt/node"), ("GENTLE_DOT_DAEMON_SCRIPT", "/srv/cli.ts")]),
@@ -1163,9 +1242,17 @@ mod tests {
         );
         assert_eq!(spec.program, "/opt/node");
         assert_eq!(spec.args, vec!["/srv/cli.ts".to_string()]);
-        assert_eq!(env_value(&spec, "GENTLE_DOT_RUNTIME"), Some(runtime.display().to_string().as_str()));
+        assert_eq!(
+            Path::new(env_value(&spec, "GENTLE_DOT_RUNTIME").unwrap()),
+            runtime
+        );
         let spec = launch_spec(env_of(&[("GENTLE_DOT_NODE", "")]), false, Some(&runtime));
-        assert_eq!(spec.program, runtime.join("node/bin/node").display().to_string());
+        let node = if cfg!(windows) {
+            "node/bin/node.exe"
+        } else {
+            "node/bin/node"
+        };
+        assert_eq!(Path::new(&spec.program), runtime.join(node));
     }
 
     #[test]
