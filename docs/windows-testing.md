@@ -164,7 +164,7 @@ Autostart uses `tauri-plugin-autostart`, whose Windows backend registers the app
 1. In the tray menu, turn **Launch at login** on.
 2. Open `regedit`, press **F5** to refresh, and look in **both** `HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Run` and `HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`: a value named `Gentle Dot` points at `gentle-dot.exe` (measured on Windows 11, in `HKLM` because that run was elevated; `regedit` needs the refresh to show it).
 3. Quit Gentle Dot, sign out and back in (or restart), and confirm it launches again.
-4. Turn **Launch at login** off and confirm the value is gone from the key that held it.
+4. Turn **Launch at login** off and confirm the value is gone from the key that held it (measured on Windows 11: the `HKLM` value disappeared as soon as the item was turned off).
 
 ## Troubleshooting
 
