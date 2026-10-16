@@ -92,11 +92,11 @@ Drag the rose to the middle of the screen and let go.
 
 If the webview's developer console reports `tray icon is missing`, note your build; an early build had an ordering bug that is fixed.
 
-### 7. Toggle shortcut — not yet on Windows
+### 7. Toggle shortcut
 
-The default global shortcut is `Alt+Space`, which Windows reserves. **This is W9 and not done yet.**
+The Windows default global shortcut is `Ctrl+Shift+Space` (`Alt+Space` on macOS and Linux; on Windows `Alt+Space` opens the window menu, so a global hotkey on it would take that away).
 
-**Expected today:** pressing `Alt+Space` does nothing, or opens the Windows system menu. Write **N/A** and note what it did.
+**Expected:** pressing `Ctrl+Shift+Space` toggles the panel — it opens when hidden and hides when open, from any app. In the panel's Settings, change the shortcut and confirm the new combination toggles the panel; **Reset to default** returns to `Ctrl+Shift+Space`. Pressing `Alt+Space` opens the Windows system menu, not the panel.
 
 ### 8. Sign in with an API key
 
@@ -142,7 +142,7 @@ From `apps/desktop/src-tauri`, run:
 cargo test --lib
 ```
 
-**Expected** (measured on Windows 11): the suite passes, 355 passed / 0 failed / 4 ignored. `%LOCALAPPDATA%\Gentle Dot\secrets.dat` is where a connector secret would be written; you do not need to create one for this check.
+**Expected** (measured on Windows 11): the suite passes, 357 passed / 0 failed / 4 ignored. `%LOCALAPPDATA%\Gentle Dot\secrets.dat` is where a connector secret would be written; you do not need to create one for this check.
 
 ### 15. Voice — not yet on Windows
 
@@ -156,11 +156,15 @@ Computer control is macOS-only today (W13).
 
 **Expected today:** the feature is unavailable. Write **N/A**.
 
-### 17. Launch at login — not yet on Windows
+### 17. Launch at login
 
-Autostart is W9 and not done.
+Autostart uses `tauri-plugin-autostart`, whose Windows backend writes the app to `HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`.
 
-**Expected today:** the tray's **Launch at login** item does not persist a login entry. Write **N/A**.
+**Expected:**
+1. In the tray menu, turn **Launch at login** on.
+2. Open `regedit` and check `HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`: a value (typically `gentle-dot`) points at `gentle-dot.exe`.
+3. Quit Gentle Dot, sign out and back in (or restart), and confirm it launches again.
+4. Turn **Launch at login** off and confirm the value is gone from the `Run` key.
 
 ## Troubleshooting
 
@@ -171,7 +175,7 @@ Autostart is W9 and not done.
 | `biome check` reports around 178 errors, one per line, after switching branches | CRLF left over in an existing checkout. Renormalize with `git add --renormalize .`, then confirm `git diff --stat` stays empty. |
 | The app opens but no webview loads | You are running a **debug** build. Debug builds load the UI from the Vite dev server, which is not running (measured on Windows 11). Build a release with `pnpm --filter @gentle-dot/desktop build`, or start the UI dev server first. |
 | A connector that needs a secret or an approval never runs | Expected: the private app-to-daemon channel is not on Windows yet (W7). |
-| `Alt+Space` does nothing | Expected: the shortcut is W9, and Windows reserves `Alt+Space`. |
+| `Ctrl+Shift+Space` does not toggle the panel | Check that another app does not hold that combination; pick another shortcut in the panel's Settings. `Alt+Space` opening the Windows window menu is expected: it is Windows' window-menu key, not this app's default. |
 | The webview console reports `tray icon is missing` | Note your build. An early build had an ordering bug that is fixed. |
 | `%USERPROFILE%\.gentle-dot\daemon.log` says the connector cannot get its secrets | Expected until W7 lands. |
 
@@ -199,7 +203,7 @@ Build command:                (pnpm --filter @gentle-dot/desktop build)
 | 4 | Click opens the panel         |                                      |       |
 | 5 | Drag and snap                 |                                      |       |
 | 6 | Tray icon and menu            |                                      |       |
-| 7 | Toggle shortcut (not yet)     |                                      | W9    |
+| 7 | Toggle shortcut               |                                      | Windows default Ctrl+Shift+Space |
 | 8 | Sign in with an API key       |                                      |       |
 | 9 | Chat                          |                                      |       |
 |10 | Profiles                      |                                      |       |
@@ -209,7 +213,7 @@ Build command:                (pnpm --filter @gentle-dot/desktop build)
 |14 | Secret store tests (optional) |                                      |       |
 |15 | Voice (not yet)               |                                      | W12   |
 |16 | Computer control (not yet)    |                                      | W13   |
-|17 | Launch at login (not yet)     |                                      | W9    |
+|17 | Launch at login               |                                      | HKCU Run key |
 
 Screenshots: (the rose on the desktop, the open panel, the tray icon)
 

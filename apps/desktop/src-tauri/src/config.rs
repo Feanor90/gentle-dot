@@ -4,7 +4,12 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_PORT: u16 = 4317;
-pub const DEFAULT_SHORTCUT: &str = "Alt+Space";
+
+/// The panel shortcut a fresh install binds, per platform (Windows avoids `Alt+Space`, its
+/// window-menu key). See [`crate::platform::Os::default_shortcut`].
+pub fn default_shortcut() -> &'static str {
+    crate::platform::Os::CURRENT.default_shortcut()
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DesktopConfig {
@@ -56,7 +61,7 @@ pub fn parse_config(
         .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or(DEFAULT_SHORTCUT)
+        .unwrap_or_else(|| default_shortcut())
         .to_string();
     DesktopConfig { data_dir, port, shortcut }
 }
@@ -160,7 +165,7 @@ mod tests {
     #[test]
     fn defaults_without_file() {
         let config = parse_config(dir(), None, env_of(&[]));
-        assert_eq!(config, DesktopConfig { data_dir: dir(), port: DEFAULT_PORT, shortcut: DEFAULT_SHORTCUT.into() });
+        assert_eq!(config, DesktopConfig { data_dir: dir(), port: DEFAULT_PORT, shortcut: default_shortcut().into() });
     }
 
     #[test]
@@ -180,10 +185,10 @@ mod tests {
     fn invalid_values_fall_back() {
         let config = parse_config(dir(), Some(r#"{ "port": 70000, "shortcut": 3 }"#), env_of(&[("GENTLE_DOT_PORT", "abc")]));
         assert_eq!(config.port, DEFAULT_PORT);
-        assert_eq!(config.shortcut, DEFAULT_SHORTCUT);
+        assert_eq!(config.shortcut, default_shortcut());
         let config = parse_config(dir(), Some(r#"{ "port": "5001", "shortcut": "  " }"#), env_of(&[]));
         assert_eq!(config.port, DEFAULT_PORT);
-        assert_eq!(config.shortcut, DEFAULT_SHORTCUT);
+        assert_eq!(config.shortcut, default_shortcut());
     }
 
     #[test]
@@ -191,7 +196,7 @@ mod tests {
         let config = parse_config(dir(), Some("{ not json"), env_of(&[]));
         assert_eq!(config.port, DEFAULT_PORT);
         let config = parse_config(dir(), Some("[1, 2]"), env_of(&[]));
-        assert_eq!(config.shortcut, DEFAULT_SHORTCUT);
+        assert_eq!(config.shortcut, default_shortcut());
     }
 
     #[test]

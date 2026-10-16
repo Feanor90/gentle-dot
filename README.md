@@ -50,7 +50,7 @@ Assistants live in a browser tab you have to go find, forget you between chats, 
 
 ### Always one key away
 
-A glowing rose sits on your desktop. Click it, press your shortcut (**`⌥ Space`** unless you pick another), or use the menu bar, and the chat opens over whatever you are doing. Hide the rose if you prefer, or open the chat full screen with **`⌘⇧F`**. The same chat runs in the browser, on your machine or on your own server.
+A glowing rose sits on your desktop. Click it, press your shortcut (**`⌥ Space`** on macOS and Linux, **`Ctrl+Shift+Space`** on Windows, unless you pick another), or use the menu bar, and the chat opens over whatever you are doing. Hide the rose if you prefer, or open the chat full screen with **`⌘⇧F`**. The same chat runs in the browser, on your machine or on your own server.
 
 ---
 
@@ -123,7 +123,7 @@ pnpm package:linux --arch amd64
 pnpm --filter @gentle-dot/desktop build
 ```
 
-Then follow **[docs/install.md](docs/install.md)**: opening an unsigned app on macOS 15 and later goes through **System Settings → Privacy & Security → Open Anyway**, and the guide covers permissions, where your data lives, and uninstalling. Windows support is in progress: it builds and runs, but connectors that need a secret or an approval, the global shortcut, voice, and computer control are not there yet. See **[docs/install.md](docs/install.md)** for the Windows section and **[docs/windows-testing.md](docs/windows-testing.md)** for the tester checklist.
+Then follow **[docs/install.md](docs/install.md)**: opening an unsigned app on macOS 15 and later goes through **System Settings → Privacy & Security → Open Anyway**, and the guide covers permissions, where your data lives, and uninstalling. Windows support is in progress: it builds and runs, but connectors that need a secret or an approval, voice, and computer control are not there yet. See **[docs/install.md](docs/install.md)** for the Windows section and **[docs/windows-testing.md](docs/windows-testing.md)** for the tester checklist.
 
 Prefer to run it from the source?
 

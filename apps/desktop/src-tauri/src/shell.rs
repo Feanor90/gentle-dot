@@ -11,7 +11,7 @@ use crate::approvals::{native::NativePrompt, ApprovalRequest, Approvals, Decisio
 use crate::computer::app as computer;
 use crate::computer::server::Endpoint;
 use crate::computer::session::Reason;
-use crate::config::{self, ConnectionInfo, DesktopConfig, DEFAULT_SHORTCUT};
+use crate::config::{self, ConnectionInfo, DesktopConfig};
 use crate::daemon::{self, Daemon, RestartOutcome};
 use crate::geometry::{self, Rect};
 use crate::platform::{self, LaunchRequest, Os, WindowEffect, DOT_TITLE, PANEL_TITLE};
@@ -295,8 +295,8 @@ fn shortcut_get(app: AppHandle) -> ShortcutInfo {
     let shell = app.state::<Shell>();
     let current = shell.shortcut.lock().unwrap().clone().unwrap_or_else(|| shell.config.shortcut.clone());
     ShortcutInfo {
-        shortcut: shortcut::normalize(&current).unwrap_or(current),
-        default: DEFAULT_SHORTCUT.to_string(),
+        shortcut: shortcut::normalize(&current, Os::CURRENT).unwrap_or(current),
+        default: config::default_shortcut().to_string(),
     }
 }
 
@@ -310,7 +310,7 @@ async fn shortcut_set(app: AppHandle, shortcut: String) -> CommandResult<Shortcu
         }
         let mut current = shell.shortcut.lock().unwrap();
         let host = ShortcutHost { app: &app, config_file: shell.config.data_dir.join("config.json") };
-        let saved = shortcut::apply(&host, current.as_deref(), &shortcut)?;
+        let saved = shortcut::apply(&host, current.as_deref(), &shortcut, Os::CURRENT)?;
         *current = Some(saved.clone());
         Ok(ShortcutChoice { shortcut: saved })
     })
@@ -745,12 +745,13 @@ fn toggle_on_press(app: &AppHandle, _: &Shortcut, event: ShortcutEvent) {
 
 /// Binds the configured shortcut, or the default one when it is unavailable. Returns the bound one.
 fn register_shortcut(app: &AppHandle, shortcut: &str) -> Option<String> {
+    let default = config::default_shortcut();
     match app.global_shortcut().on_shortcut(shortcut, toggle_on_press) {
         Ok(()) => return Some(shortcut.to_string()),
-        Err(error) => eprintln!("gentle-dot: shortcut `{shortcut}` is unavailable ({error}); using {DEFAULT_SHORTCUT}"),
+        Err(error) => eprintln!("gentle-dot: shortcut `{shortcut}` is unavailable ({error}); using {default}"),
     }
-    if shortcut != DEFAULT_SHORTCUT && app.global_shortcut().on_shortcut(DEFAULT_SHORTCUT, toggle_on_press).is_ok() {
-        return Some(DEFAULT_SHORTCUT.to_string());
+    if shortcut != default && app.global_shortcut().on_shortcut(default, toggle_on_press).is_ok() {
+        return Some(default.to_string());
     }
     None
 }
