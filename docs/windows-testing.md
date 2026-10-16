@@ -1,0 +1,230 @@
+# Testing Gentle Dot on Windows
+
+Thanks for testing! This guide walks you through building Gentle Dot from source on Windows 10 or Windows 11 (x86_64) and checking that it works. Building and running takes about 30 minutes, most of it the first build.
+
+There is **no package to install yet**: the Windows port is in progress, so this checklist is source-only. Several features are not there yet, and they are marked **not yet on Windows** instead of being presented as if they work. The expected results below are what the app should do; a few checks have already been measured on Windows 11 and say so. Where a step is pending, write **N/A** and note what happened.
+
+## Before you start
+
+1. Check your Windows version. In PowerShell, run:
+
+   ```powershell
+   winver
+   [System.Environment]::OSVersion.Version
+   ```
+
+   Write down the result for the report (for example `Windows 11 24H2, 26100.1`). Windows 10 and 11, x86_64, are the supported targets; aarch64 comes later.
+2. Check your toolchain. In PowerShell, run:
+
+   ```powershell
+   echo $env:PROCESSOR_ARCHITECTURE
+   node --version
+   pnpm --version
+   rustc --version
+   go version
+   ```
+
+   You need Windows 10 or 11 x86_64; Node.js 24; pnpm 11.5.0 (`corepack enable` picks up the version `package.json` pins); Rust stable with the MSVC toolchain; the Visual Studio Build Tools with the "Desktop development with C++" workload; WebView2 (Windows 11 ships it, Windows 10 may need the Evergreen Runtime); and Go 1.25.10 or newer, because `pnpm install` builds gentle-pi's Gentle AI binary from source on Windows. Write down each version.
+3. Have an API key ready for one model provider (for example OpenAI, OpenRouter, or Anthropic). You need it in step 8.
+4. Get the files: clone the repository or unpack the archive you were sent, then open **PowerShell** in that folder.
+
+## Build from source
+
+From the repository root:
+
+```sh
+pnpm install
+pnpm --filter @gentle-dot/desktop build
+```
+
+The second command is a release build. With `apps/desktop/src-tauri/tauri.windows.conf.json`, the bundler also writes two installers under `apps/desktop/src-tauri/target/release/bundle/`: an NSIS per-user installer (`Gentle Dot_<version>_x64-setup.exe`) and an MSI per-machine installer (`Gentle Dot_<version>_x64_en-US.msi`). **Neither carries a Node runtime, the engine, or Engram yet**, so they are not self-contained, there is no `pnpm package:windows`, and you should not install them for this checklist. Run the built app directly instead:
+
+```sh
+apps/desktop/src-tauri/target/release/gentle-dot.exe
+```
+
+If the build fails inside a dependency's build script with a silent `cl.exe` error and no other output, see the troubleshooting table.
+
+## The checklist
+
+Do each step in order and note **Pass**, **Fail**, **Partial**, or **N/A** for each one. If something fails, keep going; later steps often still work.
+
+### 1. Build
+
+`pnpm install` then `pnpm --filter @gentle-dot/desktop build`.
+
+**Expected:** `pnpm install` finishes, including gentle-pi's postinstall (which needs Go). The build finishes and produces `apps/desktop/src-tauri/target/release/gentle-dot.exe`.
+
+### 2. First launch
+
+Run `apps/desktop/src-tauri/target/release/gentle-dot.exe`.
+
+**Expected:**
+- Within a few seconds, a black circle with a glowing pink rose appears at the right edge of the screen, vertically centered.
+- The app provisions `%USERPROFILE%\.gentle-dot`, with `agent\`, `sessions\`, `identity.md`, and `token` (measured on Windows 11).
+- The app spawns its own daemon. Open a browser at `http://127.0.0.1:4317/`: the page answers HTTP 200 with the title "Gentle Dot" (measured on Windows 11).
+
+The panel is **opaque** on Windows; there is no blur behind it (Mica is W8d and not done).
+
+### 3. The rose stays on top
+
+Open a few other windows and click on them.
+
+**Expected:** the rose stays above the other windows.
+
+### 4. Click opens the panel
+
+Click the rose (without dragging).
+
+**Expected:** a 420 × 640 dark panel opens next to the rose, and the cursor is in the message box. Press `Esc`: the panel hides. Click the rose again: it opens again.
+
+### 5. Drag and snap
+
+Drag the rose to the middle of the screen and let go.
+
+**Expected:** within half a second, the rose moves to the nearest screen edge.
+
+### 6. Tray icon and menu
+
+**Expected:**
+- A small rose appears in the notification area. Clicking it opens a menu: Open, Open in browser, Restart assistant, Launch at login, Quit.
+- **Open** shows the panel. **Open in browser** opens the same chat in your browser.
+
+If the webview's developer console reports `tray icon is missing`, note your build; an early build had an ordering bug that is fixed.
+
+### 7. Toggle shortcut — not yet on Windows
+
+The default global shortcut is `Alt+Space`, which Windows reserves. **This is W9 and not done yet.**
+
+**Expected today:** pressing `Alt+Space` does nothing, or opens the Windows system menu. Write **N/A** and note what it did.
+
+### 8. Sign in with an API key
+
+In the panel, type `/login` and press Enter (or use the **Accounts** icon in the header). Choose **API key**, pick your provider, paste the key, and confirm.
+
+**Expected:** the provider shows as connected. The key never appears again in the chat.
+
+### 9. Chat
+
+Ask "What can you do?".
+
+**Expected:** the answer streams in word by word, and the rose glows with a moving light while the assistant works.
+
+### 10. Profiles
+
+Open **Profiles** (the sliders icon in the header). Create a profile, rename it, switch to it, and switch back.
+
+**Expected:** each change shows right away, and no error appears.
+
+### 11. Connectors
+
+Open **Connectors** in the header.
+
+**Expected:** it lists Gmail, Slack, Discord, Notion, Linear, and Atlassian, plus "Add another connector". Open two or three guides and check that they read well. **Connecting one that needs a secret or an approval does not work yet (W7), and the app says so instead of falling back to a file.**
+
+### 12. Connector secrets and approvals — not yet on Windows
+
+The app cannot answer connector secret requests or show native connector/approval dialogs until W7 lands the private app-to-daemon channel. Connectors that need a secret or an approval fail closed.
+
+**Expected today:** write **N/A** for this step. The one thing that can be checked is the store itself, in step 14.
+
+### 13. Quit and relaunch
+
+Choose **Quit** in the tray menu, then run the app again.
+
+**Expected** (Quit is measured on Windows 11): the rose and the tray icon disappear on Quit, and the process exits with code 0, taking its daemon with it. On relaunch, the rose and the tray icon appear again.
+
+### 14. The Windows secret store (optional, developer check)
+
+From `apps/desktop/src-tauri`, run:
+
+```sh
+cargo test --lib
+```
+
+**Expected** (measured on Windows 11): the suite passes, 355 passed / 0 failed / 4 ignored. `%LOCALAPPDATA%\Gentle Dot\secrets.dat` is where a connector secret would be written; you do not need to create one for this check.
+
+### 15. Voice — not yet on Windows
+
+Voice capture is W12 and not done.
+
+**Expected today:** the mic button reports voice as unavailable. Write **N/A**.
+
+### 16. Computer control — not yet on Windows
+
+Computer control is macOS-only today (W13).
+
+**Expected today:** the feature is unavailable. Write **N/A**.
+
+### 17. Launch at login — not yet on Windows
+
+Autostart is W9 and not done.
+
+**Expected today:** the tray's **Launch at login** item does not persist a login entry. Write **N/A**.
+
+## Troubleshooting
+
+| Symptom | Try |
+|---|---|
+| `pnpm install` fails in gentle-pi's postinstall asking for Go 1.25.10 or newer | Install Go 1.25.10 or newer and run `pnpm install` again. |
+| A cold build fails inside a dependency's build script with `cl.exe` exit code 2 and no other output | The shell is missing the Windows SDK include/library paths (`stddef.h`). Run the build from a `.bat` that sets `INCLUDE` and `LIB` explicitly; that is the workaround that worked here. A Developer Command Prompt through `vcvars64.bat` does not run well from git-bash. |
+| `biome check` reports around 178 errors, one per line, after switching branches | CRLF left over in an existing checkout. Renormalize with `git add --renormalize .`, then confirm `git diff --stat` stays empty. |
+| The app opens but no webview loads | You are running a **debug** build. Debug builds load the UI from the Vite dev server, which is not running (measured on Windows 11). Build a release with `pnpm --filter @gentle-dot/desktop build`, or start the UI dev server first. |
+| A connector that needs a secret or an approval never runs | Expected: the private app-to-daemon channel is not on Windows yet (W7). |
+| `Alt+Space` does nothing | Expected: the shortcut is W9, and Windows reserves `Alt+Space`. |
+| The webview console reports `tray icon is missing` | Note your build. An early build had an ordering bug that is fixed. |
+| `%USERPROFILE%\.gentle-dot\daemon.log` says the connector cannot get its secrets | Expected until W7 lands. |
+
+## Report template
+
+Copy this into your message and fill it in.
+
+```text
+## Gentle Dot Windows test report
+
+Windows version and build:    (for example Windows 11 24H2, 26100.1)
+Architecture:                 (output of: echo $env:PROCESSOR_ARCHITECTURE)
+Node / pnpm:                  (output of: node --version; pnpm --version)
+Rust / Go:                    (output of: rustc --version; go version)
+WebView2:                     (Windows 11 built-in, or the Evergreen Runtime version)
+Source version:               (output of: git rev-parse --short HEAD, or the archive name)
+Install method:               (source; no package path yet)
+Build command:                (pnpm --filter @gentle-dot/desktop build)
+
+| # | Step                          | Result (Pass / Fail / Partial / N/A) | Notes |
+|---|-------------------------------|--------------------------------------|-------|
+| 1 | Build                         |                                      |       |
+| 2 | First launch                  |                                      |       |
+| 3 | Rose stays on top             |                                      |       |
+| 4 | Click opens the panel         |                                      |       |
+| 5 | Drag and snap                 |                                      |       |
+| 6 | Tray icon and menu            |                                      |       |
+| 7 | Toggle shortcut (not yet)     |                                      | W9    |
+| 8 | Sign in with an API key       |                                      |       |
+| 9 | Chat                          |                                      |       |
+|10 | Profiles                      |                                      |       |
+|11 | Connectors (list and guides)  |                                      |       |
+|12 | Secrets and approvals (not yet)|                                     | W7    |
+|13 | Quit and relaunch             |                                      |       |
+|14 | Secret store tests (optional) |                                      |       |
+|15 | Voice (not yet)               |                                      | W12   |
+|16 | Computer control (not yet)    |                                      | W13   |
+|17 | Launch at login (not yet)     |                                      | W9    |
+
+Screenshots: (the rose on the desktop, the open panel, the tray icon)
+
+Logs: (see below)
+```
+
+### Logs to attach
+
+- The terminal output of `gentle-dot.exe`, if you started it from a terminal.
+- The assistant log, with the access key removed. The key is a secret: never share `%USERPROFILE%\.gentle-dot\token`. In PowerShell, this copies the log and masks the key:
+
+  ```powershell
+  $token = (Get-Content "$env:USERPROFILE\.gentle-dot\token" -Raw).Trim()
+  (Get-Content "$env:USERPROFILE\.gentle-dot\daemon.log" -Raw) -replace [regex]::Escape($token), '<token>' |
+    Set-Content "$env:TEMP\gentle-dot-daemon.log"
+  ```
+
+  Then attach `%TEMP%\gentle-dot-daemon.log`. Look through it before sending it, and remove anything else you consider private.
