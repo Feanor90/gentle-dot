@@ -1778,10 +1778,16 @@ const REFUSALS = {
 
 type Emit = (payload: ServerPayload) => void;
 
+/**
+ * An opaque connection identity (the app connection object): flows and registrations belong to
+ * one, it is compared by reference and never read or logged.
+ */
+export type ConnectionOwner = object;
+
 interface Flow {
 	id: string;
 	connectorId: string;
-	owner: object;
+	owner: ConnectionOwner;
 	emit: Emit;
 	/** The OAuth flow, once the connector's settings were read. */
 	signIn?: SignIn;
@@ -1792,7 +1798,7 @@ interface Flow {
 interface Setup {
 	id: string;
 	connectorId: string;
-	owner: object;
+	owner: ConnectionOwner;
 	emit: Emit;
 	fields: readonly SetupField[];
 	values: Record<string, string>;
@@ -1841,7 +1847,7 @@ export class ConnectorManager {
 	imagesSupported: () => boolean | undefined = () => undefined;
 	private flow: Flow | undefined;
 	/** The window that registered the computer helper; it goes away with that window. */
-	private computerOwner: object | undefined;
+	private computerOwner: ConnectionOwner | undefined;
 	private setupFlow: Setup | undefined;
 	private readonly failed = new Set<string>();
 	private readonly waiting = new Map<string, ConnectorDraft>();
@@ -1908,7 +1914,7 @@ export class ConnectorManager {
 	 * The desktop app's computer helper, registered by one of its windows (S24.7). The engine reads it
 	 * at its next start; its key is written only to `mcp.json`, never logged or sent to a window.
 	 */
-	registerComputer(owner: object, endpoint: ComputerEndpoint): void {
+	registerComputer(owner: ConnectionOwner, endpoint: ComputerEndpoint): void {
 		this.computerOwner = owner;
 		if (!this.options.store.setComputer(endpoint)) return;
 		this.log("the desktop app registered computer control");
@@ -1916,7 +1922,7 @@ export class ConnectorManager {
 	}
 
 	/** Removes the helper; only the window that registered it can (it also goes when that window does). */
-	unregisterComputer(owner: object): void {
+	unregisterComputer(owner: ConnectionOwner): void {
 		if (this.computerOwner !== owner) return;
 		this.computerOwner = undefined;
 		if (!this.options.store.setComputer(undefined)) return;
@@ -1925,7 +1931,7 @@ export class ConnectorManager {
 	}
 
 	/** Adds or turns on a connector: asks for the values it still needs, then signs in when it has no sign-in yet. */
-	connect(owner: object, id: string, emit: Emit): ConnectorRefusal | undefined {
+	connect(owner: ConnectionOwner, id: string, emit: Emit): ConnectorRefusal | undefined {
 		const saved = this.options.store.state().connectors[id];
 		const spec = specOf(id, saved);
 		if (!spec) return REFUSALS.unknown;
@@ -1950,7 +1956,7 @@ export class ConnectorManager {
 	}
 
 	/** Asks again for the values the user typed (a new token, another OAuth client). */
-	setup(owner: object, id: string, emit: Emit): ConnectorRefusal | undefined {
+	setup(owner: ConnectionOwner, id: string, emit: Emit): ConnectorRefusal | undefined {
 		const saved = this.options.store.state().connectors[id];
 		const spec = specOf(id, saved);
 		if (!spec) return REFUSALS.unknown;
@@ -1970,7 +1976,7 @@ export class ConnectorManager {
 		return undefined;
 	}
 
-	signIn(owner: object, id: string, emit: Emit): ConnectorRefusal | undefined {
+	signIn(owner: ConnectionOwner, id: string, emit: Emit): ConnectorRefusal | undefined {
 		const saved = this.options.store.state().connectors[id];
 		const spec = specOf(id, saved);
 		if (!spec) return REFUSALS.unknown;
@@ -1982,7 +1988,7 @@ export class ConnectorManager {
 	}
 
 	/** Answers the flow `owner` started: a typed value, a pasted address, or a cancellation. */
-	reply(owner: object, flowId: string, answer: { value?: string; cancelled?: boolean }): boolean {
+	reply(owner: ConnectionOwner, flowId: string, answer: { value?: string; cancelled?: boolean }): boolean {
 		const setup = this.setupFlow;
 		if (setup && setup.id === flowId) {
 			if (setup.owner !== owner) return false;
@@ -2007,7 +2013,7 @@ export class ConnectorManager {
 	}
 
 	/** A window that goes away takes its sign-in with it. */
-	cancelOwnedBy(owner: object): void {
+	cancelOwnedBy(owner: ConnectionOwner): void {
 		if (this.setupFlow?.owner === owner) this.cancelSetup(this.setupFlow);
 		if (this.flow?.owner === owner) this.cancel(this.flow);
 	}
@@ -2065,7 +2071,7 @@ export class ConnectorManager {
 	 * only, with every tool hidden, then asks for its secrets in the window that approved it and signs
 	 * in when it needs to.
 	 */
-	decideDraft(owner: object, draftId: string, approve: boolean, emit: Emit): ConnectorRefusal | undefined {
+	decideDraft(owner: ConnectionOwner, draftId: string, approve: boolean, emit: Emit): ConnectorRefusal | undefined {
 		const draft = this.waiting.get(draftId);
 		if (!draft) return REFUSALS.noDraft;
 		if (approve && this.busy()) return REFUSALS.busy;
@@ -2297,7 +2303,7 @@ export class ConnectorManager {
 	}
 
 	/** After the values are there: sign in when the connector needs it, otherwise it is done. */
-	private afterSetup(owner: object, id: string, emit: Emit, flowId: string): void {
+	private afterSetup(owner: ConnectionOwner, id: string, emit: Emit, flowId: string): void {
 		const spec = specOf(id, this.options.store.state().connectors[id]);
 		if (spec?.oauth && !this.options.store.isSignedIn(id)) this.startLogin(owner, id, emit, flowId);
 		// Already signed in, or nothing to sign in to: the window that asked is told it is done.
@@ -2305,7 +2311,7 @@ export class ConnectorManager {
 	}
 
 	private askValues(
-		owner: object,
+		owner: ConnectionOwner,
 		connectorId: string,
 		fields: readonly SetupField[],
 		emit: Emit,
@@ -2380,7 +2386,7 @@ export class ConnectorManager {
 		return undefined;
 	}
 
-	private startLogin(owner: object, connectorId: string, emit: Emit, flowId?: string): void {
+	private startLogin(owner: ConnectionOwner, connectorId: string, emit: Emit, flowId?: string): void {
 		const flow: Flow = {
 			id: flowId ?? `connector-${randomUUID()}`,
 			connectorId,
