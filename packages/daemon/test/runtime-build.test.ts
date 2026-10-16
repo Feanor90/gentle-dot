@@ -87,6 +87,7 @@ describe("build:runtime", () => {
 		expect(manifest.dependencies).toEqual({
 			"@earendil-works/pi-ai": "1.0.4",
 			"@earendil-works/pi-coding-agent": "1.0.4",
+			"@earendil-works/pi-codemode": "1.0.4",
 			"@earendil-works/pi-mcp": "1.0.4",
 			"@earendil-works/pi-tui": "1.0.4",
 			"gentle-pi": "4.0.0",

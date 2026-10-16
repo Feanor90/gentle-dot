@@ -225,6 +225,12 @@ function installDaemonModules(out, target) {
 	process.stdout.write(result.stdout ?? "");
 	process.stderr.write(result.stderr ?? "");
 	if (result.status !== 0) throw new Error(`npm install failed (exit ${result.status}).`);
+	// A fresh npm graph can satisfy semver yet break the engine's ESM imports.
+	run(process.execPath, [
+		join(REPO, "scripts", "package", "staged-engine.mjs"),
+		daemon,
+		join(out, "node", "bin", isWindows(target) ? "node.exe" : "node"),
+	]);
 	const postinstall = `${result.stdout}\n${result.stderr}`
 		.split("\n")
 		.filter((line) => /Gentle AI|gentle-pi/.test(line) && !/^>/.test(line.trim()));
