@@ -10,10 +10,41 @@
  * default `Array.prototype.sort`), arrays in their order, and strings, numbers, booleans, and null
  * as `JSON.stringify` writes them. The `mac` field is the lowercase hex digest.
  */
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
+import { defaultDataDir } from "./config.ts";
 
-/** The secret id of the signing key in the app's store. */
+/** The secret id of the signing key before data folders got their own (kept for migration). */
 export const INTEGRITY_KEY_ID = "integrity/connectors";
+
+/** `path` as it exists on disk, or resolved when it does not (yet). */
+function realPath(path: string): string {
+	try {
+		return realpathSync(path);
+	} catch {
+		return resolve(path);
+	}
+}
+
+/**
+ * The secret id of THIS data folder's signing key (S18): the legacy id plus a short hash of the
+ * folder's real path, so one folder's key can never make another folder's missing file look
+ * deleted. The key itself is unchanged; only where the store keeps it.
+ */
+export function scopedIntegrityKeyId(dataDir: string): string {
+	return `${INTEGRITY_KEY_ID}/${createHash("sha256").update(realPath(dataDir)).digest("hex").slice(0, 16)}`;
+}
+
+/**
+ * True when `dataDir` is the folder this installation uses by default (the env override included):
+ * the only folder the legacy id's key can be attributed to, so the only one that still reads it.
+ */
+export function isDefaultDataDir(dataDir: string, env: NodeJS.ProcessEnv = process.env): boolean {
+	const own = realPath(dataDir);
+	const def = realPath(defaultDataDir(env));
+	return process.platform === "win32" ? own.toLowerCase() === def.toLowerCase() : own === def;
+}
 
 /** What every signed text starts with, so the key signs nothing else by accident. */
 export const MAC_DOMAIN = "gentle-dot/connectors.json/v1\n";

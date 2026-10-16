@@ -32,10 +32,12 @@ import { resolveRecord, resolveValue, storedSignIn } from "./connector-credentia
 import { type ScannedServer, scanClientConfigs, valueNotes } from "./connector-import.ts";
 import {
 	INTEGRITY_KEY_ID,
+	isDefaultDataDir,
 	macMatches,
 	newIntegrityKey,
 	parseIntegrityKey,
 	recordMac,
+	scopedIntegrityKeyId,
 } from "./connector-integrity.ts";
 import { type OAuthSettings, type SignIn, SignInCancelledError, startSignIn } from "./connector-oauth.ts";
 import { directAccess, type EngineAccess } from "./engine-access.ts";
@@ -815,18 +817,31 @@ export class ConnectorStore {
 			this.log(`connectors.json could not be checked: ${why}; connectors that need a secret stay locked`);
 			this.onSetAside(INTEGRITY_UNCHECKED);
 		};
+		// One key per data folder (S18): another folder's key, or the one key older versions kept,
+		// must not make this folder's missing file look deleted.
+		const scopedId = scopedIntegrityKeyId(this.options.dataDir);
 		let stored: string | undefined;
 		try {
-			stored = await source.get(INTEGRITY_KEY_ID);
+			stored = await source.get(scopedId);
 		} catch (error) {
 			cannot(`its key could not be read (${(error as Error).message})`);
 			return;
 		}
-		let key = parseIntegrityKey(stored);
+		// The legacy key signed only the default folder; a different folder never owned it.
+		let legacy: string | undefined;
+		if (stored === undefined && isDefaultDataDir(this.options.dataDir)) {
+			try {
+				legacy = await source.get(INTEGRITY_KEY_ID);
+			} catch (error) {
+				cannot(`its legacy key could not be read (${(error as Error).message})`);
+				return;
+			}
+		}
+		let key = parseIntegrityKey(stored) ?? parseIntegrityKey(legacy);
 		if (!key) {
 			const created = newIntegrityKey();
 			try {
-				await this.verifiedPut(source, INTEGRITY_KEY_ID, created);
+				await this.verifiedPut(source, scopedId, created);
 			} catch (error) {
 				cannot(`its key could not be stored (${(error as Error).message})`);
 				return;
@@ -836,21 +851,35 @@ export class ConnectorStore {
 		this.integrityKey = key;
 		if (!this.loaded) {
 			// A file that was signed before is gone: say so instead of starting empty in silence (A3).
-			if (stored !== undefined) {
+			if (stored !== undefined || legacy !== undefined) {
 				this.log("connectors.json was signed before and is missing; starting with no connectors");
 				this.onSetAside(MISSING_NOTICE);
 			}
 			return;
 		}
 		const record = this.loaded.record;
-		const signedBefore = stored !== undefined || (record !== undefined && "mac" in record);
+		const signedBefore =
+			stored !== undefined || legacy !== undefined || (record !== undefined && "mac" in record);
 		if (!signedBefore) {
 			this.edited = true;
 			writePrivateFile(this.file, this.recordText());
 			this.log("signed connectors.json for the first time");
 			return;
 		}
-		if (record && macMatches(key, record)) return;
+		if (record && macMatches(key, record)) {
+			// An existing install's key moves to this folder's own entry once it verified the file.
+			if (legacy !== undefined && stored === undefined) {
+				try {
+					await this.verifiedPut(source, scopedId, legacy);
+					this.log("connectors.json signing key now has its own store entry for this data folder");
+				} catch (error) {
+					this.log(
+						`could not store this data folder's copy of the signing key (${(error as Error).message}); the legacy entry stays in use`,
+					);
+				}
+			}
+			return;
+		}
 		this.setAside();
 	}
 

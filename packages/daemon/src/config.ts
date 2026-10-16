@@ -48,6 +48,11 @@ function uiDirOf(env: NodeJS.ProcessEnv): string {
 	return runtime ? join(runtime, "ui") : DEFAULT_UI_DIR;
 }
 
+/** The data folder this installation uses when nothing overrides it (`GENTLE_DOT_DATA_DIR` included). */
+export function defaultDataDir(env: NodeJS.ProcessEnv = process.env): string {
+	return resolve(expandHome(env.GENTLE_DOT_DATA_DIR ?? "~/.gentle-dot"));
+}
+
 function expandHome(path: string): string {
 	return path === "~" || path.startsWith("~/") ? join(homedir(), path.slice(1)) : path;
 }
@@ -98,7 +103,7 @@ function agentConfig(env: NodeJS.ProcessEnv, dataDir: string) {
 
 /** Resolves configuration from environment variables, then `~/.gentle-dot/config.json`, then defaults. */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): DotConfig {
-	const dataDir = resolve(expandHome(env.GENTLE_DOT_DATA_DIR ?? "~/.gentle-dot"));
+	const dataDir = defaultDataDir(env);
 	const file = readFileConfig(dataDir);
 	// The engine always works in its own workspace, which names its memory project; a
 	// folder the user chose is passed to the engine as the place to work in.

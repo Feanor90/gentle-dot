@@ -8,6 +8,7 @@ import { join } from "node:path";
 import type { ServerMessage, ServerPayload } from "@gentle-dot/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
+import { scopedIntegrityKeyId } from "../src/connector-integrity.ts";
 import {
 	ConnectorManager,
 	ConnectorStore,
@@ -65,7 +66,7 @@ const readRecord = (dataDir: string) =>
 
 /** True when connectors.json carries a valid MAC under the key in `secrets`. */
 function validlySigned(dataDir: string, secrets: Map<string, string>): boolean {
-	const key = secrets.get(INTEGRITY_KEY_ID);
+	const key = secrets.get(scopedIntegrityKeyId(dataDir));
 	const record = readRecord(dataDir);
 	return key !== undefined && typeof record.mac === "string" && record.mac === expectedMac(key, record);
 }
@@ -135,7 +136,7 @@ describe("connectors.json is signed on every write (S25.6)", () => {
 	it("carries a valid MAC whose key is only in the app's store, never in a file or a log", async () => {
 		const logs: string[] = [];
 		const { dataDir, source } = await signedInstall();
-		const key = source.values.get(INTEGRITY_KEY_ID) ?? "";
+		const key = source.values.get(scopedIntegrityKeyId(dataDir)) ?? "";
 		expect(key).toMatch(/^[0-9a-f]{64}$/);
 		expect(validlySigned(dataDir, source.values)).toBe(true);
 		expect(readRecord(dataDir).connectors.discord?.values).toEqual({
@@ -261,13 +262,153 @@ describe("a file changed while the daemon was down is set aside", () => {
 	});
 });
 
+describe("one signing key per data folder (S18)", () => {
+	/** Runs `run` with this installation's default data folder set to `dataDir` (env override). */
+	async function withDefault<T>(dataDir: string, run: () => Promise<T>): Promise<T> {
+		const saved = process.env.GENTLE_DOT_DATA_DIR;
+		process.env.GENTLE_DOT_DATA_DIR = dataDir;
+		try {
+			return await run();
+		} finally {
+			if (saved === undefined) delete process.env.GENTLE_DOT_DATA_DIR;
+			else process.env.GENTLE_DOT_DATA_DIR = saved;
+		}
+	}
+
+	it("a fresh folder with a legacy key in the store starts with no removal notice and its own key", async () => {
+		const dataDir = tempDir();
+		const source = new MemorySecretSource();
+		source.values.set(INTEGRITY_KEY_ID, "ab".repeat(32));
+		const logs: string[] = [];
+		const { store, notices } = await started(dataDir, source, logs);
+		expect(notices).toEqual([]);
+		expect(logs.join("\\n")).not.toContain("signed before and is missing");
+		expect(source.values.get(INTEGRITY_KEY_ID)).toBe("ab".repeat(32));
+		const scoped = scopedIntegrityKeyId(dataDir);
+		expect(source.values.get(scoped)).toMatch(/^[0-9a-f]{64}$/);
+		await store.keepValues("discord", { token: TOKEN });
+		store.update((state) => {
+			state.connectors.discord = { ...state.connectors.discord, enabled: true, mode: "read_only" };
+		});
+		expect(validlySigned(dataDir, source.values)).toBe(true);
+	});
+
+	it("the legacy key still warns about a deleted file, but only in the default folder", async () => {
+		const dataDir = tempDir();
+		const source = new MemorySecretSource();
+		source.values.set(INTEGRITY_KEY_ID, "cd".repeat(32));
+		await withDefault(dataDir, async () => {
+			const { notices } = await started(dataDir, source);
+			expect(notices).toEqual([MISSING_NOTICE]);
+		});
+		const other = tempDir();
+		const fresh = await started(other, source);
+		expect(fresh.notices).toEqual([]);
+	});
+
+	it("a legacy-signed file in the default folder verifies and its key is copied to the folder's entry", async () => {
+		const dataDir = tempDir();
+		const source = new MemorySecretSource();
+		const legacy = "ef".repeat(32);
+		source.values.set(INTEGRITY_KEY_ID, legacy);
+		const record = {
+			version: 2,
+			connectors: { plain: { enabled: true, mode: "read_only", custom: PLAIN } },
+		};
+		writeFileSync(
+			join(dataDir, "connectors.json"),
+			JSON.stringify({ ...record, mac: expectedMac(legacy, record) }),
+		);
+		await withDefault(dataDir, async () => {
+			const { store, notices } = await started(dataDir, source);
+			expect(notices).toEqual([]);
+			expect(Object.keys(store.state().connectors)).toEqual(["plain"]);
+		});
+		expect(source.values.get(scopedIntegrityKeyId(dataDir))).toBe(legacy);
+		expect(source.values.get(INTEGRITY_KEY_ID)).toBe(legacy);
+		source.values.delete(INTEGRITY_KEY_ID);
+		await withDefault(dataDir, async () => {
+			const { notices } = await started(dataDir, source);
+			expect(notices).toEqual([]);
+		});
+	});
+
+	it("a legacy key the app cannot read fails closed in the default folder", async () => {
+		const dataDir = tempDir();
+		const source = new MemorySecretSource();
+		const legacy = "99".repeat(32);
+		const record = {
+			version: 2,
+			connectors: { plain: { enabled: true, mode: "read_only", custom: PLAIN } },
+		};
+		writeFileSync(join(dataDir, "connectors.json"), JSON.stringify({ ...record, mac: expectedMac(legacy, record) }));
+		const before = readFileSync(join(dataDir, "connectors.json"), "utf8");
+		const get = source.get.bind(source);
+		source.get = async (id: string) => {
+			if (id === INTEGRITY_KEY_ID) throw new Error("keychain unavailable");
+			return get(id);
+		};
+		await withDefault(dataDir, async () => {
+			const { notices } = await started(dataDir, source);
+			expect(notices).toEqual([INTEGRITY_UNCHECKED]);
+		});
+		expect(readFileSync(join(dataDir, "connectors.json"), "utf8")).toBe(before);
+		expect(rejectedFiles(dataDir)).toEqual([]);
+	});
+
+	it("a verifying legacy key whose copy fails keeps working through the legacy entry", async () => {
+		const dataDir = tempDir();
+		const source = new MemorySecretSource();
+		const legacy = "88".repeat(32);
+		source.values.set(INTEGRITY_KEY_ID, legacy);
+		const record = {
+			version: 2,
+			connectors: { plain: { enabled: true, mode: "read_only", custom: PLAIN } },
+		};
+		writeFileSync(join(dataDir, "connectors.json"), JSON.stringify({ ...record, mac: expectedMac(legacy, record) }));
+		const put = source.put.bind(source);
+		source.put = async (id: string, value: string) => {
+			if (id === scopedIntegrityKeyId(dataDir)) throw new Error("keychain full");
+			return put(id, value);
+		};
+		const logs: string[] = [];
+		await withDefault(dataDir, async () => {
+			const { store, notices } = await started(dataDir, source, logs);
+			expect(notices).toEqual([]);
+			expect(Object.keys(store.state().connectors)).toEqual(["plain"]);
+		});
+		expect(logs.join("\\n")).toContain("the legacy entry stays in use");
+		expect(source.values.has(scopedIntegrityKeyId(dataDir))).toBe(false);
+		const kept = readRecord(dataDir);
+		expect(kept.mac).toBe(expectedMac(legacy, kept));
+		source.put = put;
+		await withDefault(dataDir, async () => {
+			const { notices } = await started(dataDir, source);
+			expect(notices).toEqual([]);
+		});
+	});
+
+	it("one folder's key never applies to another folder sharing the store", async () => {
+		const { dataDir: own, source } = await signedInstall();
+		const other = tempDir();
+		const fresh = await started(other, source);
+		expect(fresh.notices).toEqual([]);
+		const otherKey = source.values.get(scopedIntegrityKeyId(other)) ?? "";
+		expect(otherKey).toMatch(/^[0-9a-f]{64}$/);
+		expect(otherKey).not.toBe(source.values.get(scopedIntegrityKeyId(own)));
+		expect(validlySigned(own, source.values)).toBe(true);
+		// Nothing was carried over: the other folder never even got a connectors.json.
+		expect(existsSync(join(other, "connectors.json"))).toBe(false);
+	});
+});
+
 describe("when the check itself cannot run (A1, A3, L120)", () => {
 	it("a key the app cannot read keeps the file as it is and every connector with a secret locked", async () => {
 		const { dataDir, source } = await signedInstall();
 		const before = readFileSync(join(dataDir, "connectors.json"), "utf8");
 		const get = source.get.bind(source);
 		source.get = async (id: string) => {
-			if (id === INTEGRITY_KEY_ID) throw new Error("keychain unavailable");
+			if (id === scopedIntegrityKeyId(dataDir)) throw new Error("keychain unavailable");
 			return get(id);
 		};
 		const { store, notices } = await started(dataDir, source);
@@ -306,7 +447,7 @@ describe("first start after T23e", () => {
 		expect(notices).toEqual([]);
 		expect(rejectedFiles(dataDir)).toEqual([]);
 		expect(Object.keys(store.state().connectors)).toEqual(["plain"]);
-		expect(source.values.get(INTEGRITY_KEY_ID)).toMatch(/^[0-9a-f]{64}$/);
+		expect(source.values.get(scopedIntegrityKeyId(dataDir))).toMatch(/^[0-9a-f]{64}$/);
 		expect(validlySigned(dataDir, source.values)).toBe(true);
 		store.close();
 		expect((await started(dataDir, source)).notices).toEqual([]);
@@ -316,7 +457,7 @@ describe("first start after T23e", () => {
 		const dataDir = tempDir();
 		const source = new MemorySecretSource();
 		(await started(dataDir, source)).store.close();
-		expect(source.values.has(INTEGRITY_KEY_ID)).toBe(true);
+		expect(source.values.has(scopedIntegrityKeyId(dataDir))).toBe(true);
 		writeFileSync(
 			join(dataDir, "connectors.json"),
 			JSON.stringify({
@@ -487,7 +628,7 @@ describe("the daemon checks connectors.json with the app (S25.6)", () => {
 	it("sets a changed file aside at start and tells the window; a restart starts clean", async () => {
 		const dataDir = tempDir();
 		const app = fakeApp();
-		app.secrets.set(INTEGRITY_KEY_ID, "cd".repeat(32));
+		app.secrets.set(scopedIntegrityKeyId(dataDir), "cd".repeat(32));
 		writeFileSync(
 			join(dataDir, "connectors.json"),
 			JSON.stringify({
