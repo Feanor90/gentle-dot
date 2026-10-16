@@ -96,7 +96,7 @@ If the webview's developer console reports `tray icon is missing`, note your bui
 
 The Windows default global shortcut is `Ctrl+Shift+Space` (`Alt+Space` on macOS and Linux; on Windows `Alt+Space` opens the window menu, so a global hotkey on it would take that away).
 
-**Expected:** pressing `Ctrl+Shift+Space` toggles the panel — it opens when hidden and hides when open, from any app. In the panel's Settings, change the shortcut and confirm the new combination toggles the panel; **Reset to default** returns to `Ctrl+Shift+Space`. Pressing `Alt+Space` opens the Windows system menu, not the panel.
+**Expected** (measured on Windows 11): pressing `Ctrl+Shift+Space` toggles the panel — it opens when hidden and hides when open, from any app (including with the panel focused). In the panel's Settings, change the shortcut and confirm the new combination toggles the panel; **Reset to default** returns to `Ctrl+Shift+Space` (measured: `Ctrl+Alt+Space` toggled, and the reset came back to `Ctrl+Shift+Space`). Pressing `Alt+Space` opens the Windows window menu, not the panel (measured).
 
 ### 8. Sign in with an API key
 
@@ -158,13 +158,13 @@ Computer control is macOS-only today (W13).
 
 ### 17. Launch at login
 
-Autostart uses `tauri-plugin-autostart`, whose Windows backend writes the app to `HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`.
+Autostart uses `tauri-plugin-autostart`, whose Windows backend registers the app as **`Gentle Dot`** under the Windows `Run` key. It writes `HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`; when the app runs with administrator rights it writes `HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run` instead, and that entry starts it for every user.
 
 **Expected:**
 1. In the tray menu, turn **Launch at login** on.
-2. Open `regedit` and check `HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`: a value (typically `gentle-dot`) points at `gentle-dot.exe`.
+2. Open `regedit`, press **F5** to refresh, and look in **both** `HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Run` and `HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`: a value named `Gentle Dot` points at `gentle-dot.exe` (measured on Windows 11, in `HKLM` because that run was elevated; `regedit` needs the refresh to show it).
 3. Quit Gentle Dot, sign out and back in (or restart), and confirm it launches again.
-4. Turn **Launch at login** off and confirm the value is gone from the `Run` key.
+4. Turn **Launch at login** off and confirm the value is gone from the key that held it.
 
 ## Troubleshooting
 
@@ -213,7 +213,7 @@ Build command:                (pnpm --filter @gentle-dot/desktop build)
 |14 | Secret store tests (optional) |                                      |       |
 |15 | Voice (not yet)               |                                      | W12   |
 |16 | Computer control (not yet)    |                                      | W13   |
-|17 | Launch at login               |                                      | HKCU Run key |
+|17 | Launch at login               |                                      | `Gentle Dot` in the Run key |
 
 Screenshots: (the rose on the desktop, the open panel, the tray icon)
 
