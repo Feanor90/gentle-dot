@@ -19,7 +19,9 @@ describe("loadConfig", () => {
 		});
 		expect(config.preferredFolder).toBeUndefined();
 		expect(config.agentArgs).toHaveLength(1);
-		expect(config.agentArgs[0]?.replaceAll("\\", "/")).toMatch(/node_modules\/gentle-pi\/bin\/gentle-shell\.mjs$/);
+		expect(config.agentArgs[0]?.replaceAll("\\", "/")).toMatch(
+			/node_modules\/gentle-pi\/bin\/gentle-shell\.mjs$/,
+		);
 		expect(existsSync(config.agentArgs[0] ?? "")).toBe(true);
 	});
 
