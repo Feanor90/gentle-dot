@@ -1087,10 +1087,9 @@ export class ConnectorStore {
 	 */
 	watch(): void {
 		this.close();
-		let timer: NodeJS.Timeout | undefined;
 		const check = () => {
-			clearTimeout(timer);
-			timer = setTimeout(() => {
+			clearTimeout(this.queuedCheck);
+			this.queuedCheck = setTimeout(() => {
 				try {
 					this.enforce();
 				} catch (error) {
@@ -1113,6 +1112,9 @@ export class ConnectorStore {
 
 	close(): void {
 		clearInterval(this.poll);
+		// A check already queued would write the files again after the daemon stopped.
+		clearTimeout(this.queuedCheck);
+		this.queuedCheck = undefined;
 		for (const watcher of this.watchers.splice(0)) watcher.close();
 		this.projectWatcher?.close();
 		this.projectWatcher = undefined;
@@ -1450,6 +1452,7 @@ export class ConnectorStore {
 
 	private check: () => void = () => {};
 	private poll: NodeJS.Timeout | undefined;
+	private queuedCheck: NodeJS.Timeout | undefined;
 	private projectWatcher: FSWatcher | undefined;
 
 	/** `.pi` appears after the watch starts; its folder is watched once it is there. */

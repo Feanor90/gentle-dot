@@ -17,6 +17,7 @@ import { AppChannel } from "./app-channel.ts";
 import { AuthManager, type AuthRuntime, createModelAuthRuntime, resolveAgentHome } from "./auth.ts";
 import { AuthHelper } from "./auth-helper.ts";
 import { type BridgeClient, DotBridge } from "./bridge.ts";
+import { materializeCompanions, packagedCompanions } from "./companions.ts";
 import {
 	APPROVAL_GUARD,
 	ConnectorManager,
@@ -62,6 +63,8 @@ export interface DaemonOptions {
 	agentEnv?: NodeJS.ProcessEnv;
 	/** The assistant's own Gentle Shell home (`--home`); profiles go next to it. */
 	agentHome?: string;
+	/** Prepared companion packages for a fresh engine home; default `<runtime>/companions` of an installed app. */
+	companions?: string;
 	/** Another setup's `profiles.json` offered for a one-time import; defaults to the user's Gentle Shell store. */
 	profilesImportPath?: string;
 	/** Creates the sign-in runtime; defaults to Pi's ModelRuntime on the agent home. */
@@ -181,6 +184,17 @@ export async function startDaemon(options: DaemonOptions): Promise<DotDaemon> {
 		// The engine also writes under the home folder; it gets one of its own.
 		agentEnv = isolatedAgentEnv(agentEnv, options.dataDir, access);
 		agentEnv.GENTLE_PI_CONFIG_HOME = join(options.dataDir, "gentle-ai");
+		// Before the engine's first start: a fresh home gets the installer's prepared companions, so
+		// gentle-shell needs no download or Go build to set it up (S17).
+		await materializeCompanions({
+			companions: options.companions ?? packagedCompanions(options.agentEnv ?? process.env),
+			gentleShell: options.agentArgs?.[0],
+			dataDir: options.dataDir,
+			agentHome: options.agentHome,
+			engineHome: join(options.dataDir, "home"),
+			log,
+			access,
+		});
 	}
 	const agentHome = options.agentHome ?? resolveAgentHome(process.env, options.dataDir);
 	const app = options.appChannel
@@ -596,7 +610,7 @@ async function handleUpload(
 	reply(res, 200, outcome.file);
 }
 
-function reply(res: ServerResponse, status: number, body: object): void {
+function reply(res: ServerResponse, status: number, body: unknown): void {
 	if (res.headersSent || res.destroyed) return;
 	res.writeHead(status, { "Content-Type": "application/json" });
 	res.end(JSON.stringify(body));
