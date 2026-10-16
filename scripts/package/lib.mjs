@@ -1,7 +1,7 @@
 // Pure helpers for staging the installed app's runtime (`stage-runtime.mjs`).
 import { createHash } from "node:crypto";
-import { createReadStream, lstatSync, readdirSync } from "node:fs";
-import { join, win32 } from "node:path";
+import { createReadStream, lstatSync, readdirSync, readFileSync } from "node:fs";
+import { extname, join, win32 } from "node:path";
 
 /**
  * The targets a runtime can be staged for, with the names Node's and Engram's
@@ -153,6 +153,119 @@ export function npmInstallEnv({ platform, nodeBin, cache, goBin, env = process.e
 		PATH: [nodeBin, goBin, win32.join(root, "System32"), root].filter(Boolean).join(";"),
 		...npmConfig,
 	};
+}
+
+/**
+ * The environment of the staging `gentle-shell --home <dir> setup` that prepares the packaged
+ * companions: `npmInstallEnv`'s clean npm, with every profile, temp, npm, gentle-shell, Gentle AI
+ * and Engram folder inside `sandbox`, telemetry and self-update off, and gentle-pi's Go build of
+ * Gentle AI and gentle-shell's auto-setup skipped. Nothing else comes from the parent environment
+ * but the Windows system variables; PATH is the runtime's own `bin` (its `pi` and `engram`, which
+ * Gentle AI's setup requires), the staged Node, git (`gitBin`), then the system folders.
+ * @param {{ platform: string, sandbox: string, runtimeBin?: string, nodeBin: string, gitBin?: string, env?: Record<string, string | undefined> }} options
+ */
+export function companionsSetupEnv({ platform, sandbox, runtimeBin, nodeBin, gitBin, env = process.env }) {
+	const path = platform === "win32" ? win32 : { join: (...parts) => parts.join("/") };
+	const base = npmInstallEnv({ platform, nodeBin, cache: sandbox, env });
+	const home = path.join(sandbox, "home");
+	const temp = path.join(sandbox, "tmp");
+	const system =
+		platform === "win32"
+			? [win32.join(base.SystemRoot, "System32"), base.SystemRoot]
+			: ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+	const dirs = [...new Set([runtimeBin, nodeBin, gitBin, ...system].filter(Boolean))];
+	return {
+		...base,
+		HOME: home,
+		USERPROFILE: home,
+		APPDATA: path.join(home, "AppData", "Roaming"),
+		LOCALAPPDATA: path.join(home, "AppData", "Local"),
+		...(platform === "win32" ? { TEMP: temp, TMP: temp } : { TMPDIR: temp }),
+		npm_config_prefix: path.join(sandbox, "npm-prefix"),
+		GENTLE_SHELL_CONFIG: path.join(sandbox, "gentle-shell", "config.json"),
+		GENTLE_PI_CONFIG_HOME: path.join(sandbox, "gentle-ai"),
+		ENGRAM_DATA_DIR: path.join(sandbox, "engram"),
+		DO_NOT_TRACK: "1",
+		GENTLE_AI_TELEMETRY: "0",
+		GENTLE_AI_NO_SELF_UPDATE: "1",
+		GENTLE_PI_SKIP_GENTLE_AI_INSTALL: "1",
+		GENTLE_SHELL_NO_AUTO_SETUP: "1",
+		PATH: dirs.join(platform === "win32" ? ";" : ":"),
+	};
+}
+
+/** Files a build-machine path could be written into: scripts, shims, JSON and docs. */
+const TEXT_FILES = new Set([".json", ".cmd", ".ps1", ".md", ".mjs", ".js"]);
+
+/** The installed version of each package `<npmDir>/package.json` depends on, from its lockfile. */
+export function installedCompanions(npmDir) {
+	const read = (name) => {
+		try {
+			return JSON.parse(readFileSync(join(npmDir, name), "utf8"));
+		} catch (error) {
+			throw new Error(`The companion template's npm/${name} is unreadable: ${error.message}`);
+		}
+	};
+	const { dependencies = {} } = read("package.json");
+	const { packages = {} } = read("package-lock.json");
+	const versions = {};
+	for (const name of Object.keys(dependencies).sort()) {
+		const version = packages[`node_modules/${name}`]?.version;
+		if (typeof version !== "string")
+			throw new Error(`npm/package-lock.json has no installed version of ${name}.`);
+		versions[name] = version;
+	}
+	return versions;
+}
+
+/**
+ * Throws unless `home`, made by gentle-shell setup inside `sandbox`, can be shipped as the
+ * packaged companions: settings.json parses, npm/ holds no leftover gentle-pi, nothing is a link
+ * or junction, and no script, shim or JSON file names the sandbox (the home must work anywhere).
+ * Returns the installed companion versions.
+ */
+export function validateCompanionsTemplate(home, sandbox) {
+	const exists = (rel) => {
+		try {
+			return lstatSync(join(home, rel));
+		} catch {
+			return undefined;
+		}
+	};
+	if (!exists("settings.json")?.isFile()) throw new Error("The companion template has no settings.json.");
+	try {
+		JSON.parse(readFileSync(join(home, "settings.json"), "utf8"));
+	} catch (error) {
+		throw new Error(`The companion template's settings.json does not parse: ${error.message}`);
+	}
+	if (!exists("npm")?.isDirectory()) throw new Error("The companion template has no npm folder.");
+	if (exists("npm/node_modules/gentle-pi"))
+		throw new Error(
+			"The companion template still has npm/node_modules/gentle-pi; gentle-shell setup removes it, so a leftover means a gentle-pi version mismatch.",
+		);
+	if (lstatSync(home).isSymbolicLink()) throw new Error("The companion template is itself a link.");
+	const links = symlinksIn(home);
+	if (links.length > 0) throw new Error(`The companion template contains a link: ${links[0]}.`);
+	// The sandbox as it may be written: as is, with `/`, or JSON-escaped; Windows paths ignore case.
+	const spellings = [sandbox, sandbox.replaceAll("\\", "/"), sandbox.replaceAll("\\", "\\\\")].map((s) =>
+		s.toLowerCase(),
+	);
+	const check = (dir, prefix, every) => {
+		for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) =>
+			a.name.localeCompare(b.name),
+		)) {
+			const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+			const bin = every || rel === "npm/node_modules/.bin";
+			if (entry.isDirectory()) check(join(dir, entry.name), rel, bin);
+			else if (bin || TEXT_FILES.has(extname(entry.name).toLowerCase())) {
+				const text = readFileSync(join(dir, entry.name), "utf8").toLowerCase();
+				if (spellings.some((spelling) => text.includes(spelling)))
+					throw new Error(`The companion template is not relocatable: ${rel} names the setup sandbox.`);
+			}
+		}
+	};
+	check(home, "", false);
+	return installedCompanions(join(home, "npm"));
 }
 
 /**

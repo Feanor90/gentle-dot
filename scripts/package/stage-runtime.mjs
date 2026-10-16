@@ -32,6 +32,7 @@ import {
 	engramReleaseVersion,
 	formatSize,
 	hostCommand,
+	installedCompanions,
 	nodeArchiveEntries,
 	nodeArchiveName,
 	nodeVersion,
@@ -225,12 +226,22 @@ function installDaemonModules(out, target) {
 	process.stdout.write(result.stdout ?? "");
 	process.stderr.write(result.stderr ?? "");
 	if (result.status !== 0) throw new Error(`npm install failed (exit ${result.status}).`);
+	const node = join(out, "node", "bin", isWindows(target) ? "node.exe" : "node");
 	// A fresh npm graph can satisfy semver yet break the engine's ESM imports.
-	run(process.execPath, [
-		join(REPO, "scripts", "package", "staged-engine.mjs"),
-		daemon,
-		join(out, "node", "bin", isWindows(target) ? "node.exe" : "node"),
-	]);
+	run(process.execPath, [join(REPO, "scripts", "package", "staged-engine.mjs"), daemon, node]);
+	// On Windows the app carries the companion packages gentle-shell would otherwise download
+	// (and build Gentle AI for with Go) on its first run: a real setup, made here in a sandbox.
+	let companions;
+	if (isWindows(target)) {
+		say("Companions (gentle-shell setup in a sandbox, telemetry off)");
+		run(process.execPath, [
+			join(REPO, "scripts", "package", "companions.mjs"),
+			daemon,
+			node,
+			join(out, "companions"),
+		]);
+		companions = installedCompanions(join(out, "companions", "agent-home", "npm"));
+	}
 	const postinstall = `${result.stdout}\n${result.stderr}`
 		.split("\n")
 		.filter((line) => /Gentle AI|gentle-pi/.test(line) && !/^>/.test(line.trim()));
@@ -243,11 +254,13 @@ function installDaemonModules(out, target) {
 	);
 	const pkg = (name) =>
 		JSON.parse(readFileSync(join(daemon, "node_modules", name, "package.json"), "utf8")).version;
-	return {
+	const versions = {
 		gentlePi: pkg("gentle-pi"),
 		engine: pkg("@earendil-works/pi-coding-agent"),
 		gentleAi: gentleAi.version,
 	};
+	if (companions) versions.companions = companions;
+	return versions;
 }
 
 /** The Engram release to carry: the flag, else the user's own release version, else the latest release. */
@@ -315,8 +328,9 @@ async function main() {
 	const node = await stageNode(out, target);
 	say("Daemon (build:runtime)");
 	runOnPath("pnpm", ["--filter", "@gentle-dot/daemon", "build:runtime", "--", "--out", out], { cwd: REPO });
-	const modules = installDaemonModules(out, target);
+	// Engram first: the companions' setup (in installDaemonModules) runs with the runtime's own `bin`.
 	const engram = await stageEngram(out, target, options.engramVersion);
+	const modules = installDaemonModules(out, target);
 	say("Web UI");
 	runOnPath("pnpm", ["--filter", "@gentle-dot/ui", "build"], { cwd: REPO });
 	cpSync(join(REPO, "packages", "ui", "dist", "app"), join(out, "ui"), { recursive: true });
