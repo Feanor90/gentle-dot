@@ -579,6 +579,8 @@ impl Daemon {
     }
 
     #[cfg(test)]
+    // Its only callers are the POSIX-only tests, so it has no callers on Windows by design.
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn with_health(mut self, health: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
         self.health = Some(health);
         self
@@ -764,10 +766,16 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::app_channel::{AppChannel, Handler};
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::io::{BufRead, BufReader};
+    #[cfg(unix)]
     use std::os::fd::{AsFd, AsRawFd};
+    #[cfg(unix)]
     use std::os::unix::net::UnixStream;
+    #[cfg(unix)]
     use std::process::Command;
 
     fn env_of(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
@@ -783,7 +791,7 @@ mod tests {
         let spec = launch_spec(env_of(&[]), false, None);
         assert_eq!(spec.program, env!("GENTLE_DOT_BUILD_NODE"));
         assert_eq!(spec.args, vec![env!("GENTLE_DOT_BUILD_DAEMON_SCRIPT").to_string()]);
-        assert!(spec.args[0].ends_with("packages/daemon/src/cli.ts"));
+        assert!(Path::new(&spec.args[0]).ends_with("packages/daemon/src/cli.ts"));
         assert_eq!(env_value(&spec, "PATH"), Some(env!("GENTLE_DOT_BUILD_PATH")));
         assert_eq!(env_value(&spec, "GENTLE_DOT_ALLOWED_ORIGINS"), None);
     }
@@ -860,7 +868,7 @@ mod tests {
         assert_eq!(spec.args, vec!["/srv/cli.ts".to_string()]);
         assert_eq!(env_value(&spec, "GENTLE_DOT_RUNTIME"), Some(runtime.display().to_string().as_str()));
         let spec = launch_spec(env_of(&[("GENTLE_DOT_NODE", "")]), false, Some(&runtime));
-        assert_eq!(spec.program, runtime.join("node/bin/node").display().to_string());
+        assert_eq!(Path::new(&spec.program), runtime.join("node/bin/node"));
     }
 
     #[test]
@@ -885,10 +893,12 @@ mod tests {
         std::env::temp_dir().join(format!("gentle-dot-{name}-{}-{nanos}", std::process::id()))
     }
 
+    #[cfg(unix)]
     fn mode_of(path: &Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
+    #[cfg(unix)]
     #[test]
     fn daemon_log_is_private_when_created() {
         let dir = scratch_dir("log-new").join("data");
@@ -897,6 +907,7 @@ mod tests {
         assert_eq!(mode_of(&dir.join("daemon.log")), 0o600);
     }
 
+    #[cfg(unix)]
     #[test]
     fn daemon_log_repairs_looser_modes() {
         let dir = scratch_dir("log-old");
@@ -915,6 +926,7 @@ mod tests {
         LaunchSpec { program: "/bin/sh".into(), args: vec!["-c".into(), script.into()], envs: vec![] }
     }
 
+    #[cfg(unix)]
     fn read_line(stream: &UnixStream) -> String {
         // macOS refuses socket options (EINVAL) once the other end has closed; reading still works.
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
@@ -923,6 +935,7 @@ mod tests {
         line
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_daemon_gets_its_end_of_the_channel_on_fd_3() {
         let dir = scratch_dir("channel-fd");
@@ -938,12 +951,14 @@ IFS= read -r line <&3; printf '%s %s\\n' \"$kind\" \"$line\" >&3";
         assert_eq!(read_line(&app), "");
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_channel_end_is_never_one_the_daemon_could_clobber() {
         let (_app, daemon_end) = channel_pair().unwrap();
         assert!(daemon_end.as_raw_fd() > APP_FD, "{}", daemon_end.as_raw_fd());
     }
 
+    #[cfg(unix)]
     #[test]
     fn without_a_channel_fd_3_is_closed_in_the_daemon() {
         let dir = scratch_dir("channel-none");
@@ -953,6 +968,7 @@ IFS= read -r line <&3; printf '%s %s\\n' \"$kind\" \"$line\" >&3";
         assert_eq!(fs::read_to_string(dir.join("daemon.log")).unwrap(), "none\n");
     }
 
+    #[cfg(unix)]
     #[test]
     fn no_other_descriptor_of_the_app_reaches_the_daemon() {
         let dir = scratch_dir("channel-only");
@@ -975,6 +991,7 @@ IFS= read -r line <&3; printf '%s %s\\n' \"$kind\" \"$line\" >&3";
     /// stand-in (packages/daemon/test/fixtures/app-channel-child.ts), which opens the channel the way
     /// the daemon does and reports what the children it spawns see on fd 3. Needs Node 24 on PATH
     /// (or `GENTLE_DOT_TEST_NODE`): `cargo test a_node_daemon -- --ignored`.
+    #[cfg(unix)]
     #[test]
     #[ignore = "needs Node 24 and the repository's daemon sources"]
     fn a_node_daemon_keeps_the_channel_from_its_children() {
@@ -1012,9 +1029,11 @@ IFS= read -r line <&3; printf '%s %s\\n' \"$kind\" \"$line\" >&3";
         assert_eq!(report["detectsALeak"], true, "{report}");
     }
 
+    #[cfg(unix)]
     #[derive(Default)]
     struct Opened(Mutex<usize>);
 
+    #[cfg(unix)]
     impl Handler for Opened {
         fn approve(&self, _: &crate::approvals::ApprovalRequest) -> bool {
             false
@@ -1031,6 +1050,7 @@ id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
 printf '{"kind":"response","id":%s,"result":{"echo":%s}}\n' "$id" "$id" >&3
 done"#;
 
+    #[cfg(unix)]
     #[test]
     fn a_daemon_this_app_spawned_gets_a_channel_until_it_stops() {
         let handler = Arc::new(Opened::default());
@@ -1083,6 +1103,7 @@ done"#;
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_app_that_wants_a_channel_never_attaches_to_a_daemon_it_did_not_launch() {
         let port = foreign_daemon();
@@ -1111,6 +1132,7 @@ done"#;
         assert_eq!(daemon.wait_ready(Duration::from_millis(300)), Ok(()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_pid_file_names_only_the_process_it_recorded() {
         let dir = scratch_dir("pid-file");
@@ -1137,10 +1159,12 @@ done"#;
     }
 
     /// A pid file naming `pid` with its real start time, as `record_launch` would write it.
+    #[cfg(unix)]
     fn launch_line(pid: u32) -> String {
         format!("{pid} {}\n", process_started(pid).expect("a live process"))
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_pid_file_never_names_the_app_its_parent_or_the_system() {
         let dir = scratch_dir("pid-self");
@@ -1159,6 +1183,7 @@ done"#;
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_pid_file_that_is_a_symlink_is_not_read_and_its_target_is_untouched() {
         let dir = scratch_dir("pid-symlink-read");
@@ -1175,6 +1200,7 @@ done"#;
         child.wait().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn recording_a_launch_never_writes_through_a_symlink() {
         let dir = scratch_dir("pid-symlink-write");
@@ -1193,6 +1219,7 @@ done"#;
         child.wait().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn recording_a_launch_replaces_the_pid_file_whole() {
         use std::os::unix::fs::MetadataExt;
@@ -1214,6 +1241,7 @@ done"#;
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_pid_file_that_is_not_a_small_regular_file_is_not_read() {
         let dir = scratch_dir("pid-odd");
@@ -1232,6 +1260,7 @@ done"#;
         child.wait().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_refused_app_announces_its_assistant_once_a_restart_starts_it() {
         let dir = scratch_dir("ready-after-restart");
@@ -1262,6 +1291,7 @@ done"#;
         daemon.stop();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_relaunched_app_after_a_crashed_one_gets_a_channel() {
         let dir = scratch_dir("relaunch");
@@ -1301,6 +1331,7 @@ done"#;
         assert!(!dir.join(PID_FILE).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn stop_child_terminates_with_sigterm() {
         let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
@@ -1312,6 +1343,7 @@ done"#;
         assert_eq!(status.signal(), Some(libc::SIGTERM));
     }
 
+    #[cfg(unix)]
     #[test]
     fn stop_child_kills_after_the_grace_period() {
         let mut child = Command::new("/bin/sh").args(["-c", "trap '' TERM; sleep 30"]).spawn().unwrap();
