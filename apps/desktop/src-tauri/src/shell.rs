@@ -775,7 +775,15 @@ pub fn run() {
         std::env::set_var("GDK_BACKEND", backend);
     }
     let places_windows = !platform::compositor_places_windows(|key| std::env::var(key).ok());
-    let config = config::load_config();
+    // No home folder and no `GENTLE_DOT_DATA_DIR`: there is nowhere to keep anything, and
+    // guessing a relative folder is the W22 bug. Fail before a window exists rather than after.
+    let config = match config::load_config() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("gentle-dot: {error}");
+            std::process::exit(1);
+        }
+    };
     tauri::Builder::default()
         // First, so a second launch forwards its arguments and exits before anything else starts.
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| handle_launch(app, &args)))

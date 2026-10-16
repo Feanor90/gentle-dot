@@ -1,10 +1,12 @@
 //! Platform decisions for the desktop shell (design §9), kept pure so they are tested on
-//! every OS: the GDK backend on Linux, who places the windows, the panel URL, and what a
-//! second launch (`gentle-dot --toggle`) asks the running app to do.
+//! every OS: the GDK backend on Linux, who places the windows, the panel URL, the home folder,
+//! and what a second launch (`gentle-dot --toggle`) asks the running app to do.
 //!
 //! The OS-agnostic decisions live here; translating one into a Tauri type is the caller's job
 //! (`shell.rs` maps [`WindowEffect`] onto `tauri::window::Effect`). Nothing in this module names
 //! a platform crate, which is what lets the Windows branches be tested on macOS and Linux.
+
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {
@@ -63,6 +65,29 @@ impl Os {
             Os::MacOs | Os::Linux => "Alt+Space",
             Os::Windows => "Ctrl+Shift+Space",
         }
+    }
+}
+
+/// The user's home folder, from the variables this OS actually sets.
+///
+/// **Windows does not define `HOME`** — only MSYS and similar shells do — so an app started the
+/// way a user starts it (Explorer, the Start menu, autostart) has none. Reading `HOME` alone
+/// therefore left the data dir as a bare relative `.gentle-dot`, resolved against the working
+/// directory, and the app never found its own token (W22). Windows sets `USERPROFILE`, with
+/// `HOMEDRIVE` + `HOMEPATH` as the older pair; macOS and Linux set `HOME`.
+///
+/// `None` is the honest answer when nothing names a home, and the caller must fail rather than
+/// invent a relative path.
+pub fn home_dir(os: Os, env: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    // A blank value is not a folder: `USERPROFILE=   ` must not become a home called `   `.
+    let value = |key: &str| env(key).filter(|value| !value.trim().is_empty());
+    match os {
+        Os::Windows => value("USERPROFILE").map(PathBuf::from).or_else(|| {
+            let drive = value("HOMEDRIVE")?;
+            let rest = value("HOMEPATH")?;
+            Some(PathBuf::from(format!("{drive}{rest}")))
+        }),
+        Os::MacOs | Os::Linux => value("HOME").map(PathBuf::from),
     }
 }
 
@@ -260,6 +285,28 @@ mod tests {
         assert_eq!(Os::Windows.default_shortcut(), "Ctrl+Shift+Space");
         assert_eq!(Os::MacOs.default_shortcut(), "Alt+Space");
         assert_eq!(Os::Linux.default_shortcut(), "Alt+Space");
+    }
+
+    #[test]
+    fn the_home_comes_from_the_variables_this_os_sets() {
+        assert_eq!(
+            home_dir(Os::Windows, env_of(&[("USERPROFILE", r"C:\Users\me")])),
+            Some(PathBuf::from(r"C:\Users\me"))
+        );
+        // The older pair, joined the way Windows renders it.
+        assert_eq!(
+            home_dir(Os::Windows, env_of(&[("HOMEDRIVE", "C:"), ("HOMEPATH", r"\Users\me")])),
+            Some(PathBuf::from(r"C:\Users\me"))
+        );
+        assert_eq!(home_dir(Os::Windows, env_of(&[("USERPROFILE", "   ")])), None);
+        // The W22 bug: a Windows GUI launch has no HOME, and that must never become a relative path.
+        assert_eq!(home_dir(Os::Windows, env_of(&[("HOME", "/home/me")])), None);
+        assert_eq!(home_dir(Os::Windows, env_of(&[("HOMEDRIVE", "C:")])), None);
+        assert_eq!(home_dir(Os::Linux, env_of(&[("HOME", "/home/me")])), Some(PathBuf::from("/home/me")));
+        assert_eq!(home_dir(Os::MacOs, env_of(&[("HOME", "/Users/me")])), Some(PathBuf::from("/Users/me")));
+        // The other direction too: Unix does not read USERPROFILE.
+        assert_eq!(home_dir(Os::Linux, env_of(&[("USERPROFILE", r"C:\Users\me")])), None);
+        assert_eq!(home_dir(Os::MacOs, env_of(&[])), None);
     }
 
     #[test]
