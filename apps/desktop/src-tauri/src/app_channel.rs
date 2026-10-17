@@ -872,5 +872,50 @@ mod windows_tests {
         let read = adversary.join().unwrap();
         assert!(read.is_err() || read.unwrap() == 0, "the refused peer read something");
     }
+
+    /// The endpoint is **single-instance**, and that is what stops a same-user process from creating
+    /// a *second* instance of the name it found in `\\.\pipe\` and receiving the daemon's
+    /// connection instead of the app. `FILE_FLAG_FIRST_PIPE_INSTANCE` alone would only fail *our*
+    /// own create when the name already exists; the OS refuses the second instance because the
+    /// first asked for one (`nMaxInstances = 1`). Measured on Windows 11: with 1 the second
+    /// `CreateNamedPipeW` fails with `ERROR_PIPE_BUSY`, and the same call with 2 succeeds, so this
+    /// test fails if the app's single-instance choice is ever relaxed.
+    #[test]
+    fn a_second_instance_of_the_endpoints_name_cannot_be_created() {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
+        };
+        use windows_sys::Win32::System::Pipes::{
+            CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+        };
+        let server = windows::ServerEndpoint::create().unwrap();
+        let name: Vec<u16> = server.name().encode_utf16().chain(Some(0)).collect();
+        let second = |flags: u32| unsafe {
+            CreateNamedPipeW(
+                name.as_ptr(),
+                PIPE_ACCESS_DUPLEX | flags,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                4096,
+                4096,
+                0,
+                std::ptr::null(),
+            )
+        };
+        // What an attacker would try: the same name, no FIRST_PIPE_INSTANCE. One instance is the
+        // endpoint's own limit, so the OS refuses this.
+        assert_eq!(
+            second(FILE_FLAG_OVERLAPPED),
+            INVALID_HANDLE_VALUE,
+            "a second instance of the app's pipe name was created"
+        );
+        // And a duplicate of the app's own create is refused by the flag.
+        assert_eq!(
+            second(FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED),
+            INVALID_HANDLE_VALUE,
+            "FILE_FLAG_FIRST_PIPE_INSTANCE did not refuse a duplicate of the name"
+        );
+    }
 }
 
