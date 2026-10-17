@@ -138,7 +138,9 @@ pnpm package:windows           # add --check to verify both installers (needs 7-
 
 At version 0.1.0 they measure 79,267,489 bytes (75.6 MB) and 125,985,987 bytes (120.1 MB), because each carries the 317.9 MB runtime compressed. `--skip-stage` reuses a runtime staged earlier. `--check` verifies an installer before you trust it, and **installs nothing**: it extracts each payload, compares every one of the ~28,000 files against the staged runtime, checks the SHA-256 of six of them (the manifest, `node\node.exe`, `bin\pi.cmd`, `bin\engram.exe`, the daemon bundle, and the engine binary), and deletes the extractions.
 
-The app finds its runtime in `runtime\` beside `Gentle Dot.exe` (override with `GENTLE_DOT_RUNTIME_DIR`). **The installers are not signed** — there is no code-signing identity in this project yet — so Windows shows its "unrecognized app" warning.
+The app finds its runtime in `runtime\` beside `Gentle Dot.exe` (override with `GENTLE_DOT_RUNTIME_DIR`). Measured on Windows 11 x86_64 with the NSIS installer: `"Gentle Dot_0.1.0_x64-setup.exe" /S /D=<folder>` exits 0 and leaves `Gentle Dot.exe`, `runtime\` and `uninstall.exe` in that folder, with an Add/Remove Programs entry under `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Gentle Dot`; the installed `runtime\` holds all 28,273 staged files byte for byte, and running its `bin\pi.cmd`, `bin\engram.exe` and engine binary with no Go on `PATH` reports `1.0.4`, `engram 3.4.0` and `gentle-ai 4.0.0`. The MSI was not installed, because it needs an administrator.
+
+**The installers are not signed** — there is no code-signing identity in this project yet — so Windows shows its "unrecognized app" warning.
 
 `pnpm --filter @gentle-dot/desktop build` still works and is a plain release build: it writes the same two installers, but **they do not carry the runtime**, which is what [docs/windows-testing.md](windows-testing.md) uses.
 
@@ -183,6 +185,8 @@ For a step-by-step tester checklist, see [docs/windows-testing.md](windows-testi
 2. If you built from source, delete the folder you built or the built app; if you installed one of the installers, remove **Gentle Dot** from **Settings → Apps → Installed apps** (the NSIS installer writes its own `uninstall.exe` next to the app as well).
 3. Optional: delete `%USERPROFILE%\.gentle-dot` to remove settings and conversations.
 4. Optional: delete `%LOCALAPPDATA%\Gentle Dot` to remove `secrets.dat` and the connector secrets it holds.
+
+The NSIS uninstaller removes the app folder and its Add/Remove Programs entry, but leaves an empty `HKCU\Software\Gentleman Programming\Gentle Dot` key behind — that is Tauri's installer template, not this app. Deleting it is optional.
 
 ### For developers
 

@@ -2,7 +2,7 @@
 
 Thanks for testing! This guide walks you through building Gentle Dot from source on Windows 10 or Windows 11 (x86_64) and checking that it works. Building and running takes about 30 minutes, most of it the first build.
 
-This checklist is **source-only**: it runs the app you just built, not an installed one. A self-contained installer now exists (`pnpm package:windows`, see [docs/install.md](install.md)) and its payload is verified file by file, but no one has installed it on a machine yet, so installing it is deliberately **not** a step here — build and run instead. Several features are not there yet, and they are marked **not yet on Windows** instead of being presented as if they work. The expected results below are what the app should do; a few checks have already been measured on Windows 11 and say so. Where a step is pending, write **N/A** and note what happened.
+This checklist is **source-only**: it runs the app you just built, not an installed one. A self-contained installer now exists (`pnpm package:windows`, see [docs/install.md](install.md)), its payload is verified file by file, and the NSIS one has been run silently on Windows 11 and read back — its installed `runtime\` is byte-identical to the staged one and its engine starts with no Go installed. What nobody has done yet is **launch an installed copy** of the app, so installing it is deliberately **not** a step here — build and run instead. Several features are not there yet, and they are marked **not yet on Windows** instead of being presented as if they work. The expected results below are what the app should do; a few checks have already been measured on Windows 11 and say so. Where a step is pending, write **N/A** and note what happened.
 
 ## Before you start
 
