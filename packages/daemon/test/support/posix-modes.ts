@@ -4,8 +4,8 @@
 // be asserted to be `0o600` / `0o700` / `0o644` / `0o711`. Windows has none: `statSync().mode` never
 // carries them, so a raw mode assertion there can never pass. File privacy on Windows comes from the
 // ACL of the profile directory the data folder lives in, not from a per-file mode
-// (odd/tasks/windows-port.md). These helpers skip the mode assertion on Windows, but say so once per
-// test process so a green Windows run cannot quietly assert nothing.
+// (odd/tasks/windows-port.md). These helpers skip the mode assertion on Windows, but announce every
+// skip so a green Windows run cannot quietly assert nothing.
 import { lstatSync, statSync } from "node:fs";
 import { expect } from "vitest";
 
@@ -13,21 +13,18 @@ export function hasPosixModes(platform: string = process.platform): boolean {
 	return platform !== "win32";
 }
 
-let warned = false;
-
-function warnSkipped(): void {
-	if (warned) return;
-	warned = true;
+function warnSkipped(kind: "stat" | "lstat" | "executable", path: string, mode: number): void {
 	console.warn(
-		"posix-modes: Windows has no POSIX mode bits, so file and directory mode assertions are skipped; " +
-			"privacy relies on the ACL of the profile directory (see odd/tasks/windows-port.md).",
+		`posix-modes: skipped ${kind} mode 0o${mode.toString(8)} assertion for ${path}; ` +
+			"Windows has no POSIX mode bits, and privacy relies on the ACL of the profile directory " +
+			"(see odd/tasks/windows-port.md).",
 	);
 }
 
 /** Asserts the `0o777` bits of `path`, or loudly skips on a platform without POSIX modes. */
 export function expectPosixMode(path: string, mode: number, platform: string = process.platform): void {
 	if (!hasPosixModes(platform)) {
-		warnSkipped();
+		warnSkipped("stat", path, mode);
 		return;
 	}
 	expect(statSync(path).mode & 0o777).toBe(mode);
@@ -36,7 +33,7 @@ export function expectPosixMode(path: string, mode: number, platform: string = p
 /** The `lstat` twin of {@link expectPosixMode}, for a path that may be a symlink itself. */
 export function expectPosixLstatMode(path: string, mode: number, platform: string = process.platform): void {
 	if (!hasPosixModes(platform)) {
-		warnSkipped();
+		warnSkipped("lstat", path, mode);
 		return;
 	}
 	expect(lstatSync(path).mode & 0o777).toBe(mode);
@@ -49,7 +46,7 @@ export function expectPosixLstatMode(path: string, mode: number, platform: strin
  */
 export function expectPosixExecutable(path: string, platform: string = process.platform): void {
 	if (!hasPosixModes(platform)) {
-		warnSkipped();
+		warnSkipped("executable", path, 0o111);
 		return;
 	}
 	expect(statSync(path).mode & 0o111).toBe(0o111);

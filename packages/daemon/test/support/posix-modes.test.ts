@@ -31,7 +31,7 @@ describe("posix mode helper", () => {
 		expect(() => expectPosixExecutable(file, "linux")).toThrow();
 	});
 
-	it("skips and warns exactly once on Windows, for stat and lstat alike", () => {
+	it("warns on every Windows skip, for stat, lstat, and executable alike", () => {
 		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 		try {
 			const file = join(tempDir(), "private");
@@ -41,9 +41,20 @@ describe("posix mode helper", () => {
 			expect(() => expectPosixLstatMode(file, 0o600, "win32")).not.toThrow();
 			expect(() => expectPosixMode(file, 0o644, "win32")).not.toThrow();
 			expect(() => expectPosixExecutable(file, "win32")).not.toThrow();
-			expect(warn).toHaveBeenCalledTimes(1);
-			expect(warn.mock.calls[0]?.[0]).toContain("odd/tasks/windows-port.md");
-			expect(warn.mock.calls[0]?.[0]).toContain("ACL");
+			// Every skip announces itself, not just the first in the process.
+			expect(warn).toHaveBeenCalledTimes(4);
+			for (const call of warn.mock.calls) {
+				const line = String(call[0]);
+				expect(line).toContain(file);
+				expect(line).toContain("odd/tasks/windows-port.md");
+				expect(line).toContain("ACL");
+				expect(line).not.toContain("\n");
+			}
+			// Two consecutive skips still each warn: no once-only flag may hide the second.
+			warn.mockClear();
+			expect(() => expectPosixMode(file, 0o600, "win32")).not.toThrow();
+			expect(() => expectPosixExecutable(file, "win32")).not.toThrow();
+			expect(warn).toHaveBeenCalledTimes(2);
 		} finally {
 			warn.mockRestore();
 		}
