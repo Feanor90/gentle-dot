@@ -38,7 +38,8 @@ export function scopedIntegrityKeyId(dataDir: string): string {
 
 /**
  * True when `dataDir` is the folder this installation uses by default (the env override included):
- * the only folder the legacy id's key can be attributed to, so the only one that still reads it.
+ * the only folder whose MISSING file the legacy id's key can be attributed to. A file that is there
+ * is checked against the legacy key in any folder, as older versions signed every folder with it.
  */
 export function isDefaultDataDir(dataDir: string, env: NodeJS.ProcessEnv = process.env): boolean {
 	const own = realPath(dataDir);
