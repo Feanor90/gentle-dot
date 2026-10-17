@@ -1,9 +1,12 @@
 //! The private channel to the daemon this app launched (S25.1–S25.3). When the app spawns the
 //! daemon it creates a connected pair of Unix sockets and hands one end to the daemon as fd 3
-//! (`daemon::spawn_daemon`); it keeps the other. That connection is the authentication: nothing is
-//! written to a file or an environment variable and nothing listens, so another process (the agent
-//! included) cannot reach it. A daemon the app only attached to gets no channel.
-//!
+//! (`daemon::spawn_daemon`); it keeps the other. On Windows, where there is no fd 3, it creates a
+//! single-instance named pipe before it spawns the daemon and hands the daemon the pipe's name in
+//! `GENTLE_DOT_CHANNEL_PIPE`; the accepted connection's PID, matched against the child the app
+//! spawned, is the credential. That name is not a secret, and the pipe does listen; the retained
+//! handle and the PID check are what authenticate (W7c documents the trust model). The frame,
+//! pending and secret logic below is one rule both platforms share; only the transport differs
+//! (`windows`). A daemon the app only attached to gets no channel.
 //! Frames are line-delimited JSON in both directions; each side numbers its own requests:
 //!   {"kind":"request","id":1,"method":"command","params":{"clientId":"…","message":{…}}}
 //!   {"kind":"response","id":1,"result":{}}  or  {"kind":"response","id":1,"error":"…"}
@@ -19,26 +22,21 @@
 //! about a secret request is logged. The answer goes back over this channel only.
 
 use crate::approvals::ApprovalRequest;
-use crate::secure_store::SecretStore;
-#[cfg(unix)]
-use crate::secure_store::{check_id, Secret};
+use crate::secure_store::{check_id, Secret, SecretStore};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-#[cfg(unix)]
-use serde_json::json;
-#[cfg(unix)]
+use serde_json::{json, Value};
 use std::collections::HashMap;
-#[cfg(unix)]
 use std::io::{self, BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::net::Shutdown;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[cfg(unix)]
 use std::sync::{mpsc, Arc, Mutex, PoisonError};
 use std::time::Duration;
+
+#[cfg(windows)]
+pub(crate) mod windows;
 
 /// Where the daemon finds its end of the channel.
 pub const APP_FD: i32 = 3;
@@ -49,10 +47,8 @@ pub const REGISTER_TIMEOUT: Duration = Duration::from_secs(60);
 /// A frame longer than this closes the channel. The daemon has the same rule, and a closed channel
 /// stops the daemon (S35.2), so neither side ever sends a longer one: an oversized request fails
 /// here without being written, and an oversized answer goes out as an error instead.
-#[cfg(unix)]
 const MAX_FRAME: u64 = 1024 * 1024;
 /// Why a frame was not sent.
-#[cfg(unix)]
 const TOO_LARGE: &str = "too large to send to the assistant";
 
 /// What the panel may ask the daemon through the app (S25.2): connector changes, approving a draft
@@ -71,13 +67,6 @@ pub const PANEL_COMMANDS: &[&str] = &[
 /// Why the panel cannot change connectors: the daemon was not started by this app.
 pub const NO_CHANNEL: &str = "Gentle Dot did not start this assistant, so its connectors cannot be changed from here. \
 Quit the assistant that is running and open Gentle Dot again.";
-
-/// What the panel is told on Windows, where the app-to-assistant channel does not exist at all, so a
-/// connector change has nothing to travel over. W7 is what gives this platform a channel (L30), and
-/// until then this says so instead of blaming a daemon the app did start.
-#[cfg(not(unix))]
-pub const NO_CHANNEL_WINDOWS: &str = "Connector changes are not available on Windows yet: they need the private \
-channel between Gentle Dot and its assistant, which this platform does not carry yet.";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -107,7 +96,6 @@ pub trait Handler: Send + Sync {
     /// Shows the native dialog and blocks until the answer; true only when the user allowed it.
     fn approve(&self, request: &ApprovalRequest) -> bool;
     /// The channel to a freshly spawned daemon is open (for example, register the computer helper).
-    #[cfg(unix)]
     fn opened(&self, _channel: &Arc<AppChannel>) {}
     /// Where connector secrets live (the Keychain on macOS); `None` refuses secret requests.
     fn secrets(&self) -> Option<&dyn SecretStore> {
@@ -116,20 +104,17 @@ pub trait Handler: Send + Sync {
 }
 
 /// The id (and, for `secret_put`, the secret) of a secret request. Shows the id only.
-#[cfg(unix)]
 pub(crate) struct SecretParams {
     id: String,
     secret: Option<Secret>,
 }
 
-#[cfg(unix)]
 impl std::fmt::Debug for SecretParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SecretParams").field("id", &self.id).field("secret", &self.secret).finish()
     }
 }
 
-#[cfg(unix)]
 impl SecretParams {
     /// Reads `{id, secret?}` by hand, so a refusal never repeats a value the daemon sent.
     pub(crate) fn parse(params: &Value) -> Result<Self, String> {
@@ -145,7 +130,6 @@ impl SecretParams {
 }
 
 /// Answers one secret request from `store`. Errors name what failed, never a secret.
-#[cfg(unix)]
 pub(crate) fn serve_secret(store: &dyn SecretStore, method: &str, params: &Value) -> Result<Value, String> {
     if method == "secret_list" {
         return store.list_ids().map(|ids| json!({ "ids": ids })).map_err(|error| error.to_string());
@@ -167,35 +151,70 @@ pub(crate) fn serve_secret(store: &dyn SecretStore, method: &str, params: &Value
     }
 }
 
-#[cfg(unix)]
 type Reply = mpsc::Sender<Result<Value, String>>;
 
-/// The app's end of the channel. It exists only where the platform can carry one: Windows has no
-/// fd 3 helper, so the type is absent there and `with_channel` declares no handler (L30).
-#[cfg(unix)]
+/// The app's end of the channel, over either transport. The frame, pending and secret rules are
+/// shared; only the transport (`start`) and the way `close` unblocks in-flight I/O differ.
 pub struct AppChannel {
-    writer: Mutex<UnixStream>,
+    writer: Mutex<Box<dyn Write + Send>>,
     pending: Mutex<HashMap<u64, Reply>>,
     next: AtomicU64,
     open: AtomicBool,
+    /// Unblocks a read or write that is already in progress when `close` runs: a Unix socket
+    /// shutdown, or a Windows `CancelIoEx` per direction.
+    shutdown: Box<dyn Fn() + Send + Sync>,
 }
 
-#[cfg(unix)]
 impl AppChannel {
-    /// Reads `stream` on a thread of its own; each daemon request runs on a worker thread.
-    pub fn start(stream: UnixStream, handler: Arc<dyn Handler>) -> io::Result<Arc<Self>> {
-        let reader = stream.try_clone()?;
+    /// Spawns the read loop over `reader` and shares it with the returned channel.
+    fn spawn<R: Read + Send + 'static>(
+        reader: R,
+        writer: Box<dyn Write + Send>,
+        shutdown: Box<dyn Fn() + Send + Sync>,
+        handler: Arc<dyn Handler>,
+    ) -> io::Result<Arc<Self>> {
         let channel = Arc::new(AppChannel {
-            writer: Mutex::new(stream),
+            writer: Mutex::new(writer),
             pending: Mutex::new(HashMap::new()),
             next: AtomicU64::new(0),
             open: AtomicBool::new(true),
+            shutdown,
         });
         let reading = channel.clone();
         std::thread::Builder::new()
             .name("app-channel".into())
-            .spawn(move || reading.read(BufReader::new(reader), handler))?;
+            .spawn(move || reading.read(reader, handler))?;
         Ok(channel)
+    }
+
+    /// The app's end of the fd-3 Unix socketpair. Reads `stream` on a thread of its own.
+    #[cfg(unix)]
+    pub fn start(stream: UnixStream, handler: Arc<dyn Handler>) -> io::Result<Arc<Self>> {
+        let reader = stream.try_clone()?;
+        let shutdown = stream.try_clone()?;
+        Self::spawn(
+            reader,
+            Box::new(stream),
+            Box::new(move || {
+                let _ = shutdown.shutdown(Shutdown::Both);
+            }),
+            handler,
+        )
+    }
+
+    /// The app's end of the Windows named pipe accepted from the daemon this app spawned.
+    #[cfg(windows)]
+    pub fn start(connected: windows::Connected, handler: Arc<dyn Handler>) -> io::Result<Arc<Self>> {
+        let windows::Connected { reader, writer, read_cancel, write_cancel } = connected;
+        Self::spawn(
+            reader,
+            Box::new(writer),
+            Box::new(move || {
+                let _ = read_cancel.cancel();
+                let _ = write_cancel.cancel();
+            }),
+            handler,
+        )
     }
 
     pub fn is_open(&self) -> bool {
@@ -236,7 +255,7 @@ impl AppChannel {
 
     pub fn close(&self) {
         self.open.store(false, Ordering::SeqCst);
-        let _ = self.writer.lock().unwrap_or_else(PoisonError::into_inner).shutdown(Shutdown::Both);
+        (self.shutdown)();
         // Dropping the senders wakes every waiting request.
         self.pending().clear();
     }
@@ -255,7 +274,8 @@ impl AppChannel {
         self.writer.lock().unwrap_or_else(PoisonError::into_inner).write_all(&line)
     }
 
-    fn read(self: Arc<Self>, mut reader: BufReader<UnixStream>, handler: Arc<dyn Handler>) {
+    fn read<R: Read + Send + 'static>(self: Arc<Self>, reader: R, handler: Arc<dyn Handler>) {
+        let mut reader = BufReader::new(reader);
         let mut line = Vec::new();
         loop {
             line.clear();
@@ -628,3 +648,229 @@ mod tests {
         assert!(!channel.is_open());
     }
 }
+
+/// The Windows transport's own tests (W7b): the named pipe is created before the spawn, only the
+/// child's PID is accepted, and `close` settles in-flight I/O. These compile and run on Windows
+/// only; the Unix fd-3 arm is covered by the module above.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use crate::approvals::ApprovalRequest;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    /// Records every approval the daemon asks for; always allows.
+    #[derive(Default)]
+    struct Recording {
+        asked: Mutex<Vec<ApprovalRequest>>,
+    }
+
+    impl Handler for Recording {
+        fn approve(&self, request: &ApprovalRequest) -> bool {
+            self.asked.lock().unwrap().push(request.clone());
+            true
+        }
+    }
+
+    fn read_frame<R: BufRead>(reader: &mut R) -> Frame {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap_or_else(|error| panic!("{error}: {line:?}"))
+    }
+
+    fn write_frame<W: Write>(writer: &mut W, frame: &Frame) {
+        writeln!(writer, "{}", serde_json::to_string(frame).unwrap()).unwrap();
+    }
+
+    /// A connected endpoint and the other process's end, both in this test process, so the PID
+    /// check accepts it. The client half is returned so a test can read and write as the daemon.
+    fn same_process_connected() -> (windows::Connected, std::fs::File) {
+        let server = windows::ServerEndpoint::create().unwrap();
+        let name = server.name().to_string();
+        let client = std::thread::spawn(move ||{
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match std::fs::OpenOptions::new().read(true).write(true).open(&name) {
+                    Ok(file) => return file,
+                    Err(error) => {
+                        assert!(Instant::now() < deadline, "client could not connect: {error}");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+        });
+        let connected =
+            server.accept(std::process::id(), || true, Instant::now() + Duration::from_secs(10)).unwrap();
+        let client = client.join().unwrap();
+        (connected, client)
+    }
+
+    /// Connects to a pipe by name, retrying while the app creates it.
+    fn connect_client(name: &str) -> std::fs::File {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match std::fs::OpenOptions::new().read(true).write(true).open(name) {
+                Ok(file) => return file,
+                Err(error) => {
+                    assert!(Instant::now() < deadline, "could not connect to the channel: {error}");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_named_pipe_channel_round_trips_requests_and_responses() {
+        let (connected, client) = same_process_connected();
+        let handler = Arc::new(Recording::default());
+        let channel = AppChannel::start(connected, handler.clone()).unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut writer = client;
+
+        // App to daemon: a request, answered by the fake daemon.
+        let waiting = std::thread::spawn({
+            let channel = channel.clone();
+            move || channel.request("ping", json!({}), Duration::from_secs(5))
+        });
+        let Frame::Request { id, method, .. } = read_frame(&mut reader) else { panic!("expected a request") };
+        assert_eq!(method, "ping");
+        write_frame(&mut writer, &Frame::Response { id, result: Some(json!({"ok": true})), error: None });
+        assert_eq!(waiting.join().unwrap(), Ok(json!({"ok": true})));
+
+        // Daemon to app: a request, answered by the channel's handler.
+        let request = json!({"connector": "Notion", "action": "create pages", "preview": [{"name": "title", "value": "Plan"}]});
+        write_frame(&mut writer, &Frame::Request { id: 9, method: "approve".into(), params: request });
+        let Frame::Response { id, result, error } = read_frame(&mut reader) else { panic!("expected a response") };
+        assert_eq!(id, 9);
+        assert_eq!(result, Some(json!({"approved": true})));
+        assert_eq!(error, None);
+        assert_eq!(handler.asked.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_frame_over_the_cap_is_never_written() {
+        let (connected, client) = same_process_connected();
+        let channel = AppChannel::start(connected, Arc::new(Recording::default())).unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut writer = client;
+        let huge = json!({"type": "connector_setup", "connectorId": "slack", "pad": "x".repeat(MAX_FRAME as usize)});
+        let refused = channel.command("w", huge).unwrap_err();
+        assert!(refused.contains("too large"), "{refused}");
+        assert!(channel.is_open());
+        // The first frame the daemon reads is the next small request, not a piece of the large one.
+        let waiting = std::thread::spawn({
+            let channel = channel.clone();
+            move || channel.request("ping", json!({}), Duration::from_secs(5))
+        });
+        let Frame::Request { id, method, .. } = read_frame(&mut reader) else { panic!("expected a request") };
+        assert_eq!(method, "ping");
+        write_frame(&mut writer, &Frame::Response { id, result: Some(json!({})), error: None });
+        assert_eq!(waiting.join().unwrap(), Ok(json!({})));
+    }
+
+    #[test]
+    fn close_wakes_a_request_blocked_on_a_full_pipe() {
+        let (connected, _client) = same_process_connected();
+        let channel = AppChannel::start(connected, Arc::new(Recording::default())).unwrap();
+        // 200 KiB is under the cap but far past the 4 KiB pipe buffer, and nobody reads it.
+        let waiting = std::thread::spawn({
+            let channel = channel.clone();
+            move || channel.request("ping", json!({"pad": "x".repeat(200_000)}), Duration::from_secs(30))
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        channel.close();
+        assert!(waiting.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn a_blocked_read_is_woken_by_its_cancellation() {
+        let (connected, _client) = same_process_connected();
+        let windows::Connected { mut reader, writer, read_cancel, write_cancel } = connected;
+        // Keep the write half and the client alive so the read truly blocks instead of seeing EOF.
+        let _keep = (writer, write_cancel, _client);
+        let (done, wait) = std::sync::mpsc::channel();
+        let reading = std::thread::spawn(move || {
+            let mut buffer = [0u8; 16];
+            let _ = done.send(reader.read(&mut buffer));
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        read_cancel.cancel().unwrap();
+        let result = wait.recv_timeout(Duration::from_secs(5)).expect("the read was not woken");
+        assert!(result.is_err() || result.unwrap() == 0);
+        reading.join().unwrap();
+    }
+
+    /// The peer-process fixture, dispatched by env var and a no-op in a normal run.
+    #[test]
+    fn windows_channel_peer_fixture() {
+        let Ok(role) = std::env::var("GENTLE_DOT_TEST_CHANNEL_ROLE") else { return };
+        let name = std::env::var("GENTLE_DOT_TEST_CHANNEL_PIPE").expect("a pipe name");
+        if role != "daemon" {
+            return;
+        }
+        if let Ok(delay) = std::env::var("GENTLE_DOT_TEST_CHANNEL_DELAY_MS") {
+            std::thread::sleep(Duration::from_millis(delay.parse().unwrap_or(0)));
+        }
+        let mut client = connect_client(&name);
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        // Answer the app's request, then ask it to approve something and read the answer.
+        let Frame::Request { id, .. } = read_frame(&mut reader) else { panic!("expected a request") };
+        write_frame(&mut client, &Frame::Response { id, result: Some(json!({"echo": id})), error: None });
+        let approve = json!({"connector": "Notion", "action": "create pages", "preview": []});
+        write_frame(&mut client, &Frame::Request { id: 4242, method: "approve".into(), params: approve });
+        let Frame::Response { id, .. } = read_frame(&mut reader) else { panic!("expected a response") };
+        assert_eq!(id, 4242);
+    }
+
+    /// The adversarial identity test: this same-user process enumerates `\\.\pipe\`, finds the
+    /// endpoint's name, connects, and tries to drive the channel. The endpoint refuses it (its PID
+    /// is not the child's) and disconnects it, while the real child is accepted and drives the
+    /// channel. The name is not a secret; the retained handle's PID is the credential (L50).
+    #[test]
+    fn a_same_user_process_that_finds_the_pipe_cannot_drive_the_channel() {
+        let server = windows::ServerEndpoint::create().unwrap();
+        let name = server.name().to_string();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "app_channel::windows_tests::windows_channel_peer_fixture"])
+            .env("GENTLE_DOT_TEST_CHANNEL_ROLE", "daemon")
+            .env("GENTLE_DOT_TEST_CHANNEL_PIPE", &name)
+            .env("GENTLE_DOT_TEST_CHANNEL_DELAY_MS", "600")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // The child delays 600 ms, so the adversary's connection is the first the accept sees.
+        let accepting = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            server.accept(pid, move || crate::daemon::process_started(pid).is_some(), deadline)
+        });
+        let wanted = name.clone();
+        let adversary = std::thread::spawn(move || {
+            let found = std::fs::read_dir(r"\\.\pipe\")
+                .unwrap()
+                .any(|entry| {
+                    entry.map(|entry| format!(r"\\.\pipe\{}", entry.file_name().to_string_lossy()) == wanted).unwrap_or(false)
+                });
+            assert!(found, r"the pipe name is not discoverable in \\.\pipe\");
+            let mut client = std::fs::OpenOptions::new().read(true).write(true).open(&wanted).unwrap();
+            let frame = Frame::Request { id: 1, method: "command".into(), params: json!({}) };
+            let _ = writeln!(client, "{}", serde_json::to_string(&frame).unwrap());
+            let mut buffer = [0u8; 64];
+            client.read(&mut buffer)
+        });
+
+        let connected = accepting.join().unwrap().unwrap();
+        let handler = Arc::new(Recording::default());
+        let channel = AppChannel::start(connected, handler.clone()).unwrap();
+        // The real child is accepted and still drives the channel.
+        let answer = channel.request("ping", json!({}), Duration::from_secs(5)).unwrap();
+        assert_eq!(answer, json!({"echo": 1}));
+        assert!(child.wait().unwrap().success(), "the accepted peer failed");
+        assert_eq!(handler.asked.lock().unwrap().len(), 1, "the refused peer reached the handler");
+        // The refused connection got EOF or an error, never a frame.
+        let read = adversary.join().unwrap();
+        assert!(read.is_err() || read.unwrap() == 0, "the refused peer read something");
+    }
+}
+

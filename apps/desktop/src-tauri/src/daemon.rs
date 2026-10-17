@@ -1,6 +1,7 @@
 //! Spawns the daemon, and stops what it spawned. A daemon it spawns gets its end of the app's
-//! private channel on fd 3 (S25.1, `app_channel`) and stops by itself when that channel closes, so it
-//! lives as long as this app, crashes included (S35.2).
+//! private channel (S25.1, `app_channel`): on fd 3 on macOS and Linux, over a named pipe on
+//! Windows, whose name the app hands over in `GENTLE_DOT_CHANNEL_PIPE`. The daemon stops by itself
+//! when that channel closes, so it lives as long as this app, crashes included (S35.2).
 //!
 //! An app with a channel never attaches to a daemon it did not launch: that daemon has no channel,
 //! so connectors would stay locked with no way out. When a healthy daemon holds the port at start,
@@ -9,9 +10,7 @@
 //! [`foreign_daemon_message`], which names the exit. An app without a channel attaches as before.
 
 pub use crate::app_channel::APP_FD;
-#[cfg(unix)]
-use crate::app_channel::AppChannel;
-use crate::app_channel::Handler;
+use crate::app_channel::{AppChannel, Handler};
 use crate::health::check_health;
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -32,6 +31,9 @@ pub const DEV_ALLOWED_ORIGINS: &str = r#"["http://127.0.0.1:5173","http://localh
 
 const HEALTH_TIMEOUT: Duration = Duration::from_millis(300);
 const STOP_GRACE: Duration = Duration::from_secs(5);
+/// How long the app waits for the daemon it spawned to connect to the named-pipe channel.
+#[cfg(windows)]
+const CHANNEL_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 /// The daemon stops its engine and memory first; a recorded orphan gets longer than a child.
 const ORPHAN_GRACE: Duration = Duration::from_secs(10);
 /// How long the port may take to be free after a recorded orphan stopped.
@@ -491,9 +493,9 @@ fn spawn_daemon(spec: &LaunchSpec, log: File, channel: Option<BorrowedFd<'_>>) -
 }
 
 /// Windows has no fd 3 to place a channel on and no other descriptor of the app to withhold, so
-/// the daemon gets its stdio and the log and nothing else. It starts and serves the browser; the
-/// app-provided channel is absent there until W7 replaces the fd-3 mechanism, which is the same
-/// reason [`Daemon::with_channel`] declares no handler on that platform.
+/// the daemon gets its stdio and the log and nothing else. The channel is a named pipe the app
+/// creates before the spawn; the daemon receives its name in `GENTLE_DOT_CHANNEL_PIPE` (set on
+/// `spec.envs` before this runs) and connects to it.
 #[cfg(windows)]
 fn spawn_daemon(spec: &LaunchSpec, log: File) -> io::Result<Box<dyn ChildProcess>> {
     use std::process::{Command, Stdio};
@@ -583,7 +585,6 @@ pub struct Daemon {
     runtime_dir: Option<PathBuf>,
     child: Mutex<Option<Box<dyn ChildProcess>>>,
     /// The private channel to the daemon this app spawned; attached daemons have none.
-    #[cfg(unix)]
     channel: Mutex<Option<Arc<AppChannel>>>,
     /// Serves the daemon's requests; without it no channel is made.
     handler: Option<Arc<dyn Handler>>,
@@ -605,7 +606,6 @@ impl Daemon {
             data_dir,
             runtime_dir,
             child: Mutex::new(None),
-            #[cfg(unix)]
             channel: Mutex::new(None),
             handler: None,
             refused: Mutex::new(None),
@@ -616,19 +616,10 @@ impl Daemon {
         }
     }
 
-    /// Every daemon this app spawns gets a channel served by `handler`.
-    ///
-    /// Windows has no fd 3 to carry one, so no handler is declared there and the daemon is treated
-    /// as one the app never asked a channel from: it attaches to whatever answers on the port, or
-    /// starts its own. W6 gates the channel; W7 replaces the mechanism.
-    #[cfg(unix)]
+    /// Every daemon this app spawns gets a channel served by `handler`: the fd-3 socketpair on
+    /// macOS and Linux, the named pipe the app creates before the spawn on Windows.
     pub fn with_channel(mut self, handler: Arc<dyn Handler>) -> Self {
         self.handler = Some(handler);
-        self
-    }
-
-    #[cfg(not(unix))]
-    pub fn with_channel(self, _handler: Arc<dyn Handler>) -> Self {
         self
     }
 
@@ -654,7 +645,6 @@ impl Daemon {
     }
 
     /// The channel to the daemon, only while one this app spawned runs and the channel is open.
-    #[cfg(unix)]
     pub fn channel(&self) -> Option<Arc<AppChannel>> {
         if !self.owns_running() {
             return None;
@@ -758,7 +748,9 @@ impl Daemon {
                 return Ok(());
             }
         }
-        let spec = self.launch.clone().unwrap_or_else(|| {
+        // The pipe name is pushed into the child's environment below, so the spec is mutable on Windows.
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut spec = self.launch.clone().unwrap_or_else(|| {
             launch_spec(|key| std::env::var(key).ok(), cfg!(debug_assertions), self.runtime_dir.as_deref())
         });
         let log = open_private_log(&self.data_dir).map_err(|e| format!("cannot open daemon.log: {e}"))?;
@@ -772,15 +764,36 @@ impl Daemon {
             use std::os::fd::AsFd;
             daemon_end.as_fd()
         });
+        // Created before the spawn, with `FILE_FLAG_FIRST_PIPE_INSTANCE`, so no other process can
+        // take the name while the child starts.
+        #[cfg(windows)]
+        let endpoint = match &self.handler {
+            Some(_) => Some(
+                crate::app_channel::windows::ServerEndpoint::create()
+                    .map_err(|e| format!("cannot open the assistant's channel: {e}"))?,
+            ),
+            None => None,
+        };
+        // The name is not a secret; the accepted connection's PID, checked against the child, is.
+        #[cfg(windows)]
+        if let Some(endpoint) = &endpoint {
+            spec.envs.push(("GENTLE_DOT_CHANNEL_PIPE".to_string(), endpoint.name().to_string()));
+        }
         #[cfg(unix)]
         let child = spawn_daemon(&spec, log, channel_end).map_err(|e| format!("cannot start {}: {e}", spec.program))?;
         #[cfg(not(unix))]
         let child = spawn_daemon(&spec, log).map_err(|e| format!("cannot start {}: {e}", spec.program))?;
+        let pid = child.id();
         // A relaunched app can then tell this daemon from one it did not launch (S35.2).
-        if let Err(error) = record_launch(&self.data_dir, child.id()) {
+        if let Err(error) = record_launch(&self.data_dir, pid) {
             eprintln!("gentle-dot: cannot record the assistant's pid: {error}");
         }
         *slot = Some(child);
+        // The child's creation time, so a recycled PID cannot pass the liveness check (W19).
+        #[cfg(windows)]
+        let started = process_started(pid);
+        // Never hold the child mutex while waiting on the pipe: `owns_running` locks it too.
+        drop(slot);
         // The daemon's end now lives only in the daemon.
         #[cfg(unix)]
         {
@@ -791,6 +804,24 @@ impl Daemon {
                         *self.channel.lock().unwrap() = Some(channel);
                     }
                     Err(error) => eprintln!("gentle-dot: cannot read the assistant's channel: {error}"),
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            if let (Some(endpoint), Some(handler)) = (endpoint, &self.handler) {
+                let deadline = Instant::now() + CHANNEL_ACCEPT_TIMEOUT;
+                // The recorded-creation-time liveness check (W19) needs no lock, so the accept never
+                // touches the child mutex it just released; a recycled PID fails the comparison.
+                match endpoint.accept(pid, move || started.is_some_and(|started| process_started(pid) == Some(started)), deadline) {
+                    Ok(connected) => match AppChannel::start(connected, handler.clone()) {
+                        Ok(channel) => {
+                            handler.opened(&channel);
+                            *self.channel.lock().unwrap() = Some(channel);
+                        }
+                        Err(error) => eprintln!("gentle-dot: cannot read the assistant's channel: {error}"),
+                    },
+                    Err(error) => eprintln!("gentle-dot: cannot open the assistant's channel: {error}"),
                 }
             }
         }
@@ -810,7 +841,6 @@ impl Daemon {
             stop_child(child.as_mut(), STOP_GRACE);
             forget_launch(&self.data_dir, child.id());
         }
-        #[cfg(unix)]
         if let Some(channel) = self.channel.lock().unwrap().take() {
             channel.close();
         }
@@ -833,11 +863,7 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
-    use crate::app_channel::{AppChannel, Handler};
-    use std::io::Write;
-    #[cfg(unix)]
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Write};
     #[cfg(unix)]
     use std::os::fd::{AsFd, AsRawFd};
     #[cfg(unix)]
@@ -1108,11 +1134,9 @@ IFS= read -r line <&3; printf '%s %s\\n' \"$kind\" \"$line\" >&3";
         assert_eq!(report["detectsALeak"], true, "{report}");
     }
 
-    #[cfg(unix)]
     #[derive(Default)]
     struct Opened(Mutex<usize>);
 
-    #[cfg(unix)]
     impl Handler for Opened {
         fn approve(&self, _: &crate::approvals::ApprovalRequest) -> bool {
             false
@@ -1140,6 +1164,59 @@ done"#;
         daemon.spawn().unwrap();
         let channel = daemon.channel().expect("a channel to the spawned daemon");
         assert_eq!(*handler.0.lock().unwrap(), 1);
+        let answer = channel.request("ping", serde_json::json!({}), Duration::from_secs(5)).unwrap();
+        assert_eq!(answer, serde_json::json!({"echo": 1}));
+        daemon.stop();
+        assert!(daemon.channel().is_none());
+        assert!(!channel.is_open());
+    }
+
+    /// The named-pipe peer fixture: dispatched by env var, a no-op in a normal run. It answers one
+    /// request with `{"echo": <id>}` over the pipe the app named in `GENTLE_DOT_CHANNEL_PIPE`.
+    #[cfg(windows)]
+    #[test]
+    fn windows_channel_echo_daemon_fixture() {
+        let Ok(role) = std::env::var("GENTLE_DOT_TEST_ECHO_ROLE") else { return };
+        if role != "daemon" {
+            return;
+        }
+        let name = std::env::var("GENTLE_DOT_CHANNEL_PIPE").expect("a pipe name");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut client = loop {
+            match std::fs::OpenOptions::new().read(true).write(true).open(&name) {
+                Ok(file) => break file,
+                Err(error) => {
+                    assert!(Instant::now() < deadline, "could not connect to the channel: {error}");
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+        };
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let frame: crate::app_channel::Frame = serde_json::from_str(&line).unwrap();
+        let crate::app_channel::Frame::Request { id, .. } = frame else { panic!("expected a request") };
+        let response = crate::app_channel::Frame::Response { id, result: Some(serde_json::json!({"echo": id})), error: None };
+        writeln!(client, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+    }
+
+    /// The Windows wiring: the endpoint is created before the spawn, `GENTLE_DOT_CHANNEL_PIPE`
+    /// reaches the child, the accepted connection's PID is the child's, and the channel is opened.
+    #[cfg(windows)]
+    #[test]
+    fn a_daemon_this_app_spawned_gets_a_named_pipe_channel_until_it_stops() {
+        let handler = Arc::new(Opened::default());
+        let spec = LaunchSpec {
+            program: std::env::current_exe().unwrap().display().to_string(),
+            args: vec!["--exact".into(), "daemon::tests::windows_channel_echo_daemon_fixture".into()],
+            envs: vec![("GENTLE_DOT_TEST_ECHO_ROLE".into(), "daemon".into())],
+        };
+        let daemon =
+            Daemon::new(0, scratch_dir("channel-pipe"), None).with_channel(handler.clone()).with_launch(spec);
+        assert!(daemon.channel().is_none());
+        daemon.spawn().unwrap();
+        let channel = daemon.channel().expect("a channel to the spawned daemon");
+        assert_eq!(*handler.0.lock().unwrap(), 1, "opened fired once");
         let answer = channel.request("ping", serde_json::json!({}), Duration::from_secs(5)).unwrap();
         assert_eq!(answer, serde_json::json!({"echo": 1}));
         daemon.stop();

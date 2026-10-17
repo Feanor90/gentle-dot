@@ -3,10 +3,7 @@
 //! the daemon lifecycle (design §9), and the app's private channel to the daemon (S25.1–S25.3).
 
 use crate::app_channel;
-#[cfg(unix)]
 use crate::app_channel::{AppChannel, NO_CHANNEL, REGISTER_TIMEOUT};
-#[cfg(not(unix))]
-use crate::app_channel::NO_CHANNEL_WINDOWS;
 use crate::approvals::{native::NativePrompt, ApprovalRequest, Approvals, Decision, APPROVAL_TIMEOUT};
 use crate::computer::app as computer;
 use crate::computer::server::Endpoint;
@@ -190,7 +187,6 @@ impl app_channel::Handler for ChannelService {
         Some(self.secrets.as_ref())
     }
 
-    #[cfg(unix)]
     fn opened(&self, channel: &Arc<AppChannel>) {
         let Some(endpoint) = self.computer.clone() else {
             return;
@@ -212,16 +208,8 @@ impl app_channel::Handler for ChannelService {
 async fn connector_command(app: AppHandle, client_id: String, message: serde_json::Value) -> CommandResult {
     let daemon = app.state::<Shell>().daemon.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(unix)]
-        {
-            let channel = daemon.channel().ok_or_else(|| NO_CHANNEL.to_string())?;
-            channel.command(&client_id, message)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (&daemon, &client_id, &message);
-            Err(NO_CHANNEL_WINDOWS.to_string())
-        }
+        let channel = daemon.channel().ok_or_else(|| NO_CHANNEL.to_string())?;
+        channel.command(&client_id, message)
     })
     .await
     .map_err(err)?
