@@ -11,6 +11,7 @@ import { McpClient, type McpError, StreamableHttpTransport, type Tool } from "@e
 import { APP_REQUIRED, type ServerMessage } from "@gentle-dot/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
+import { scopedIntegrityKeyId } from "../src/connector-integrity.ts";
 import { type DaemonOptions, type DotDaemon, startDaemon } from "../src/daemon.ts";
 import { FileSecretSource } from "../src/secret-file.ts";
 import { PIN_ATTEMPTS } from "../src/web-pin.ts";
@@ -291,7 +292,7 @@ describe("server mode: connector secrets encrypted at rest (S25.8)", () => {
 		expect(statSync(file).mode & 0o777).toBe(0o600);
 		expect(s.mcpText()).not.toContain(SIGNED_IN_TOKEN);
 		const ids = await new FileSecretSource({ file, key: s.key }).list();
-		expect(ids).toEqual(expect.arrayContaining(["integrity/connectors"]));
+		expect(ids).toEqual(expect.arrayContaining([scopedIntegrityKeyId(s.dataDir)]));
 		expect(ids.some((id) => id.startsWith("connector/notion"))).toBe(true);
 	});
 
