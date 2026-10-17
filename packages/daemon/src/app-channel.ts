@@ -14,7 +14,7 @@
  */
 import { type StdioOptions, spawnSync } from "node:child_process";
 import { closeSync, fstatSync } from "node:fs";
-import { Socket } from "node:net";
+import { connect, Socket } from "node:net";
 import type { Duplex } from "node:stream";
 
 /** Where the app puts its end of the channel. */
@@ -270,4 +270,15 @@ export function inheritedAppSocket(options: InheritedChannelOptions = {}): Socke
 export function openInheritedChannel(options: InheritedChannelOptions = {}): AppChannel | undefined {
 	const socket = inheritedAppSocket(options);
 	return socket ? new AppChannel(socket, options) : undefined;
+}
+
+/**
+ * The daemon's end of the Windows channel: the app creates the named pipe before it spawns the
+ * daemon and hands the name over in `GENTLE_DOT_CHANNEL_PIPE`, so the daemon connects to it. The
+ * name is not a secret; the app authenticates the daemon by the accepted connection's PID. Node
+ * buffers writes made before the connection completes, and a connection error closes the channel
+ * (the consumer is an {@link AppChannel}), so privileged actions fail closed when the app is gone.
+ */
+export function namedPipeSocket(path: string): Socket {
+	return connect({ path });
 }
