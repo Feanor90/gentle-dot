@@ -917,5 +917,49 @@ mod windows_tests {
             "FILE_FLAG_FIRST_PIPE_INSTANCE did not refuse a duplicate of the name"
         );
     }
+
+    /// The reported Windows defect: the direction's `OVERLAPPED` event is manual-reset and reused
+    /// for every transfer without `ResetEvent`, so a read issued after an earlier completion could
+    /// see the leftover signal, return `ERROR_IO_INCOMPLETE` immediately, and tear the direction
+    /// down after its first frame. This pins the invariant that claim denies, with the second read
+    /// *genuinely* pending (nothing is written for a while, so it cannot complete synchronously).
+    #[test]
+    fn a_second_pending_read_on_one_direction_still_waits_for_its_data() {
+        let (connected, client) = same_process_connected();
+        let channel = AppChannel::start(connected, Arc::new(Recording::default())).unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut writer = client;
+
+        // Transfer 1: the daemon answers, completing one read and signalling the shared event.
+        let waiting = std::thread::spawn({
+            let channel = channel.clone();
+            move || channel.request("ping", json!({}), Duration::from_secs(10))
+        });
+        let Frame::Request { id, .. } = read_frame(&mut reader) else { panic!("expected a request") };
+        write_frame(&mut writer, &Frame::Response { id, result: Some(json!({"ok": true})), error: None });
+        assert_eq!(waiting.join().unwrap(), Ok(json!({"ok": true})));
+
+        // Transfer 2: the next read is submitted with nothing to read, so it is pending while the
+        // event still carries the previous completion's signal.
+        std::thread::sleep(Duration::from_millis(250));
+        write_frame(
+            &mut writer,
+            &Frame::Request {
+                id: 77,
+                method: "approve".into(),
+                params: json!({"connector": "x", "action": "y", "preview": []}),
+            },
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(read_frame(&mut reader));
+        });
+        let frame = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the direction never answered the second request after its first frame");
+        let Frame::Response { id, result, .. } = frame else { panic!("expected a response") };
+        assert_eq!(id, 77);
+        assert_eq!(result, Some(json!({"approved": true})));
+    }
 }
 
