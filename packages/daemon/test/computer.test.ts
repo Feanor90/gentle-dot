@@ -134,13 +134,19 @@ async function restarted(d: DotDaemon, pid: number | undefined) {
 describe("computer control registration (S24.7)", () => {
 	it("registering on an install with no saved connectors is not reported as a blocked change", async () => {
 		const { send, logs, messages, servers, dataDir } = await setup();
+		const baseline = readFileSync(join(dataDir, "connectors.json"), "utf8");
+		expect(JSON.parse(baseline)).toEqual({
+			version: 2,
+			connectors: {},
+			mac: expect.stringMatching(/^[0-9a-f]{64}$/),
+		});
 		send({ type: "computer_register", url: HELPER, token: KEY });
 		await waitFor(() => servers().computer);
 		// Longer than the one-second backup check, so a late revert would show.
 		await new Promise((resolve) => setTimeout(resolve, 1300));
 		expect(logs.filter((line) => line.includes("put back"))).toEqual([]);
 		expect(messages.filter((m) => m.type === "toast")).toEqual([]);
-		expect(existsSync(join(dataDir, "connectors.json"))).toBe(false);
+		expect(readFileSync(join(dataDir, "connectors.json"), "utf8")).toBe(baseline);
 	});
 
 	it("renders the helper as a built-in direct server with the key in its header, and the key goes nowhere else", async () => {

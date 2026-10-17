@@ -300,6 +300,73 @@ describe("one signing key per data folder (S18)", () => {
 		}
 	}
 
+	it("restarting a never-configured folder does not report a deleted connectors file", async () => {
+		const dataDir = tempDir();
+		const source = new MemorySecretSource();
+		const firstLogs: string[] = [];
+		const first = await started(dataDir, source, firstLogs);
+		expect(first.notices).toEqual([]);
+		expect(first.store.state().connectors).toEqual({});
+		expect(firstLogs.join("\n")).not.toContain("signed before and is missing");
+		const key = await source.get(scopedIntegrityKeyId(dataDir));
+		expect(key).toMatch(/^[0-9a-f]{64}$/);
+		expect(readRecord(dataDir).connectors).toEqual({});
+		expect(validlySigned(dataDir, source.values)).toBe(true);
+		const initial = readFileSync(join(dataDir, "connectors.json"), "utf8");
+		first.store.close();
+
+		const logs: string[] = [];
+		const restarted = await started(dataDir, source, logs);
+		expect(restarted.notices).toEqual([]);
+		expect(restarted.store.state().connectors).toEqual({});
+		expect(logs.join("\n")).not.toContain("signed before and is missing");
+		expect(await source.get(scopedIntegrityKeyId(dataDir))).toBe(key);
+		expect(readFileSync(join(dataDir, "connectors.json"), "utf8")).toBe(initial);
+		expect(rejectedFiles(dataDir)).toEqual([]);
+	});
+
+	it("deleting a signed empty baseline still reports the real deletion", async () => {
+		const dataDir = tempDir();
+		const source = new MemorySecretSource();
+		const first = await started(dataDir, source);
+		const key = await source.get(scopedIntegrityKeyId(dataDir));
+		expect(validlySigned(dataDir, source.values)).toBe(true);
+		first.store.close();
+		rmSync(join(dataDir, "connectors.json"));
+		const logs: string[] = [];
+		const next = await started(dataDir, source, logs);
+		expect(next.notices).toEqual([MISSING_NOTICE]);
+		expect(logs).toEqual(["connectors.json was signed before and is missing; starting with no connectors"]);
+		expect(next.store.state().connectors).toEqual({});
+		expect(await source.get(scopedIntegrityKeyId(dataDir))).toBe(key);
+		expect(existsSync(join(dataDir, "connectors.json"))).toBe(false);
+	});
+
+	it("a failed initial signed baseline write reports an unchecked state without changing the blocked path", async () => {
+		const dataDir = tempDir();
+		const source = new MemorySecretSource();
+		const logs: string[] = [];
+		const opened = storeWith(dataDir, source, logs);
+		const blocked = join(dataDir, "connectors.json");
+		mkdirSync(blocked);
+		writeFileSync(join(blocked, "keep.txt"), "not the connector record");
+		await expect(opened.store.checkIntegrity()).resolves.toBeUndefined();
+		expect(opened.notices).toEqual([INTEGRITY_UNCHECKED]);
+		const key = await source.get(scopedIntegrityKeyId(dataDir));
+		await expect(opened.store.keepValues("discord", { token: TOKEN })).rejects.toMatchObject({
+			message: INTEGRITY_UNCHECKED,
+		});
+		expect(await source.get("connector/discord/value/token")).toBeUndefined();
+		expect(await source.get(scopedIntegrityKeyId(dataDir))).toBe(key);
+		expect(logs).toHaveLength(1);
+		expect(logs[0]).toContain(
+			"connectors.json could not be checked: its initial signed file could not be written",
+		);
+		expect(readFileSync(join(blocked, "keep.txt"), "utf8")).toBe("not the connector record");
+		expect(readdirSync(blocked)).toEqual(["keep.txt"]);
+		expect(opened.store.state().connectors).toEqual({});
+	});
+
 	it("a fresh folder with a legacy key in the store starts with no removal notice and its own key", async () => {
 		const dataDir = tempDir();
 		const source = new MemorySecretSource();
@@ -568,8 +635,9 @@ describe("one signing key per data folder (S18)", () => {
 		expect(otherKey).toMatch(/^[0-9a-f]{64}$/);
 		expect(otherKey).not.toBe(source.values.get(scopedIntegrityKeyId(own)));
 		expect(validlySigned(own, source.values)).toBe(true);
-		// Nothing was carried over: the other folder never even got a connectors.json.
-		expect(existsSync(join(other, "connectors.json"))).toBe(false);
+		// Only its own signed empty baseline is created; no connector or key is carried over.
+		expect(readRecord(other).connectors).toEqual({});
+		expect(validlySigned(other, source.values)).toBe(true);
 	});
 });
 

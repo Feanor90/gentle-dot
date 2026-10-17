@@ -856,6 +856,16 @@ export class ConnectorStore {
 			if (stored !== undefined || legacy !== undefined) {
 				this.log("connectors.json was signed before and is missing; starting with no connectors");
 				this.onSetAside(MISSING_NOTICE);
+			} else {
+				// The new key must have a signed baseline, even with no connectors. Otherwise the
+				// next start mistakes a never-created file for a deletion. Existing keys above
+				// still warn: an old empty install and a real deletion cannot be distinguished.
+				try {
+					mkdirSync(this.options.dataDir, { recursive: true, mode: 0o700 });
+					writePrivateFile(this.file, this.recordText());
+				} catch (error) {
+					cannot(`its initial signed file could not be written (${(error as Error).message})`);
+				}
 			}
 			return;
 		}
