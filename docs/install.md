@@ -120,14 +120,27 @@ Measured on Windows 11 x86_64: the app provisions `%USERPROFILE%\.gentle-dot`, s
 
 ### Build from source
 
+Building the Windows installers needs Node.js 24, pnpm, Rust with the MSVC toolchain, the Visual Studio Build Tools with the "Desktop development with C++" workload, and Go 1.25.10 or newer — `pnpm install` builds gentle-pi's Gentle AI binary from source on Windows, and so does the staging step.
+
 From the repository root:
 
 ```sh
 pnpm install
-pnpm --filter @gentle-dot/desktop build
+pnpm package:windows           # add --check to verify both installers (needs 7-Zip)
 ```
 
-`pnpm --filter @gentle-dot/desktop build` is a release build. With `apps/desktop/src-tauri/tauri.windows.conf.json`, the bundler writes an NSIS installer (`Gentle Dot_<version>_x64-setup.exe`) and an MSI (`Gentle Dot_<version>_x64_en-US.msi`) under `apps/desktop/src-tauri/target/release/bundle/`. The NSIS installer is per-user; the MSI is per-machine and needs an administrator. **Neither carries a Node runtime, the engine, or Engram yet** (that is a pending unit, W11), so there is **no self-contained Windows installer and no `pnpm package:windows`**.
+`pnpm package:windows` stages the app's runtime (`build/runtime/win-x64`: Node, the assistant engine, a fallback Engram, the daemon, and the web UI), then runs the release build and writes two **self-contained** installers under `apps/desktop/src-tauri/target/release/bundle/`:
+
+| Installer | File | Installs to | Needs |
+|---|---|---|---|
+| NSIS, per user | `nsis/Gentle Dot_<version>_x64-setup.exe` | `%LOCALAPPDATA%\Gentle Dot` | nothing |
+| MSI, per machine | `msi/Gentle Dot_<version>_x64_en-US.msi` | `Program Files\Gentle Dot` | an administrator |
+
+At version 0.1.0 they measure 79,267,489 bytes (75.6 MB) and 125,985,987 bytes (120.1 MB), because each carries the 317.9 MB runtime compressed. `--skip-stage` reuses a runtime staged earlier. `--check` verifies an installer before you trust it, and **installs nothing**: it extracts each payload, compares every one of the ~28,000 files against the staged runtime, checks the SHA-256 of six of them (the manifest, `node\node.exe`, `bin\pi.cmd`, `bin\engram.exe`, the daemon bundle, and the engine binary), and deletes the extractions.
+
+The app finds its runtime in `runtime\` beside `Gentle Dot.exe` (override with `GENTLE_DOT_RUNTIME_DIR`). **The installers are not signed** — there is no code-signing identity in this project yet — so Windows shows its "unrecognized app" warning.
+
+`pnpm --filter @gentle-dot/desktop build` still works and is a plain release build: it writes the same two installers, but **they do not carry the runtime**, which is what [docs/windows-testing.md](windows-testing.md) uses.
 
 You can also run the built app directly: `apps/desktop/src-tauri/target/release/gentle-dot.exe`.
 
@@ -137,6 +150,7 @@ You can also run the built app directly: `apps/desktop/src-tauri/target/release/
 |---|---|
 | Settings, conversations, logs (`daemon.log`), the access key (`token`), the engine's own home and workspace | `%USERPROFILE%\.gentle-dot` |
 | Connector secrets | `%LOCALAPPDATA%\Gentle Dot\secrets.dat` |
+| The installed app and its runtime (only if you used an installer) | `%LOCALAPPDATA%\Gentle Dot` (NSIS, per user) or `Program Files\Gentle Dot` (MSI, per machine) |
 | Installer output (build only) | `apps/desktop/src-tauri/target/release/bundle/` |
 
 The app itself never changes after it is built; everything it writes goes to the folders above.
@@ -158,14 +172,15 @@ The port is incomplete on purpose. Each item names the unit that carries it.
 - **Connectors that need a secret or an approval do not run yet** (W7). The private app-to-daemon channel is not on Windows yet, so the app cannot answer connector secret requests or show native connector/approval dialogs. The app says so rather than falling back to a file. Connectors without secrets keep working.
 - **Voice** (W12) and **computer control** (W13, macOS-only today) are not available.
 - **The panel's blur is gated and unverified** (W8d): the app asks for `Mica` only on Windows 11 (build ≥ 22000) with transparency effects on, a local session, and DWM composition on; otherwise the panel is opaque. Tauri gives no readback, so the blur can still silently fail even when those facts hold — the gate is the mitigation, and confirming it is the tester's visual check in [docs/windows-testing.md](windows-testing.md).
-- **There is no self-contained installer** (W11).
+
+Nothing else in the Windows install path is missing: the self-contained installer is built by `pnpm package:windows` (W11), its payload is verified, and the engine it carries is the project's own Go SumDB source build of the pinned Gentle AI module — unsigned, hash-pinned in `integrity.json`, and not an upstream release asset, because upstream stopped publishing unsigned Windows builds.
 
 For a step-by-step tester checklist, see [docs/windows-testing.md](windows-testing.md).
 
 ### Uninstall
 
 1. Quit Gentle Dot from the tray.
-2. If you built from source, delete the folder you built or the built app; if you installed the MSI, remove it from **Settings → Apps → Installed apps** (the NSIS installer has its own `uninstall.exe`).
+2. If you built from source, delete the folder you built or the built app; if you installed one of the installers, remove **Gentle Dot** from **Settings → Apps → Installed apps** (the NSIS installer writes its own `uninstall.exe` next to the app as well).
 3. Optional: delete `%USERPROFILE%\.gentle-dot` to remove settings and conversations.
 4. Optional: delete `%LOCALAPPDATA%\Gentle Dot` to remove `secrets.dat` and the connector secrets it holds.
 

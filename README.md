@@ -94,7 +94,7 @@ Attach files with the paperclip, drag and drop, or paste. Images go straight to 
 
 | Component | What it does |
 | :--- | :--- |
-| **Self-contained installers** | A macOS DMG and Linux `.deb` and Arch packages carry their own Node, engine, and Engram (the Windows installers do not yet) |
+| **Self-contained installers** | A macOS DMG, Linux `.deb` and Arch packages, and a Windows NSIS or MSI carry their own Node, engine, and Engram |
 | **Stable signing** | A self-signed identity keeps macOS permissions across updates |
 | **Isolated engine** | The assistant runs its own engine and home folder; it never touches your own agent setup |
 | **Web and server** | The same interface in the browser, and a Docker setup for your own VPS behind HTTPS, where the assistant runs as its own user, connector secrets are encrypted, and connector changes need your PIN |
@@ -106,7 +106,7 @@ Attach files with the paperclip, drag and drop, or paste. Images go straight to 
 
 ## Get started
 
-There are no published releases yet: build the installer for your system. There is no Windows package to install yet either. You need Node.js 24 and pnpm; the macOS app also needs Rust and the Xcode command line tools, the Linux packages need Docker, and the Windows app needs Rust with the MSVC toolchain, the Visual Studio Build Tools (C++ workload), WebView2, and Go 1.25.10 or newer.
+There are no published releases yet: build the installer for your system. You need Node.js 24 and pnpm; the macOS app also needs Rust and the Xcode command line tools, the Linux packages need Docker, and the Windows installers need Rust with the MSVC toolchain, the Visual Studio Build Tools (C++ workload), WebView2, and Go 1.25.10 or newer.
 
 ```sh
 pnpm install
@@ -118,12 +118,11 @@ pnpm package:mac
 pnpm package:linux --arch arm64
 pnpm package:linux --arch amd64
 
-# Windows 10/11 (x86_64): builds the app and its NSIS/MSI installers, which do not
-# yet carry Node, the engine, or Engram
-pnpm --filter @gentle-dot/desktop build
+# Windows 10/11 (x86_64): stages the runtime and writes a self-contained NSIS and MSI
+pnpm package:windows            # add --check to verify both payloads, which needs 7-Zip
 ```
 
-Then follow **[docs/install.md](docs/install.md)**: opening an unsigned app on macOS 15 and later goes through **System Settings → Privacy & Security → Open Anyway**, and the guide covers permissions, where your data lives, and uninstalling. Windows support is in progress: it builds and runs, but connectors that need a secret or an approval, voice, and computer control are not there yet. See **[docs/install.md](docs/install.md)** for the Windows section and **[docs/windows-testing.md](docs/windows-testing.md)** for the tester checklist.
+Then follow **[docs/install.md](docs/install.md)**: opening an unsigned app on macOS 15 and later goes through **System Settings → Privacy & Security → Open Anyway**, the Windows installers are unsigned too so Windows shows its own warning, and the guide covers permissions, where your data lives, and uninstalling. Windows support is in progress: it builds and runs, but connectors that need a secret or an approval, voice, and computer control are not there yet. See **[docs/install.md](docs/install.md)** for the Windows section and **[docs/windows-testing.md](docs/windows-testing.md)** for the tester checklist.
 
 Prefer to run it from the source?
 

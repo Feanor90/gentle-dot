@@ -2,7 +2,7 @@
 
 Thanks for testing! This guide walks you through building Gentle Dot from source on Windows 10 or Windows 11 (x86_64) and checking that it works. Building and running takes about 30 minutes, most of it the first build.
 
-There is **no package to install yet**: the Windows port is in progress, so this checklist is source-only. Several features are not there yet, and they are marked **not yet on Windows** instead of being presented as if they work. The expected results below are what the app should do; a few checks have already been measured on Windows 11 and say so. Where a step is pending, write **N/A** and note what happened.
+This checklist is **source-only**: it runs the app you just built, not an installed one. A self-contained installer now exists (`pnpm package:windows`, see [docs/install.md](install.md)) and its payload is verified file by file, but no one has installed it on a machine yet, so installing it is deliberately **not** a step here — build and run instead. Several features are not there yet, and they are marked **not yet on Windows** instead of being presented as if they work. The expected results below are what the app should do; a few checks have already been measured on Windows 11 and say so. Where a step is pending, write **N/A** and note what happened.
 
 ## Before you start
 
@@ -37,7 +37,7 @@ pnpm install
 pnpm --filter @gentle-dot/desktop build
 ```
 
-The second command is a release build. With `apps/desktop/src-tauri/tauri.windows.conf.json`, the bundler also writes two installers under `apps/desktop/src-tauri/target/release/bundle/`: an NSIS per-user installer (`Gentle Dot_<version>_x64-setup.exe`) and an MSI per-machine installer (`Gentle Dot_<version>_x64_en-US.msi`). **Neither carries a Node runtime, the engine, or Engram yet**, so they are not self-contained, there is no `pnpm package:windows`, and you should not install them for this checklist. Run the built app directly instead:
+The second command is a release build. With `apps/desktop/src-tauri/tauri.windows.conf.json`, the bundler also writes two installers under `apps/desktop/src-tauri/target/release/bundle/`: an NSIS per-user installer (`Gentle Dot_<version>_x64-setup.exe`) and an MSI per-machine installer (`Gentle Dot_<version>_x64_en-US.msi`). This plain build does **not** put the app's runtime in them; `pnpm package:windows` is what stages the runtime and writes the self-contained pair (see [docs/install.md](install.md)). This checklist runs the app directly, so do not install either artifact here:
 
 ```sh
 apps/desktop/src-tauri/target/release/gentle-dot.exe
