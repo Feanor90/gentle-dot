@@ -284,6 +284,22 @@ describe("one signing key per data folder (S18)", () => {
 		}
 	}
 
+	/** Runs `run` with the process home (`~`) set to `home`, so `~/.gentle-dot` is the real default. */
+	async function withHome<T>(home: string, run: () => Promise<T>): Promise<T> {
+		const savedHome = process.env.HOME;
+		const savedProfile = process.env.USERPROFILE;
+		process.env.HOME = home;
+		process.env.USERPROFILE = home;
+		try {
+			return await run();
+		} finally {
+			if (savedHome === undefined) delete process.env.HOME;
+			else process.env.HOME = savedHome;
+			if (savedProfile === undefined) delete process.env.USERPROFILE;
+			else process.env.USERPROFILE = savedProfile;
+		}
+	}
+
 	it("a fresh folder with a legacy key in the store starts with no removal notice and its own key", async () => {
 		const dataDir = tempDir();
 		const source = new MemorySecretSource();
@@ -302,11 +318,37 @@ describe("one signing key per data folder (S18)", () => {
 		expect(validlySigned(dataDir, source.values)).toBe(true);
 	});
 
-	it("the legacy key still warns about a deleted file, but only in the default folder", async () => {
+	it("an override folder is never the default folder for the legacy missing-file notice", async () => {
 		const dataDir = tempDir();
 		const source = new MemorySecretSource();
 		source.values.set(INTEGRITY_KEY_ID, "cd".repeat(32));
+		const logs: string[] = [];
 		await withDefault(dataDir, async () => {
+			const { notices } = await started(dataDir, source, logs);
+			expect(notices).toEqual([]);
+		});
+		expect(logs.join("\n")).not.toContain("signed before and is missing");
+	});
+
+	it("an override that IS the home default keeps the legacy missing-file notice", async () => {
+		const source = new MemorySecretSource();
+		source.values.set(INTEGRITY_KEY_ID, "cd".repeat(32));
+		const home = tempDir();
+		const dataDir = join(home, ".gentle-dot");
+		await withHome(home, async () => {
+			await withDefault(dataDir, async () => {
+				const { notices } = await started(dataDir, source);
+				expect(notices).toEqual([MISSING_NOTICE]);
+			});
+		});
+	});
+
+	it("the legacy key still warns about a deleted file, but only in the real default folder", async () => {
+		const source = new MemorySecretSource();
+		source.values.set(INTEGRITY_KEY_ID, "cd".repeat(32));
+		const home = tempDir();
+		const dataDir = join(home, ".gentle-dot");
+		await withHome(home, async () => {
 			const { notices } = await started(dataDir, source);
 			expect(notices).toEqual([MISSING_NOTICE]);
 		});
@@ -315,7 +357,7 @@ describe("one signing key per data folder (S18)", () => {
 		expect(fresh.notices).toEqual([]);
 	});
 
-	it("a legacy-signed file in the default folder verifies and its key is copied to the folder's entry", async () => {
+	it("a legacy-signed file in an override folder verifies and its key is copied to the folder's entry", async () => {
 		const dataDir = tempDir();
 		const source = new MemorySecretSource();
 		const legacy = "ef".repeat(32);

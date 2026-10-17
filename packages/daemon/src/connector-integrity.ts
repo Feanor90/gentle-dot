@@ -46,13 +46,15 @@ export function scopedIntegrityKeyId(dataDir: string): string {
 }
 
 /**
- * True when `dataDir` is the folder this installation uses by default (the env override included):
- * the only folder whose MISSING file the legacy id's key can be attributed to. A file that is there
- * is checked against the legacy key in any folder, as older versions signed every folder with it.
+ * True when `dataDir` is the folder this installation uses when nothing overrides it: the one
+ * real home default (`~/.gentle-dot`). A `GENTLE_DOT_DATA_DIR` override is deliberately NOT it: any
+ * fresh or second installation can set one, so only the home default's MISSING file may be
+ * attributed to the legacy key. A file that is there is checked against the legacy key in any
+ * folder, as older versions signed every folder with it.
  */
 export function isDefaultDataDir(dataDir: string, env: NodeJS.ProcessEnv = process.env): boolean {
 	const own = realPath(dataDir);
-	const def = realPath(defaultDataDir(env));
+	const def = realPath(defaultDataDir({ ...env, GENTLE_DOT_DATA_DIR: undefined }));
 	return process.platform === "win32" ? own.toLowerCase() === def.toLowerCase() : own === def;
 }
 
