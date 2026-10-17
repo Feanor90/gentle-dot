@@ -29,6 +29,7 @@ import {
 	engramArchiveName,
 	engramReleaseVersion,
 	formatSize,
+	gentleAiProvenance,
 	nodeArchiveName,
 	nodeVersion,
 	npmWrapper,
@@ -254,7 +255,7 @@ function installDaemonModules(out, target) {
 		.filter((line) => /Gentle AI|gentle-pi/.test(line) && !/^>/.test(line.trim()));
 	const gentleAi = openGentleAi(daemon);
 	say(`  gentle-pi postinstall: ${postinstall.join(" | ") || "(no output)"}`);
-	say(`  gentle-ai ${gentleAi.version} from ${gentleAi.asset} (sha256 ${gentleAi.assetSha256})`);
+	say(`  gentle-ai ${gentleAi.version} ${gentleAiProvenance(gentleAi)}`);
 	const pkg = (name) =>
 		JSON.parse(readFileSync(join(daemon, "node_modules", name, "package.json"), "utf8")).version;
 	return {
