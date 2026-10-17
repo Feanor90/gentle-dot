@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // Prepares the runtime's packaged companions (S17, odd/tasks/windows-support.md T8e2-B1): a real
 // `gentle-shell --home <dir> setup` of the staged gentle-pi, run with the staged Node in a
-// throwaway sandbox, checked, then copied to `<out>/agent-home` with `<out>/manifest.json` last.
+// throwaway sandbox, each companion then reinstalled at its pinned version with
+// `gentle-shell --home <dir> install npm:<name>@<version>`, checked, then copied to
+// `<out>/agent-home` with `<out>/manifest.json` last.
 // `node scripts/package/companions.mjs <daemon-dir> <node-executable> <out-companions-dir>`.
 import { spawnSync } from "node:child_process";
 import {
@@ -16,7 +18,12 @@ import {
 } from "node:fs";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { companionsSetupEnv, validateCompanionsTemplate } from "./lib.mjs";
+import {
+	COMPANION_VERSIONS,
+	checkCompanionPins,
+	companionsSetupEnv,
+	validateCompanionsTemplate,
+} from "./lib.mjs";
 
 const REPO = fileURLToPath(new URL("../..", import.meta.url));
 const CACHE = join(REPO, ".cache", "package");
@@ -55,6 +62,23 @@ async function bundledVersions(gentlePi) {
 	return { gentlePi: version, gentleAi: GENTLE_AI_VERSION };
 }
 
+/** Runs `gentle-shell --home <home> <command...>` of the staged gentle-pi in the sandbox. */
+function gentleShell(gentlePi, node, sandbox, env, home, command) {
+	const name = `gentle-shell ${command.join(" ")}`;
+	const result = spawnSync(node, [join(gentlePi, "bin", "gentle-shell.mjs"), "--home", home, ...command], {
+		cwd: sandbox,
+		env,
+		stdio: ["ignore", "inherit", "inherit"],
+		timeout: SETUP_TIMEOUT_MS,
+		windowsHide: true,
+	});
+	if (result.error?.code === "ETIMEDOUT")
+		throw new Error(`${name} did not finish within ${SETUP_TIMEOUT_MS / 60_000} minutes.`);
+	if (result.error) throw new Error(`${name} failed (${result.error.message}).`);
+	if (result.signal) throw new Error(`${name} failed (signal ${result.signal}).`);
+	if (result.status !== 0) throw new Error(`${name} failed (exit ${result.status}).`);
+}
+
 function setUp(daemon, gentlePi, node, sandbox) {
 	const env = companionsSetupEnv({
 		platform: process.platform,
@@ -71,18 +95,10 @@ function setUp(daemon, gentlePi, node, sandbox) {
 	mkdirSync(dirname(env.GENTLE_SHELL_CONFIG), { recursive: true });
 	writeFileSync(env.npm_config_userconfig, "");
 	const home = join(sandbox, "agent-home");
-	const result = spawnSync(node, [join(gentlePi, "bin", "gentle-shell.mjs"), "--home", home, "setup"], {
-		cwd: sandbox,
-		env,
-		stdio: ["ignore", "inherit", "inherit"],
-		timeout: SETUP_TIMEOUT_MS,
-		windowsHide: true,
-	});
-	if (result.error?.code === "ETIMEDOUT")
-		throw new Error(`gentle-shell setup did not finish within ${SETUP_TIMEOUT_MS / 60_000} minutes.`);
-	if (result.error) throw new Error(`gentle-shell setup failed (${result.error.message}).`);
-	if (result.signal) throw new Error(`gentle-shell setup failed (signal ${result.signal}).`);
-	if (result.status !== 0) throw new Error(`gentle-shell setup failed (exit ${result.status}).`);
+	gentleShell(gentlePi, node, sandbox, env, home, ["setup"]);
+	// Setup installs the registry's latest companions; the runtime ships the pinned ones (S17).
+	for (const [name, version] of Object.entries(COMPANION_VERSIONS))
+		gentleShell(gentlePi, node, sandbox, env, home, ["install", `npm:${name}@${version}`]);
 	return home;
 }
 
@@ -98,7 +114,8 @@ async function main() {
 	let created = false;
 	try {
 		const home = setUp(daemon, gentlePi, node, sandbox);
-		const companions = validateCompanionsTemplate(home, sandbox);
+		validateCompanionsTemplate(home, sandbox);
+		const companions = checkCompanionPins(home, COMPANION_VERSIONS);
 		mkdirSync(out, { recursive: true });
 		created = true;
 		cpSync(home, join(out, "agent-home"), { recursive: true, errorOnExist: true, force: false });

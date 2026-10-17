@@ -182,6 +182,8 @@ export function companionsSetupEnv({ platform, sandbox, runtimeBin, nodeBin, git
 		LOCALAPPDATA: path.join(home, "AppData", "Local"),
 		...(platform === "win32" ? { TEMP: temp, TMP: temp } : { TMPDIR: temp }),
 		npm_config_prefix: path.join(sandbox, "npm-prefix"),
+		// npm records `npm:<name>@<version>` installs as `<version>`, not `^<version>`.
+		npm_config_save_exact: "true",
 		GENTLE_SHELL_CONFIG: path.join(sandbox, "gentle-shell", "config.json"),
 		GENTLE_PI_CONFIG_HOME: path.join(sandbox, "gentle-ai"),
 		ENGRAM_DATA_DIR: path.join(sandbox, "engram"),
@@ -216,6 +218,60 @@ export function installedCompanions(npmDir) {
 		versions[name] = version;
 	}
 	return versions;
+}
+
+/**
+ * The exact companion versions the Windows runtime ships (S17): gentle-shell setup installs the
+ * registry's latest, so staging reinstalls each at this version and refuses any other.
+ */
+export const COMPANION_VERSIONS = Object.freeze({
+	"gentle-engram": "0.4.2",
+	"pi-btw": "0.8.0",
+	"pi-web-access": "0.41.0",
+});
+
+/** The package name of a `npm:<name>[@<version>]` source, or undefined for any other source. */
+function npmSourceName(source) {
+	if (typeof source !== "string" || !source.startsWith("npm:")) return undefined;
+	return source.slice(4).match(/^(@?[^@]+(?:\/[^@]+)?)(?:@.+)?$/)?.[1];
+}
+
+/**
+ * Throws unless the template at `home` holds exactly the `pins` companions at their versions:
+ * settings.json lists only `npm:<name>@<version>` for them, npm/package.json asks for that exact
+ * version, and the lockfile records it installed, with no unpinned companion beside them.
+ * Returns the installed companion versions.
+ */
+export function checkCompanionPins(home, pins) {
+	const read = (rel) => {
+		try {
+			return JSON.parse(readFileSync(join(home, rel), "utf8"));
+		} catch (error) {
+			throw new Error(`The companion template's ${rel} is unreadable: ${error.message}`);
+		}
+	};
+	const problems = [];
+	const { packages = [] } = read("settings.json");
+	const sources = packages.map((entry) => (typeof entry === "string" ? entry : entry?.source));
+	for (const [name, version] of Object.entries(pins)) {
+		const want = `npm:${name}@${version}`;
+		const listed = sources.filter((source) => npmSourceName(source) === name);
+		if (listed.length === 0) problems.push(`settings.json does not list ${want}`);
+		for (const source of listed)
+			if (source !== want) problems.push(`settings.json lists ${source}, not ${want}`);
+	}
+	const { dependencies = {} } = read("npm/package.json");
+	for (const [name, version] of Object.entries(pins))
+		if (dependencies[name] === undefined) problems.push(`npm/package.json does not ask for ${name}`);
+		else if (dependencies[name] !== version)
+			problems.push(`npm/package.json asks for ${name} ${dependencies[name]}, not ${version}`);
+	const installed = installedCompanions(join(home, "npm"));
+	for (const [name, version] of Object.entries(installed))
+		if (!Object.hasOwn(pins, name)) problems.push(`${name} ${version} is installed but not pinned`);
+		else if (version !== pins[name]) problems.push(`${name} ${version} is installed, not ${pins[name]}`);
+	if (problems.length > 0)
+		throw new Error(`The companion template does not match its pinned versions: ${problems.join("; ")}.`);
+	return installed;
 }
 
 /**

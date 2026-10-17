@@ -91,6 +91,7 @@ describe("companionsSetupEnv", () => {
 			npm_config_cache: win32.join(sandbox, "npm-cache"),
 			npm_config_userconfig: win32.join(sandbox, "npmrc"),
 			npm_config_prefix: win32.join(sandbox, "npm-prefix"),
+			npm_config_save_exact: "true",
 			npm_config_registry: "https://registry.npmjs.org/",
 			npm_config_update_notifier: "false",
 			GENTLE_SHELL_CONFIG: win32.join(sandbox, "gentle-shell", "config.json"),
@@ -237,9 +238,13 @@ describe("validateCompanionsTemplate", () => {
 	});
 });
 
-type Mode = "ok" | "fail" | "leftover";
+type Mode = "ok" | "fail" | "leftover" | "drift";
 
-/** A daemon folder whose gentle-shell is a stand-in: it records how it ran, then prepares (or fails) the home. */
+/**
+ * A daemon folder whose gentle-shell is a stand-in: `setup` records how it ran, then prepares (or
+ * fails) the home with the registry's latest companions, unpinned; `install npm:<name>@<version>`
+ * logs its call and installs that version, or ("drift") reports success and keeps the latest.
+ */
 function fakeDaemon(mode: Mode) {
 	const root = fixture();
 	const gentlePi = join(root, "daemon", "node_modules", "gentle-pi");
@@ -247,19 +252,38 @@ function fakeDaemon(mode: Mode) {
 	write(join(gentlePi, "runtime", "gentle-ai-binary.mjs"), 'export const GENTLE_AI_VERSION = "6.5.4";\n');
 	write(
 		join(gentlePi, "bin", "gentle-shell.mjs"),
-		`import { mkdirSync, writeFileSync } from "node:fs";
+		`import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 const args = process.argv.slice(2);
-writeFileSync(${JSON.stringify(join(root, "dump.json"))}, JSON.stringify({ args, env: process.env, cwd: process.cwd() }));
 const home = args[args.indexOf("--home") + 1];
 const put = (rel, text) => {
 	mkdirSync(join(home, rel, ".."), { recursive: true });
 	writeFileSync(join(home, rel), text);
 };
+const get = (rel) => JSON.parse(readFileSync(join(home, rel), "utf8"));
+if (args[2] === "install") {
+	appendFileSync(${JSON.stringify(join(root, "installs.log"))}, JSON.stringify({ args, saveExact: process.env.npm_config_save_exact }) + "\\n");
+	const [, name, version] = args[3].match(/^npm:(.+)@(.+)$/);
+	if (${JSON.stringify(mode)} !== "drift") {
+		const settings = get("settings.json");
+		settings.packages = settings.packages.map((p) => (p === "npm:" + name ? args[3] : p));
+		put("settings.json", JSON.stringify(settings));
+		const pkg = get("npm/package.json");
+		pkg.dependencies[name] = version;
+		put("npm/package.json", JSON.stringify(pkg));
+		const lock = get("npm/package-lock.json");
+		lock.packages["node_modules/" + name] = { version };
+		put("npm/package-lock.json", JSON.stringify(lock));
+	}
+	console.log("Installed " + args[3]);
+	process.exit(0);
+}
+writeFileSync(${JSON.stringify(join(root, "dump.json"))}, JSON.stringify({ args, env: process.env, cwd: process.cwd() }));
+const latest = { "gentle-engram": "0.4.2", "pi-btw": "0.8.0", "pi-web-access": "0.42.0" };
 put(".gentle-shell-home", "owned\\n");
-put("settings.json", JSON.stringify({ packages: ["npm:gentle-engram"] }));
-put("npm/package.json", JSON.stringify({ dependencies: { "gentle-engram": "0.4.2" } }));
-put("npm/package-lock.json", JSON.stringify({ packages: { "node_modules/gentle-engram": { version: "0.4.2" } } }));
+put("settings.json", JSON.stringify({ packages: Object.keys(latest).map((name) => "npm:" + name) }));
+put("npm/package.json", JSON.stringify({ dependencies: Object.fromEntries(Object.entries(latest).map(([n, v]) => [n, "^" + v])) }));
+put("npm/package-lock.json", JSON.stringify({ packages: Object.fromEntries(Object.entries(latest).map(([n, v]) => ["node_modules/" + n, { version: v }])) }));
 put("npm/node_modules/gentle-engram/index.js", "export {};\\n");
 ${mode === "leftover" ? 'put("npm/node_modules/gentle-pi/package.json", "{}");' : ""}
 console.log("fake setup done");
@@ -285,7 +309,9 @@ describe("companions CLI", () => {
 		expect(result.status).toBe(0);
 		expect(result.stdout).toContain("fake setup done\n");
 		expect(
-			result.stdout.endsWith("Companions: gentle-pi 9.8.7, Gentle AI 6.5.4; gentle-engram 0.4.2\n"),
+			result.stdout.endsWith(
+				"Companions: gentle-pi 9.8.7, Gentle AI 6.5.4; gentle-engram 0.4.2, pi-btw 0.8.0, pi-web-access 0.41.0\n",
+			),
 		).toBe(true);
 		expect(readFileSync(join(out, "manifest.json"), "utf8")).toBe(
 			`${JSON.stringify({ schema: 1, gentlePi: "9.8.7", gentleAi: "6.5.4" }, null, "\t")}\n`,
@@ -312,6 +338,49 @@ describe("companions CLI", () => {
 		expect(path[0]).toBe(join(dirname(daemon), "bin"));
 		expect(path[1]).toBe(dirname(process.execPath));
 		expect(existsSync(sandbox)).toBe(false);
+		expect(sandboxes()).toEqual(before);
+	});
+
+	it("installs every companion at its pinned version and refuses a later registry version", () => {
+		const pinned = { root: "", out: "" };
+		{
+			const { root, daemon, out } = fakeDaemon("ok");
+			const result = cli(daemon, process.execPath, out);
+			expect(result.stderr).toBe("");
+			expect(result.status).toBe(0);
+			Object.assign(pinned, { root, out });
+		}
+		const home = JSON.parse(readFileSync(join(pinned.root, "dump.json"), "utf8")).args[1];
+		const installs = readFileSync(join(pinned.root, "installs.log"), "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		expect(installs).toEqual(
+			["npm:gentle-engram@0.4.2", "npm:pi-btw@0.8.0", "npm:pi-web-access@0.41.0"].map((spec) => ({
+				args: ["--home", home, "install", spec],
+				saveExact: "true",
+			})),
+		);
+		const staged = (rel: string) => JSON.parse(readFileSync(join(pinned.out, "agent-home", rel), "utf8"));
+		expect(staged("settings.json").packages).toEqual([
+			"npm:gentle-engram@0.4.2",
+			"npm:pi-btw@0.8.0",
+			"npm:pi-web-access@0.41.0",
+		]);
+		expect(staged("npm/package.json").dependencies).toEqual({
+			"gentle-engram": "0.4.2",
+			"pi-btw": "0.8.0",
+			"pi-web-access": "0.41.0",
+		});
+
+		const before = sandboxes();
+		const { daemon, out } = fakeDaemon("drift");
+		const result = cli(daemon, process.execPath, out);
+		expect(result.status).toBe(1);
+		expect(result.stderr).toBe(
+			"companions: The companion template does not match its pinned versions: settings.json lists npm:gentle-engram, not npm:gentle-engram@0.4.2; settings.json lists npm:pi-btw, not npm:pi-btw@0.8.0; settings.json lists npm:pi-web-access, not npm:pi-web-access@0.41.0; npm/package.json asks for gentle-engram ^0.4.2, not 0.4.2; npm/package.json asks for pi-btw ^0.8.0, not 0.8.0; npm/package.json asks for pi-web-access ^0.42.0, not 0.41.0; pi-web-access 0.42.0 is installed, not 0.41.0.\n",
+		);
+		expect(existsSync(out)).toBe(false);
 		expect(sandboxes()).toEqual(before);
 	});
 
