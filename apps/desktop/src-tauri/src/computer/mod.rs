@@ -22,6 +22,7 @@ pub mod risk;
 pub mod server;
 pub mod session;
 pub mod windows;
+pub mod working;
 
 use blocklist::AppIdentity;
 use coords::{Point, ScreenshotGeometry};
