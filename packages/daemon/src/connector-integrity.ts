@@ -18,12 +18,21 @@ import { defaultDataDir } from "./config.ts";
 /** The secret id of the signing key before data folders got their own (kept for migration). */
 export const INTEGRITY_KEY_ID = "integrity/connectors";
 
-/** `path` as it exists on disk, or resolved when it does not (yet). */
+/**
+ * `path` as it exists on disk, or resolved when it does not (yet). The native call returns the
+ * name the file system stores, so a folder that a case-insensitive file system (Windows, macOS by
+ * default) lets you spell in any case still has one identity; the JavaScript one keeps the case it
+ * was given.
+ */
 function realPath(path: string): string {
 	try {
-		return realpathSync(path);
+		return realpathSync.native(path);
 	} catch {
-		return resolve(path);
+		try {
+			return realpathSync(path);
+		} catch {
+			return resolve(path);
+		}
 	}
 }
 

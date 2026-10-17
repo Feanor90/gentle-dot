@@ -469,6 +469,33 @@ describe("one signing key per data folder (S18)", () => {
 		expect(rejectedFiles(dataDir)).toEqual([]);
 	});
 
+	// On a file system that ignores case (Windows, macOS by default) one folder has many spellings.
+	const caseInsensitive = (() => {
+		const probe = join(tempDir(), "CaseProbe");
+		mkdirSync(probe);
+		return existsSync(probe.replace("CaseProbe", "caseprobe"));
+	})();
+
+	it.runIf(caseInsensitive)(
+		"the same folder spelled in another case keeps its key and its file",
+		async () => {
+			const dataDir = join(tempDir(), "DotData");
+			mkdirSync(dataDir);
+			const respelled = dataDir.replace("DotData", "dotdata");
+			expect(scopedIntegrityKeyId(respelled)).toBe(scopedIntegrityKeyId(dataDir));
+			const source = new MemorySecretSource();
+			const { store } = await started(dataDir, source);
+			store.update((state) => {
+				state.connectors.plain = { enabled: true, mode: "read_only", custom: PLAIN };
+			});
+			store.close();
+			const again = await started(respelled, source);
+			expect(again.notices).toEqual([]);
+			expect(rejectedFiles(dataDir)).toEqual([]);
+			expect(Object.keys(again.store.state().connectors)).toEqual(["plain"]);
+		},
+	);
+
 	it("one folder's key never applies to another folder sharing the store", async () => {
 		const { dataDir: own, source } = await signedInstall();
 		const other = tempDir();
