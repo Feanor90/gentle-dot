@@ -222,12 +222,58 @@ export async function privateMemory(
 	};
 }
 
-/** The one PID listening on `port` on this computer (`lsof`), if any. */
-function listeningPid(port: string): Promise<number | undefined> {
+/**
+ * The command that lists the local PIDs listening on a TCP `port`. POSIX answers with `lsof`, which
+ * filters by the port itself. Windows has no `lsof` and answers with `netstat -ano`, whose rows
+ * carry the state and PID that `netstatListeningPids` reads. The platform only decides the command.
+ */
+export function listenerCommand(
+	port: string,
+	platform: NodeJS.Platform = process.platform,
+): { command: string; args: string[] } {
+	if (platform === "win32") return { command: "netstat", args: ["-ano"] };
+	return { command: "lsof", args: ["-t", "-n", "-P", `-iTCP:${port}`, "-sTCP:LISTEN"] };
+}
+
+/**
+ * The PIDs `netstat -ano` reports as listening on `port`, deduplicated. Each row is
+ * `Proto  Local Address  Foreign Address  State  PID`: only a `LISTENING` row whose local address
+ * ends in `:<port>` counts, and the PID is the last field. One listener commonly appears once per
+ * address family (`0.0.0.0:<port>` and `[::]:<port>`), so the set collapses them to one PID. Empty
+ * output, no matching row, and a matching port in another state all answer with no PID.
+ */
+export function netstatListeningPids(stdout: string, port: string): number[] {
+	const pids = new Set<number>();
+	for (const line of stdout.split(/\r?\n/)) {
+		const fields = line.trim().split(/\s+/);
+		if (fields.length < 5) continue;
+		const [, localAddress, , state] = fields;
+		const pid = fields[fields.length - 1];
+		if (state !== "LISTENING") continue;
+		if (!localAddress?.endsWith(`:${port}`)) continue;
+		if (!/^\d+$/.test(pid ?? "")) continue;
+		pids.add(Number(pid));
+	}
+	return [...pids];
+}
+
+/** The one PID listening on `port` on this computer (`lsof` on POSIX, `netstat -ano` on Windows). */
+function listeningPid(
+	port: string,
+	platform: NodeJS.Platform = process.platform,
+): Promise<number | undefined> {
 	return new Promise((resolve) => {
-		execFile("lsof", ["-t", "-n", "-P", `-iTCP:${port}`, "-sTCP:LISTEN"], (error, stdout) => {
-			const pids = [...new Set(String(stdout).trim().split("\n").filter(Boolean))];
-			resolve(!error && pids.length === 1 && /^\d+$/.test(pids[0] ?? "") ? Number(pids[0]) : undefined);
+		const { command, args } = listenerCommand(port, platform);
+		execFile(command, args, (error, stdout) => {
+			if (error) {
+				resolve(undefined);
+				return;
+			}
+			const pids: (number | string)[] =
+				platform === "win32"
+					? netstatListeningPids(String(stdout), port)
+					: [...new Set(String(stdout).trim().split("\n").filter(Boolean))];
+			resolve(pids.length === 1 && /^\d+$/.test(String(pids[0])) ? Number(pids[0]) : undefined);
 		});
 	});
 }
