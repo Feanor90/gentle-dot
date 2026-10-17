@@ -6,6 +6,7 @@ import {
 	readdirSync,
 	readFileSync,
 	realpathSync,
+	statSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
@@ -13,6 +14,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
 import { tempDir } from "./helpers.ts";
+import { directoryLinkType, symlinkDirectory } from "./support/fixture-capabilities.ts";
 import { expectPosixExecutable } from "./support/posix-modes.ts";
 
 const PACKAGE = fileURLToPath(new URL("..", import.meta.url));
@@ -27,6 +29,38 @@ beforeAll(() => {
 	expect(build.stderr).toBe("");
 	expect(build.status).toBe(0);
 }, 60_000);
+
+/**
+ * Puts `PACKAGE/node_modules` beside the output's `cli.mjs` so the self-check resolves the engine.
+ * One directory link does not port: on a plain Windows install `symlinkSync` needs the symlink
+ * privilege, and a **junction** to this pnpm layout does not resolve either — Node cannot follow a
+ * dependency that is itself a symlink when it is reached through a junction (measured on Windows
+ * 11, Node 24). Windows therefore gets a real folder holding one junction per dependency, each
+ * pointing at the dependency's real path, so nothing under the output is a symlink to follow.
+ */
+function linkNodeModules(out: string): void {
+	const link = join(out, "daemon", "node_modules");
+	const source = join(PACKAGE, "node_modules");
+	if (process.platform !== "win32") {
+		symlinkDirectory(source, link);
+		return;
+	}
+	mkdirSync(link, { recursive: true });
+	for (const entry of readdirSync(source, { withFileTypes: true })) {
+		if (entry.name === ".bin") continue;
+		const from = join(source, entry.name);
+		if (entry.name.startsWith("@")) {
+			mkdirSync(join(link, entry.name));
+			for (const sub of readdirSync(from)) {
+				const real = realpathSync(join(from, sub));
+				if (statSync(real).isDirectory()) symlinkSync(real, join(link, entry.name, sub), directoryLinkType());
+			}
+		} else {
+			const real = realpathSync(from);
+			if (statSync(real).isDirectory()) symlinkSync(real, join(link, entry.name), directoryLinkType());
+		}
+	}
+}
 
 function listFiles(dir: string, prefix = ""): string[] {
 	return readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
@@ -77,7 +111,7 @@ describe("build:runtime", () => {
 	});
 
 	it("runs its self-check from the output with the engine resolved inside it", () => {
-		symlinkSync(join(PACKAGE, "node_modules"), join(out, "daemon", "node_modules"));
+		linkNodeModules(out);
 		const check = spawnSync(process.execPath, [join(out, "daemon", "cli.mjs"), "--self-check"], {
 			encoding: "utf8",
 			env: {
