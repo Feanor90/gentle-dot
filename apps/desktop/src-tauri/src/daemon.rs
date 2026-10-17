@@ -290,9 +290,17 @@ pub fn launch_spec(env: impl Fn(&str) -> Option<String>, dev: bool, runtime: Opt
     let (node, script, mut envs) = match bundled {
         Some(dir) => {
             let root = dir.display().to_string();
-            let path = format!("{root}/bin:{root}/node/bin:/usr/bin:/bin:/usr/sbin:/sbin");
+            // Windows stages Node at `node/node.exe` beside its npm, and joins PATH with `;`.
+            let (node, path) = if cfg!(windows) {
+                (format!("{root}/node/node.exe"), format!("{root}/bin;{root}/node"))
+            } else {
+                (
+                    format!("{root}/node/bin/node"),
+                    format!("{root}/bin:{root}/node/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
+                )
+            };
             (
-                format!("{root}/node/bin/node"),
+                node,
                 format!("{root}/daemon/cli.mjs"),
                 vec![("PATH".to_string(), path), ("GENTLE_DOT_RUNTIME".to_string(), root)],
             )
@@ -831,12 +839,17 @@ mod tests {
         let runtime = fake_runtime("runtime-bundled", true);
         let spec = launch_spec(env_of(&[]), false, Some(&runtime));
         let root = runtime.display().to_string();
-        assert_eq!(spec.program, format!("{root}/node/bin/node"));
+        let (program, path) = if cfg!(windows) {
+            (format!("{root}/node/node.exe"), format!("{root}/bin;{root}/node"))
+        } else {
+            (
+                format!("{root}/node/bin/node"),
+                format!("{root}/bin:{root}/node/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
+            )
+        };
+        assert_eq!(spec.program, program);
         assert_eq!(spec.args, vec![format!("{root}/daemon/cli.mjs")]);
-        assert_eq!(
-            env_value(&spec, "PATH"),
-            Some(format!("{root}/bin:{root}/node/bin:/usr/bin:/bin:/usr/sbin:/sbin").as_str())
-        );
+        assert_eq!(env_value(&spec, "PATH"), Some(path.as_str()));
         assert_eq!(env_value(&spec, "GENTLE_DOT_RUNTIME"), Some(root.as_str()));
         assert_eq!(env_value(&spec, "GENTLE_DOT_ALLOWED_ORIGINS"), None);
         let spec = launch_spec(env_of(&[]), true, Some(&runtime));
@@ -868,7 +881,12 @@ mod tests {
         assert_eq!(spec.args, vec!["/srv/cli.ts".to_string()]);
         assert_eq!(env_value(&spec, "GENTLE_DOT_RUNTIME"), Some(runtime.display().to_string().as_str()));
         let spec = launch_spec(env_of(&[("GENTLE_DOT_NODE", "")]), false, Some(&runtime));
-        assert_eq!(Path::new(&spec.program), runtime.join("node/bin/node"));
+        let node = if cfg!(windows) {
+            runtime.join("node/node.exe")
+        } else {
+            runtime.join("node/bin/node")
+        };
+        assert_eq!(Path::new(&spec.program), node);
     }
 
     #[test]
