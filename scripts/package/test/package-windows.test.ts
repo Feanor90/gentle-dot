@@ -40,6 +40,13 @@ describe("windowsReleaseConfig", () => {
 		expect(config.bundle).not.toHaveProperty("macOS");
 	});
 
+	it("adds no description key, because the Windows bundlers emit none", () => {
+		// Measured on the built bundles, not assumed: the MSI carries no Comments/ARPCOMMENTS
+		// property and the NSIS version-info block derives every key from PRODUCTNAME, so a
+		// longDescription here would be config with no output.
+		expect(windowsReleaseConfig({ runtime: "/r" }).bundle).not.toHaveProperty("longDescription");
+	});
+
 	it("refuses a config without a runtime", () => {
 		expect(() => windowsReleaseConfig({})).toThrow(/runtime/);
 	});
