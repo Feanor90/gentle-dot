@@ -491,20 +491,25 @@ fn spawn_snapper(app: AppHandle) -> mpsc::Sender<()> {
 
 /// The panel's backdrop, translated from the OS-agnostic decision in `platform` (design §9).
 ///
-/// Only macOS asks for a material. Tauri applies only the material that belongs to the host, so
-/// naming a foreign one is a silent no-op rather than an error, and `WebviewWindowBuilder::effects`
-/// is documented as unsupported on Linux. Windows is deliberately in the untouched group: Tauri
-/// discards the result of applying a Windows material and offers no readback, so a requested
-/// `Mica` cannot be told apart from one that was ignored, and a translucent panel over an ignored
-/// effect is unreadable. W8 asks for `Mica` once a real Windows machine shows it lands.
+/// The resolved [`WindowEffect`] is threaded in from the one call site that resolves it, so the
+/// material requested here and the URL that decides whether the UI paints a background cannot
+/// disagree. macOS asks for `HudWindow`. Windows asks for `Mica` only when the facts hold (build
+/// ≥ 22000, transparency on, a local session, composition on); the request is **gated, not
+/// proven**, because Tauri discards the result with no readback and a silent failure stays
+/// possible — the gate is the mitigation, and the panel keeps `effects=none` when it does not
+/// fire. Linux gets nothing, and `WebviewWindowBuilder::effects` is documented as unsupported
+/// there.
 fn with_panel_effects<'a, R: tauri::Runtime, M: tauri::Manager<R>>(
     panel: WebviewWindowBuilder<'a, R, M>,
-    os: Os,
+    effect: WindowEffect,
 ) -> WebviewWindowBuilder<'a, R, M> {
-    match os.panel_effect() {
+    match effect {
         WindowEffect::HudWindow => panel.effects(
             EffectsBuilder::new().effect(Effect::HudWindow).state(EffectState::Active).radius(20.0).build(),
         ),
+        WindowEffect::Mica => {
+            panel.effects(EffectsBuilder::new().effect(Effect::Mica).state(EffectState::Active).build())
+        }
         WindowEffect::None => panel,
     }
 }
@@ -533,8 +538,10 @@ fn build_windows(
     #[cfg(target_os = "linux")]
     let dot = dot.resizable(true).min_inner_size(DOT_SIZE.0, DOT_SIZE.1).max_inner_size(DOT_SIZE.0, DOT_SIZE.1);
     let dot = dot.build()?;
-    // Linux has no window effects; the panel URL tells the UI to paint an opaque background.
-    let panel = WebviewWindowBuilder::new(app, PANEL, WebviewUrl::App(platform::panel_url(Os::CURRENT).into()))
+    // The backdrop is resolved once here and threaded into both the panel URL and the window
+    // material, so the UI's own background and the system backdrop can never disagree.
+    let effect = Os::CURRENT.panel_effect(platform::WindowsBackdrop::current());
+    let panel = WebviewWindowBuilder::new(app, PANEL, WebviewUrl::App(platform::panel_url(effect).into()))
         .title(PANEL_TITLE)
         .inner_size(PANEL_SIZE.0, PANEL_SIZE.1)
         .transparent(true)
@@ -545,7 +552,7 @@ fn build_windows(
         // Lets the chat receive HTML5 drops of attachments (S31); Tauri's own handler would take them.
         .disable_drag_drop_handler()
         .visible(false);
-    let panel = with_panel_effects(panel, Os::CURRENT);
+    let panel = with_panel_effects(panel, effect);
     panel.build()?;
 
     if !places_windows {

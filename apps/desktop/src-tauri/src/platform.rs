@@ -3,8 +3,9 @@
 //! and what a second launch (`gentle-dot --toggle`) asks the running app to do.
 //!
 //! The OS-agnostic decisions live here; translating one into a Tauri type is the caller's job
-//! (`shell.rs` maps [`WindowEffect`] onto `tauri::window::Effect`). Nothing in this module names
-//! a platform crate, which is what lets the Windows branches be tested on macOS and Linux.
+//! (`shell.rs` maps [`WindowEffect`] onto `tauri::window::Effect`). The decisions stay pure over
+//! injected values so they are tested on every OS; the one exception is [`WindowsBackdrop::current`],
+//! which reads the Windows facts at runtime behind `cfg(target_os = "windows")` and fails closed.
 
 use std::path::PathBuf;
 
@@ -17,19 +18,20 @@ pub enum Os {
 
 /// The backdrop the panel asks the window system for. macOS blurs with the `HudWindow` material.
 /// Linux gets nothing, because neither X11 nor Wayland can be relied on to composite a
-/// translucent panel. Windows gets nothing *yet*, and the reason is not cosmetic:
+/// translucent panel. Windows asks for `Mica` only when every fact that makes it real holds —
+/// Windows 11 (build ≥ 22000), transparency effects on, a local session, and DWM composition on —
+/// and otherwise asks for nothing (see [`windows_panel_effect`] and [`WindowsBackdrop`]).
 ///
-/// Tauri applies at most one Windows material and throws the result away
-/// (`tauri/src/vibrancy/windows.rs` scans the effect list with `find` and drops the
-/// `window_vibrancy` result), so there is no `Acrylic` fallback to ask for and no way to read
-/// back whether `Mica` landed. On Windows 10, with transparency effects disabled, over Remote
-/// Desktop, or after a compositor failure the request would be dropped in silence and a
-/// translucent panel would have no backdrop at all. Asking for `Mica` therefore proves nothing,
-/// and requesting it would trade a readable panel for an unverified blur. W8 flips this to
-/// `Mica` once a real Windows machine shows the blur actually lands (SW3).
+/// The gate is the mitigation, not a proof. Tauri applies at most one Windows material and throws
+/// the result away (`tauri/src/vibrancy/windows.rs` scans the effect list with `find` and drops the
+/// `window_vibrancy` result), so there is no `Acrylic` fallback and no way to read back whether
+/// `Mica` landed. On a machine where the facts hold but the material is still silently dropped, the
+/// panel keeps `effects=none` and paints its own background, so it stays readable; whether the blur
+/// actually appears is only confirmable by eye.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowEffect {
     HudWindow,
+    Mica,
     None,
 }
 
@@ -42,18 +44,19 @@ impl Os {
         Os::Linux
     };
 
-    /// The panel's backdrop on this OS. `None` means the panel must paint an opaque background.
-    pub fn panel_effect(self) -> WindowEffect {
+    /// The panel's backdrop on this OS, from the Windows facts read once at launch. `None` means
+    /// the panel must paint an opaque background. macOS and Linux ignore `facts`.
+    pub fn panel_effect(self, facts: WindowsBackdrop) -> WindowEffect {
         match self {
             Os::MacOs => WindowEffect::HudWindow,
-            // Asking is not proof (see above), so Windows keeps the readable panel.
-            Os::Windows | Os::Linux => WindowEffect::None,
+            Os::Linux => WindowEffect::None,
+            Os::Windows => windows_panel_effect(facts),
         }
     }
 
     /// Whether the window system blurs the desktop behind the panel.
-    pub fn has_panel_effect(self) -> bool {
-        self.panel_effect() != WindowEffect::None
+    pub fn has_panel_effect(self, facts: WindowsBackdrop) -> bool {
+        self.panel_effect(facts) != WindowEffect::None
     }
 
     /// The panel shortcut a fresh install binds. macOS and Linux keep `Alt+Space`; Windows uses
@@ -91,14 +94,150 @@ pub fn home_dir(os: Os, env: impl Fn(&str) -> Option<String>) -> Option<PathBuf>
     }
 }
 
+/// The Windows facts that decide whether `Mica` is real, injected so the decision is pure and
+/// tested on every OS. All four must hold: the material needs Windows 11 (build ≥ 22000), the
+/// user's transparency setting, a local session (not Remote Desktop), and DWM composition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowsBackdrop {
+    /// The OS build number, e.g. 26100 for Windows 11 24H2.
+    pub build: u32,
+    /// `EnableTransparency` under the user's Personalize key.
+    pub transparency: bool,
+    /// Whether this is a Remote Desktop session.
+    pub remote_session: bool,
+    /// Whether DWM composition is enabled.
+    pub composition: bool,
+}
+
+/// The first Windows build that has `Mica` at all (Windows 11).
+pub const MICA_MIN_BUILD: u32 = 22000;
+
+impl WindowsBackdrop {
+    /// The fail-closed default: no facts means no `Mica`, so the panel is opaque and readable. A
+    /// caller that cannot read the facts uses this rather than guessing.
+    pub const fn unknown() -> Self {
+        Self { build: 0, transparency: false, remote_session: false, composition: false }
+    }
+
+    /// Reads the facts from this Windows host, or [`unknown`](Self::unknown) if any read fails.
+    pub fn current() -> Self {
+        #[cfg(target_os = "windows")]
+        {
+            windows_facts::read().unwrap_or_else(Self::unknown)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Self::unknown()
+        }
+    }
+}
+
+/// `Mica` only when every fact holds; anything else is [`WindowEffect::None`]. This is the whole
+/// decision (L36): asking is not proof, because Tauri gives no readback, so the gate uses the facts
+/// that make the material real and otherwise keeps the panel opaque.
+pub fn windows_panel_effect(facts: WindowsBackdrop) -> WindowEffect {
+    let mica =
+        facts.build >= MICA_MIN_BUILD && facts.transparency && !facts.remote_session && facts.composition;
+    if mica {
+        WindowEffect::Mica
+    } else {
+        WindowEffect::None
+    }
+}
+
+/// The Windows fact reader: the one place in this module that names a platform crate. Every call
+/// fails closed — an unreadable fact is [`WindowsBackdrop::unknown`], never a panic.
+#[cfg(target_os = "windows")]
+mod windows_facts {
+    use super::WindowsBackdrop;
+    use std::ptr;
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, STATUS_SUCCESS};
+    use windows_sys::Win32::Graphics::Dwm::DwmIsCompositionEnabled;
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, KEY_READ, REG_DWORD,
+    };
+    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_REMOTESESSION};
+    use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+
+    const PERSONALIZE: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize";
+    const ENABLE_TRANSPARENCY: &str = "EnableTransparency";
+
+    /// Reads all four facts, or `None` if any of them cannot be read.
+    pub fn read() -> Option<WindowsBackdrop> {
+        Some(WindowsBackdrop {
+            build: os_build()?,
+            transparency: transparency()?,
+            remote_session: remote_session(),
+            composition: composition()?,
+        })
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// The honest build number: `RtlGetVersion`, not `GetVersionExW`, which lies under a manifest.
+    fn os_build() -> Option<u32> {
+        let mut info = OSVERSIONINFOW::default();
+        info.dwOSVersionInfoSize = std::mem::size_of::<OSVERSIONINFOW>() as u32;
+        // SAFETY: `info` is an initialized, correctly sized OSVERSIONINFOW that outlives the call.
+        let status = unsafe { RtlGetVersion(&mut info) };
+        (status == STATUS_SUCCESS).then_some(info.dwBuildNumber)
+    }
+
+    fn transparency() -> Option<bool> {
+        let subkey = wide(PERSONALIZE);
+        let value = wide(ENABLE_TRANSPARENCY);
+        let mut key = ptr::null_mut();
+        // SAFETY: `subkey` is a NUL-terminated wide string, and `key` receives the opened handle.
+        let opened = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut key) };
+        if opened != ERROR_SUCCESS {
+            return None;
+        }
+        let mut kind = 0u32;
+        let mut data = 0u32;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        // SAFETY: `key` is open, `value` is NUL-terminated, and `data`/`size` describe the u32 buffer.
+        let read = unsafe {
+            RegQueryValueExW(
+                key,
+                value.as_ptr(),
+                ptr::null(),
+                &mut kind,
+                &mut data as *mut u32 as *mut u8,
+                &mut size,
+            )
+        };
+        // SAFETY: `key` came from a successful RegOpenKeyExW.
+        unsafe { RegCloseKey(key) };
+        (read == ERROR_SUCCESS && kind == REG_DWORD && size == 4).then_some(data != 0)
+    }
+
+    fn remote_session() -> bool {
+        // `GetSystemMetrics` has no failure channel for this index; a non-zero answer means Remote
+        // Desktop.
+        // SAFETY: the call takes an index and returns an integer; no pointers are involved.
+        unsafe { GetSystemMetrics(SM_REMOTESESSION) != 0 }
+    }
+
+    fn composition() -> Option<bool> {
+        let mut enabled = 0;
+        // SAFETY: `enabled` receives the composition flag.
+        let hr = unsafe { DwmIsCompositionEnabled(&mut enabled) };
+        (hr >= 0).then_some(enabled != 0)
+    }
+}
+
 /// Window titles. Hyprland rules (`scripts/linux/hyprland/`) match them, so keep them stable.
 pub const DOT_TITLE: &str = "Gentle Dot";
 pub const PANEL_TITLE: &str = "Gentle Dot Panel";
 
-/// The panel page. Without a backdrop effect, `effects=none` makes the UI paint an opaque
-/// background.
-pub fn panel_url(os: Os) -> &'static str {
-    if os.has_panel_effect() {
+/// The panel page for a resolved [`WindowEffect`]. Without a backdrop effect, `effects=none` makes
+/// the UI paint an opaque background. Taking the effect rather than the OS is what keeps the URL
+/// and the material the window asks for from disagreeing: both come from one resolution.
+pub fn panel_url(effect: WindowEffect) -> &'static str {
+    if effect != WindowEffect::None {
         "index.html?surface=panel"
     } else {
         "index.html?surface=panel&effects=none"
@@ -250,32 +389,91 @@ mod tests {
         assert_eq!(launch_request(&[]), LaunchRequest::Show);
     }
 
+    /// Windows 11 with every fact that makes `Mica` real: build 26100, transparency on, a local
+    /// session, composition on.
+    const WINDOWS_11: WindowsBackdrop =
+        WindowsBackdrop { build: 26100, transparency: true, remote_session: false, composition: true };
+
     #[test]
     fn every_os_picks_its_own_panel_backdrop() {
-        assert_eq!(Os::MacOs.panel_effect(), WindowEffect::HudWindow);
-        // Windows asks for nothing until W8 proves the blur lands; see `WindowEffect`.
-        assert_eq!(Os::Windows.panel_effect(), WindowEffect::None);
-        assert_eq!(Os::Linux.panel_effect(), WindowEffect::None);
-        // Only the OS with a backdrop effect leaves the background to the window system.
-        assert_eq!(panel_url(Os::MacOs), "index.html?surface=panel");
-        assert_eq!(panel_url(Os::Windows), "index.html?surface=panel&effects=none");
-        assert_eq!(panel_url(Os::Linux), "index.html?surface=panel&effects=none");
+        // macOS always blurs; Linux never gets an effect; Windows asks only when its facts allow it.
+        assert_eq!(Os::MacOs.panel_effect(WindowsBackdrop::unknown()), WindowEffect::HudWindow);
+        assert_eq!(Os::Windows.panel_effect(WindowsBackdrop::unknown()), WindowEffect::None);
+        assert_eq!(Os::Windows.panel_effect(WINDOWS_11), WindowEffect::Mica);
+        assert_eq!(Os::Linux.panel_effect(WINDOWS_11), WindowEffect::None);
+        // The URL follows the resolved effect, not the OS.
+        assert_eq!(panel_url(WindowEffect::HudWindow), "index.html?surface=panel");
+        assert_eq!(panel_url(WindowEffect::Mica), "index.html?surface=panel");
+        assert_eq!(panel_url(WindowEffect::None), "index.html?surface=panel&effects=none");
     }
 
     #[test]
-    fn an_unverified_backdrop_never_leaves_the_panel_transparent() {
-        // The defect this guards: a translucent panel with a no-op window effect is unreadable,
-        // and Tauri cannot report whether the effect applied.
-        for os in [Os::Windows, Os::Linux] {
-            assert!(!os.has_panel_effect(), "{os:?}");
-            assert!(panel_url(os).ends_with("effects=none"), "{os:?}");
+    fn mica_is_asked_for_only_when_every_window_fact_holds() {
+        assert_eq!(windows_panel_effect(WINDOWS_11), WindowEffect::Mica);
+        // At the Windows 11 threshold the material exists; one build below it does not.
+        assert_eq!(
+            windows_panel_effect(WindowsBackdrop { build: MICA_MIN_BUILD, ..WINDOWS_11 }),
+            WindowEffect::Mica
+        );
+        assert_eq!(
+            windows_panel_effect(WindowsBackdrop { build: MICA_MIN_BUILD - 1, ..WINDOWS_11 }),
+            WindowEffect::None
+        );
+        // Each fact on its own turns the request off.
+        assert_eq!(
+            windows_panel_effect(WindowsBackdrop { transparency: false, ..WINDOWS_11 }),
+            WindowEffect::None
+        );
+        assert_eq!(
+            windows_panel_effect(WindowsBackdrop { remote_session: true, ..WINDOWS_11 }),
+            WindowEffect::None
+        );
+        assert_eq!(
+            windows_panel_effect(WindowsBackdrop { composition: false, ..WINDOWS_11 }),
+            WindowEffect::None
+        );
+        // The fail-closed default: no facts read means no material.
+        assert_eq!(windows_panel_effect(WindowsBackdrop::unknown()), WindowEffect::None);
+    }
+
+    #[test]
+    fn a_windows_backdrop_that_is_not_mica_leaves_the_panel_opaque() {
+        // The defect this guards (L8): a translucent panel whose requested material was ignored is
+        // unreadable, and Tauri cannot report whether the effect applied. The material and the URL
+        // come from one resolved value, so they cannot disagree.
+        let cases = [
+            WindowsBackdrop { build: 21999, ..WINDOWS_11 },
+            WindowsBackdrop { build: 0, transparency: false, remote_session: false, composition: false },
+            WindowsBackdrop { transparency: false, ..WINDOWS_11 },
+            WindowsBackdrop { remote_session: true, ..WINDOWS_11 },
+            WindowsBackdrop { composition: false, ..WINDOWS_11 },
+        ];
+        for facts in cases {
+            let effect = Os::Windows.panel_effect(facts);
+            assert_eq!(effect, WindowEffect::None, "{facts:?}");
+            assert!(!Os::Windows.has_panel_effect(facts), "{facts:?}");
+            assert!(panel_url(effect).ends_with("effects=none"), "{facts:?}");
         }
+        // With every fact holding it asks for `Mica`, and the URL leaves the background to the UI.
+        let effect = Os::Windows.panel_effect(WINDOWS_11);
+        assert_eq!(effect, WindowEffect::Mica);
+        assert!(Os::Windows.has_panel_effect(WINDOWS_11));
+        assert!(!panel_url(effect).ends_with("effects=none"));
     }
 
     #[test]
     fn has_panel_effect_agrees_with_the_effect_it_names() {
         for os in [Os::MacOs, Os::Windows, Os::Linux] {
-            assert_eq!(os.has_panel_effect(), os.panel_effect() != WindowEffect::None, "{os:?}");
+            for facts in [WindowsBackdrop::unknown(), WINDOWS_11] {
+                let effect = os.panel_effect(facts);
+                assert_eq!(os.has_panel_effect(facts), effect != WindowEffect::None, "{os:?} {facts:?}");
+                // The URL and the requested material agree for every OS and every fact combination.
+                assert_eq!(
+                    !panel_url(effect).ends_with("effects=none"),
+                    effect != WindowEffect::None,
+                    "{os:?} {facts:?}"
+                );
+            }
         }
     }
 

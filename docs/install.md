@@ -157,7 +157,7 @@ The port is incomplete on purpose. Each item names the unit that carries it.
 
 - **Connectors that need a secret or an approval do not run yet** (W7). The private app-to-daemon channel is not on Windows yet, so the app cannot answer connector secret requests or show native connector/approval dialogs. The app says so rather than falling back to a file. Connectors without secrets keep working.
 - **Voice** (W12) and **computer control** (W13, macOS-only today) are not available.
-- **The panel has no blur** (W8d): the Windows panel is opaque.
+- **The panel's blur is gated and unverified** (W8d): the app asks for `Mica` only on Windows 11 (build ≥ 22000) with transparency effects on, a local session, and DWM composition on; otherwise the panel is opaque. Tauri gives no readback, so the blur can still silently fail even when those facts hold — the gate is the mitigation, and confirming it is the tester's visual check in [docs/windows-testing.md](windows-testing.md).
 - **There is no self-contained installer** (W11).
 
 For a step-by-step tester checklist, see [docs/windows-testing.md](windows-testing.md).

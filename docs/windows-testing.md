@@ -64,7 +64,7 @@ Run `apps/desktop/src-tauri/target/release/gentle-dot.exe`.
 - The app provisions `%USERPROFILE%\.gentle-dot`, with `agent\`, `sessions\`, `identity.md`, and `token` (measured on Windows 11).
 - The app spawns its own daemon. Open a browser at `http://127.0.0.1:4317/`: the page answers HTTP 200 with the title "Gentle Dot" (measured on Windows 11).
 
-The panel is **opaque** on Windows; there is no blur behind it (Mica is W8d and not done).
+The panel is opaque unless the backdrop gate fires. On Windows 11 (build ≥ 22000) with transparency effects on, a local session, and DWM composition on, the app asks for `Mica`, and only then should a blur appear behind the panel. Tauri gives no readback, so this is a **tester's visual check**: if the panel is opaque on a machine that meets all four conditions, note it — the request is gated but not proven.
 
 ### 3. The rose stays on top
 
