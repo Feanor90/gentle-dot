@@ -341,7 +341,10 @@ describe("one signing key per data folder (S18)", () => {
 			version: 2,
 			connectors: { plain: { enabled: true, mode: "read_only", custom: PLAIN } },
 		};
-		writeFileSync(join(dataDir, "connectors.json"), JSON.stringify({ ...record, mac: expectedMac(legacy, record) }));
+		writeFileSync(
+			join(dataDir, "connectors.json"),
+			JSON.stringify({ ...record, mac: expectedMac(legacy, record) }),
+		);
 		const before = readFileSync(join(dataDir, "connectors.json"), "utf8");
 		const get = source.get.bind(source);
 		source.get = async (id: string) => {
@@ -365,7 +368,10 @@ describe("one signing key per data folder (S18)", () => {
 			version: 2,
 			connectors: { plain: { enabled: true, mode: "read_only", custom: PLAIN } },
 		};
-		writeFileSync(join(dataDir, "connectors.json"), JSON.stringify({ ...record, mac: expectedMac(legacy, record) }));
+		writeFileSync(
+			join(dataDir, "connectors.json"),
+			JSON.stringify({ ...record, mac: expectedMac(legacy, record) }),
+		);
 		const put = source.put.bind(source);
 		source.put = async (id: string, value: string) => {
 			if (id === scopedIntegrityKeyId(dataDir)) throw new Error("keychain full");
@@ -386,6 +392,81 @@ describe("one signing key per data folder (S18)", () => {
 			const { notices } = await started(dataDir, source);
 			expect(notices).toEqual([]);
 		});
+	});
+
+	// Older versions signed EVERY folder under the legacy key, so a file in any folder may carry it.
+	const legacySignedFile = (dataDir: string, keyHex: string) => {
+		const record = {
+			version: 2,
+			connectors: { plain: { enabled: true, mode: "read_only", custom: PLAIN } },
+		};
+		writeFileSync(
+			join(dataDir, "connectors.json"),
+			JSON.stringify({ ...record, mac: expectedMac(keyHex, record) }),
+		);
+	};
+
+	it("a legacy-signed file in another folder verifies and its key is copied to the folder's entry", async () => {
+		const dataDir = tempDir();
+		const source = new MemorySecretSource();
+		const legacy = "77".repeat(32);
+		source.values.set(INTEGRITY_KEY_ID, legacy);
+		legacySignedFile(dataDir, legacy);
+		const { store, notices } = await started(dataDir, source);
+		expect(notices).toEqual([]);
+		expect(rejectedFiles(dataDir)).toEqual([]);
+		expect(Object.keys(store.state().connectors)).toEqual(["plain"]);
+		expect(source.values.get(scopedIntegrityKeyId(dataDir))).toBe(legacy);
+		expect(source.values.get(INTEGRITY_KEY_ID)).toBe(legacy);
+		store.close();
+		source.values.delete(INTEGRITY_KEY_ID);
+		const next = await started(dataDir, source);
+		expect(next.notices).toEqual([]);
+		expect(Object.keys(next.store.state().connectors)).toEqual(["plain"]);
+	});
+
+	it("a file in another folder signed under neither key is still set aside", async () => {
+		const dataDir = tempDir();
+		const source = new MemorySecretSource();
+		source.values.set(INTEGRITY_KEY_ID, "66".repeat(32));
+		legacySignedFile(dataDir, "55".repeat(32));
+		const { store, notices } = await started(dataDir, source);
+		expect(notices).toEqual([SET_ASIDE_NOTICE]);
+		expect(rejectedFiles(dataDir)).toHaveLength(1);
+		expect(store.state().connectors).toEqual({});
+	});
+
+	it("an unsigned file in another folder is set aside while the legacy key exists, as before", async () => {
+		const dataDir = tempDir();
+		const source = new MemorySecretSource();
+		source.values.set(INTEGRITY_KEY_ID, "44".repeat(32));
+		writeFileSync(
+			join(dataDir, "connectors.json"),
+			JSON.stringify({
+				version: 2,
+				connectors: { plain: { enabled: true, mode: "read_write", custom: PLAIN } },
+			}),
+		);
+		const { store, notices } = await started(dataDir, source);
+		expect(notices).toEqual([SET_ASIDE_NOTICE]);
+		expect(rejectedFiles(dataDir)).toHaveLength(1);
+		expect(store.state().connectors).toEqual({});
+	});
+
+	it("a legacy key the app cannot read fails closed for a file in another folder", async () => {
+		const dataDir = tempDir();
+		const source = new MemorySecretSource();
+		legacySignedFile(dataDir, "33".repeat(32));
+		const before = readFileSync(join(dataDir, "connectors.json"), "utf8");
+		const get = source.get.bind(source);
+		source.get = async (id: string) => {
+			if (id === INTEGRITY_KEY_ID) throw new Error("keychain unavailable");
+			return get(id);
+		};
+		const { notices } = await started(dataDir, source);
+		expect(notices).toEqual([INTEGRITY_UNCHECKED]);
+		expect(readFileSync(join(dataDir, "connectors.json"), "utf8")).toBe(before);
+		expect(rejectedFiles(dataDir)).toEqual([]);
 	});
 
 	it("one folder's key never applies to another folder sharing the store", async () => {

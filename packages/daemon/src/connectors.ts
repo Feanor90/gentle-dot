@@ -827,9 +827,11 @@ export class ConnectorStore {
 			cannot(`its key could not be read (${(error as Error).message})`);
 			return;
 		}
-		// The legacy key signed only the default folder; a different folder never owned it.
+		// Older versions signed every folder's file under the one legacy key, so a file that is there
+		// is checked against it as before. Only a missing file is judged by this folder's own key (or
+		// the legacy one in the default folder): another folder's key says nothing about this one.
 		let legacy: string | undefined;
-		if (stored === undefined && isDefaultDataDir(this.options.dataDir)) {
+		if (stored === undefined && (present || isDefaultDataDir(this.options.dataDir))) {
 			try {
 				legacy = await source.get(INTEGRITY_KEY_ID);
 			} catch (error) {
@@ -2071,7 +2073,12 @@ export class ConnectorManager {
 	 * only, with every tool hidden, then asks for its secrets in the window that approved it and signs
 	 * in when it needs to.
 	 */
-	decideDraft(owner: ConnectionOwner, draftId: string, approve: boolean, emit: Emit): ConnectorRefusal | undefined {
+	decideDraft(
+		owner: ConnectionOwner,
+		draftId: string,
+		approve: boolean,
+		emit: Emit,
+	): ConnectorRefusal | undefined {
 		const draft = this.waiting.get(draftId);
 		if (!draft) return REFUSALS.noDraft;
 		if (approve && this.busy()) return REFUSALS.busy;
