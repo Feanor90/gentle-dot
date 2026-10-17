@@ -3,7 +3,16 @@
 // daemon starts with no connectors, and the user is told once; the first start after T23e signs the
 // current file; without the app the file is loaded unverified, and a write never breaks a signature.
 import { createHmac } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import type { ServerMessage, ServerPayload } from "@gentle-dot/protocol";
 import { afterEach, describe, expect, it } from "vitest";
@@ -493,6 +502,18 @@ describe("one signing key per data folder (S18)", () => {
 			expect(again.notices).toEqual([]);
 			expect(rejectedFiles(dataDir)).toEqual([]);
 			expect(Object.keys(again.store.state().connectors)).toEqual(["plain"]);
+		},
+	);
+
+	it.runIf(process.platform === "win32")(
+		"a junction or a \\\\?\\ spelling of a data folder keeps the folder's key",
+		() => {
+			const dataDir = join(tempDir(), "DotData");
+			mkdirSync(dataDir);
+			const link = join(tempDir(), "DotLink");
+			symlinkSync(dataDir, link, "junction");
+			expect(scopedIntegrityKeyId(link)).toBe(scopedIntegrityKeyId(dataDir));
+			expect(scopedIntegrityKeyId(`\\\\?\\${dataDir}`)).toBe(scopedIntegrityKeyId(dataDir));
 		},
 	);
 
