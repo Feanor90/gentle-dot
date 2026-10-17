@@ -1,3 +1,6 @@
+import { existsSync, readFileSync } from "node:fs";
+import { isAbsolute } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
 	goMeetsMinimum,
@@ -12,6 +15,7 @@ import {
 	vcvars64Path,
 	WIN_USAGE,
 	WINDOWS_GO_REQUIRED,
+	WINDOWS_INSTALLER_HOOKS,
 } from "../lib.mjs";
 
 describe("parseWinArgs", () => {
@@ -61,9 +65,48 @@ describe("tauri release config", () => {
 			bundle: {
 				resources: { [runtime]: "runtime" },
 				useLocalToolsDir: true,
-				windows: { nsis: { installMode: "currentUser" } },
+				windows: { nsis: { installMode: "currentUser", installerHooks: WINDOWS_INSTALLER_HOOKS } },
 			},
 		});
+	});
+
+	it("loads guarded runtime cleanup hooks before install and uninstall", () => {
+		expect(WINDOWS_INSTALLER_HOOKS).toBe(
+			fileURLToPath(new URL("../windows/installer-hooks.nsh", import.meta.url)),
+		);
+		expect(isAbsolute(WINDOWS_INSTALLER_HOOKS)).toBe(true);
+		expect(existsSync(WINDOWS_INSTALLER_HOOKS)).toBe(true);
+		const hooks = readFileSync(WINDOWS_INSTALLER_HOOKS, "utf8");
+		for (const hook of ["PREINSTALL", "PREUNINSTALL"])
+			expect(hooks).toMatch(
+				new RegExp(`!macro NSIS_HOOK_${hook}\\s+!insertmacro RemovePreviousRuntime\\s+!macroend`),
+			);
+		const removal = hooks.match(/!macro RemovePreviousRuntime\s+([\s\S]*?)!macroend/)?.[1];
+		expect(removal).toBeDefined();
+		const requiredLines = [
+			`\${If} \${FileExists} "$INSTDIR\\runtime\\MANIFEST.json"`,
+			`\${AndIf} \${FileExists} "$INSTDIR\\\${MAINBINARYNAME}.exe"`,
+			`!insertmacro CheckIfAppIsRunning "$INSTDIR\\\${MAINBINARYNAME}.exe" "\${PRODUCTNAME}"`,
+			`!insertmacro CheckIfAppIsRunning "$INSTDIR\\runtime\\node\\bin\\node.exe" "\${PRODUCTNAME}"`,
+			`!insertmacro CheckIfAppIsRunning "$INSTDIR\\runtime\\bin\\engram.exe" "\${PRODUCTNAME}"`,
+			`\${OrIf} \${FileExists} "$INSTDIR\\runtime\\*.*"`,
+			"SetErrorLevel 2",
+			"Abort",
+		];
+		for (const line of requiredLines) expect(removal).toContain(line);
+		// Nothing else removes files, and nothing aims at the install folder itself.
+		expect(hooks).not.toMatch(/^\s*(?:RMDir|Delete)\b/im);
+	});
+
+	it("never removes the runtime with a delete that follows junctions", () => {
+		const hooks = readFileSync(WINDOWS_INSTALLER_HOOKS, "utf8");
+		// NSIS `RMDir /r` deletes through junctions (a runtime moved with `mklink /J`, a linked
+		// folder inside it); `rd /s /q` removes the link itself and keeps what it points to.
+		expect(hooks).not.toMatch(/^\s*RMDir\s+\/r\b/im);
+		expect(hooks).toContain(
+			`'"$SYSDIR\\cmd.exe" /d /v:off /c rd /s /q "%GENTLE_DOT_RUNTIME_CLEANUP%" >NUL 2>&1'`,
+		);
+		expect(hooks).toContain(`SetEnvironmentVariableW(w "GENTLE_DOT_RUNTIME_CLEANUP", w "$INSTDIR\\runtime")`);
 	});
 
 	it("names the NSIS installer the way Tauri does", () => {

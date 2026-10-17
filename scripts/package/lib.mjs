@@ -2,6 +2,7 @@
 import { createHash } from "node:crypto";
 import { createReadStream, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { extname, join, win32 } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /**
  * The targets a runtime can be staged for, with the names Node's and Engram's
@@ -575,19 +576,25 @@ export function goMeetsMinimum(output, minimum = MIN_GO_VERSION) {
 	return true;
 }
 
+/** The NSIS hooks that replace the previous runtime on upgrade and remove it on uninstall. */
+export const WINDOWS_INSTALLER_HOOKS = fileURLToPath(
+	new URL("./windows/installer-hooks.nsh", import.meta.url),
+);
+
 /**
  * The configuration `tauri build --config` merges for a Windows release: the staged
  * runtime as the `runtime` resource (as on macOS, kept out of the platform config so
  * source builds need no staged runtime); the bundler's NSIS download cached in
  * `target/.tauri`, never the user's `%LOCALAPPDATA%\tauri`; and a per-user install
- * (no administrator, HKCU), since the app's data and autostart are per user.
+ * (no administrator, HKCU), since the app's data and autostart are per user. NSIS
+ * hooks remove the previous bundled runtime before installing or uninstalling.
  */
 export function tauriWindowsReleaseConfig({ runtime }) {
 	return {
 		bundle: {
 			resources: { [runtime]: "runtime" },
 			useLocalToolsDir: true,
-			windows: { nsis: { installMode: "currentUser" } },
+			windows: { nsis: { installMode: "currentUser", installerHooks: WINDOWS_INSTALLER_HOOKS } },
 		},
 	};
 }
