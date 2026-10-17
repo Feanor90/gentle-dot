@@ -120,13 +120,13 @@ Open **Profiles** (the sliders icon in the header). Create a profile, rename it,
 
 Open **Connectors** in the header.
 
-**Expected:** it lists Gmail, Slack, Discord, Notion, Linear, and Atlassian, plus "Add another connector". Open two or three guides and check that they read well. **Connecting one that needs a secret or an approval does not work yet (W7), and the app says so instead of falling back to a file.**
+**Expected:** it lists Gmail, Slack, Discord, Notion, Linear, and Atlassian, plus "Add another connector". Open two or three guides and check that they read well. **Connecting one that needs a secret or an approval works over the app's private channel (W7); a connector whose secret is missing fails closed rather than falling back to a file.**
 
-### 12. Connector secrets and approvals — not yet on Windows
+### 12. Connector secrets and approvals
 
-The app cannot answer connector secret requests or show native connector/approval dialogs until W7 lands the private app-to-daemon channel. Connectors that need a secret or an approval fail closed.
+The app and the daemon talk over a private channel the app creates **before** it spawns the daemon: a named pipe whose name the daemon receives in `GENTLE_DOT_CHANNEL_PIPE`. The credential is the connection itself — the app accepts it only when the connecting process is the daemon it just spawned — so a daemon the app did not start is refused instead of answered.
 
-**Expected today:** write **N/A** for this step. The one thing that can be checked is the store itself, in step 14.
+**Expected:** a connector that needs a secret asks for it in the app, and the value reaches the daemon over the channel and is kept in the app's store (step 14). An action that needs approval opens a native dialog naming the connector, the action and the preview; **Decline** is the default, an unanswered dialog is refused after 120 s, and a decline leaves nothing running. A connector whose secret is missing fails closed with "Open the Gentle Dot app to use this connector." Quit the app while a chat is running: the daemon it spawned stops with it, and relaunching starts a new one.
 
 ### 13. Quit and relaunch
 
@@ -142,7 +142,7 @@ From `apps/desktop/src-tauri`, run:
 cargo test --lib
 ```
 
-**Expected** (measured on Windows 11): the suite passes, 357 passed / 0 failed / 4 ignored. `%LOCALAPPDATA%\Gentle Dot\secrets.dat` is where a connector secret would be written; you do not need to create one for this check.
+**Expected** (measured on Windows 11): the suite passes, 399 passed / 0 failed / 4 ignored. `%LOCALAPPDATA%\Gentle Dot\secrets.dat` is where a connector secret would be written; you do not need to create one for this check.
 
 ### 15. Voice — not yet on Windows
 
@@ -174,7 +174,7 @@ Autostart uses `tauri-plugin-autostart`, whose Windows backend registers the app
 | A cold build fails inside a dependency's build script with `cl.exe` exit code 2 and no other output | The shell is missing the Windows SDK include/library paths (`stddef.h`). Run the build from a `.bat` that sets `INCLUDE` and `LIB` explicitly; that is the workaround that worked here. A Developer Command Prompt through `vcvars64.bat` does not run well from git-bash. |
 | `biome check` reports around 178 errors, one per line, after switching branches | CRLF left over in an existing checkout. Renormalize with `git add --renormalize .`, then confirm `git diff --stat` stays empty. |
 | The app opens but no webview loads | You are running a **debug** build. Debug builds load the UI from the Vite dev server, which is not running (measured on Windows 11). Build a release with `pnpm --filter @gentle-dot/desktop build`, or start the UI dev server first. |
-| A connector that needs a secret or an approval never runs | Expected: the private app-to-daemon channel is not on Windows yet (W7). |
+| A connector that needs a secret or an approval never runs | Expected: the daemon and the app are not connected. The app answers secret requests and approvals over the private channel it creates before it spawns the daemon (W7); a daemon started outside the app has no channel and refuses both. |
 | `Ctrl+Shift+Space` does not toggle the panel | Check that another app does not hold that combination; pick another shortcut in the panel's Settings. `Alt+Space` opening the Windows window menu is expected: it is Windows' window-menu key, not this app's default. |
 | The webview console reports `tray icon is missing` | Note your build. An early build had an ordering bug that is fixed. |
 | `%USERPROFILE%\.gentle-dot\daemon.log` says the connector cannot get its secrets | Expected until W7 lands. |

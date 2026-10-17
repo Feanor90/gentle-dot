@@ -108,7 +108,7 @@ Keep the `./` with `apt`. The package manager adds WebKitGTK and tray support. T
 
 Gentle Dot targets Windows 10 and Windows 11, x86_64 (aarch64 is planned later); the runs so far are on Windows 11. There is **no packaged installer yet**: the port is in progress and several units are still pending, so today you build and run it from source. This section says how, where your data and secrets live, what does not work yet, and how to remove it. It is not a claim of parity with macOS or Linux.
 
-Measured on Windows 11 x86_64: the app provisions `%USERPROFILE%\.gentle-dot`, starts its own daemon, and `GET http://127.0.0.1:4317/` answers HTTP 200; quitting exits with code 0 and takes its daemon with it. `cargo test --lib` reports 357 passed / 0 failed / 4 ignored. Everything else below is the intended behaviour a tester checks, or is marked "not yet".
+Measured on Windows 11 x86_64: the app provisions `%USERPROFILE%\.gentle-dot`, starts its own daemon over the private named-pipe channel, and `GET http://127.0.0.1:4317/` answers HTTP 200; quitting exits with code 0 and takes its daemon with it. `cargo test --lib` reports 399 passed / 0 failed / 4 ignored. Everything else below is the intended behaviour a tester checks, or is marked "not yet".
 
 ### Requirements
 
@@ -171,7 +171,7 @@ On Windows, connector secrets (tokens, client secrets, imported header and envir
 
 The port is incomplete on purpose. Each item names the unit that carries it.
 
-- **Connectors that need a secret or an approval do not run yet** (W7). The private app-to-daemon channel is not on Windows yet, so the app cannot answer connector secret requests or show native connector/approval dialogs. The app says so rather than falling back to a file. Connectors without secrets keep working.
+- **Connectors that need a secret or an approval work over the private channel** (W7). The app creates a named pipe before it spawns the daemon and hands over its name in `GENTLE_DOT_CHANNEL_PIPE`; the credential is the accepted connection's pid against the child the app just spawned, so a daemon the app did not start is refused rather than answered. A connector that needs a secret asks for it in the app and the value reaches the daemon over that channel; a connector whose secret is missing fails closed rather than falling back to a file.
 - **Voice** (W12) and **computer control** (W13, macOS-only today) are not available.
 - **The panel's blur is gated and unverified** (W8d): the app asks for `Mica` only on Windows 11 (build ≥ 22000) with transparency effects on, a local session, and DWM composition on; otherwise the panel is opaque. Tauri gives no readback, so the blur can still silently fail even when those facts hold — the gate is the mitigation, and confirming it is the tester's visual check in [docs/windows-testing.md](windows-testing.md).
 
