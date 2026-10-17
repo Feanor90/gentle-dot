@@ -559,16 +559,122 @@ pub fn stop_child(child: &mut dyn ChildProcess, grace: Duration) {
     let _ = child.wait();
 }
 
-/// Windows has no `SIGTERM`, and `std` offers no way to ask a child to stop, so the polite phase
-/// cannot exist there: the child is terminated outright and `grace` has nothing to wait for. A
-/// daemon stopped this way is killed rather than asked to finish (L30).
-#[cfg(not(unix))]
+/// Windows has no `SIGTERM`, and `std` offers no way to ask a child to stop, so the polite
+/// request is the caller's: [`Daemon::stop`] closes the daemon's channel and the daemon treats
+/// that as a stop. This waits up to `grace` for the child to leave on its own and only then
+/// terminates it — the same shape as the Unix arm, without a signal to send. Terminating a daemon
+/// that is already leaving would kill its engine's clean-up with it (W20).
+#[cfg(windows)]
+pub fn stop_child(child: &mut dyn ChildProcess, grace: Duration) {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    if !matches!(child.try_wait(), Ok(None)) {
+        return;
+    }
+    let timeout = u32::try_from(grace.as_millis()).unwrap_or(u32::MAX);
+    // SAFETY: OpenProcess takes a pid and a rights mask and dereferences nothing.
+    let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, child.id()) };
+    if !process.is_null() {
+        // SAFETY: a bounded wait on a live process handle opened just above and owned here.
+        let exited = unsafe { WaitForSingleObject(process, timeout) } == WAIT_OBJECT_0;
+        // SAFETY: the handle came from OpenProcess and is closed exactly once.
+        unsafe { CloseHandle(process) };
+        if exited {
+            let _ = child.try_wait();
+            return;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// No Unix signal and no Win32 wait to use: terminate outright, as the Windows arm did before the
+/// job and grace work (W5b). No target the app ships reaches this.
+#[cfg(not(any(unix, windows)))]
 pub fn stop_child(child: &mut dyn ChildProcess, _grace: Duration) {
     if !matches!(child.try_wait(), Ok(None)) {
         return;
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// The Job Object the app puts its daemon in (W5b): `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` makes the
+/// whole process tree — the daemon, the engine launcher it starts, and the `pi` grandchild — die
+/// when the app's last handle to the job closes, which the system does when the app exits. The
+/// handle is held by [`Daemon`] for the app's lifetime.
+#[cfg(windows)]
+struct JobObject(windows_sys::Win32::Foundation::HANDLE);
+
+// SAFETY: the handle is closed only from `Drop`, and `Daemon` guards it with a mutex; a Windows
+// handle may be used from any thread.
+#[cfg(windows)]
+unsafe impl Send for JobObject {}
+#[cfg(windows)]
+unsafe impl Sync for JobObject {}
+
+#[cfg(windows)]
+impl Drop for JobObject {
+    fn drop(&mut self) {
+        // SAFETY: a handle this process owns from `CreateJobObjectW`, closed exactly once here.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+/// Creates the daemon's job. The caller fails soft: without it the daemon still starts, runs, and
+/// stops, but a process the daemon started can outlive the app instead of being ended with it.
+#[cfg(windows)]
+fn create_daemon_job() -> io::Result<JobObject> {
+    use windows_sys::Win32::System::JobObjects::{
+        CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    // SAFETY: null attributes and name ask for an unnamed job with the default security; the call
+    // dereferences nothing.
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let job = JobObject(job);
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: the buffer is exactly the structure this information class expects, and `job` is a
+    // live handle.
+    let set = unsafe {
+        SetInformationJobObject(
+            job.0,
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()).unwrap(),
+        )
+    };
+    if set == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(job)
+}
+
+/// Puts the daemon `pid` in `job`, so every process it later starts joins the job too. The process
+/// handle is opened only to assign and is closed again; the job keeps its own reference.
+#[cfg(windows)]
+fn assign_to_job(job: &JobObject, pid: u32) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
+    // SAFETY: OpenProcess takes a pid and a rights mask and dereferences nothing.
+    let process = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
+    if process.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both handles are live and owned here; the call dereferences nothing.
+    let assigned = unsafe { AssignProcessToJobObject(job.0, process) };
+    let error = io::Error::last_os_error();
+    // SAFETY: `process` came from OpenProcess and is closed exactly once.
+    unsafe { CloseHandle(process) };
+    if assigned == 0 {
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -584,6 +690,10 @@ pub struct Daemon {
     data_dir: PathBuf,
     runtime_dir: Option<PathBuf>,
     child: Mutex<Option<Box<dyn ChildProcess>>>,
+    /// The Job Object every daemon this app starts joins, held for the app's lifetime so the whole
+    /// tree dies with the app (Windows, W5b).
+    #[cfg(windows)]
+    job: Mutex<Option<JobObject>>,
     /// The private channel to the daemon this app spawned; attached daemons have none.
     channel: Mutex<Option<Arc<AppChannel>>>,
     /// Serves the daemon's requests; without it no channel is made.
@@ -606,6 +716,8 @@ impl Daemon {
             data_dir,
             runtime_dir,
             child: Mutex::new(None),
+            #[cfg(windows)]
+            job: Mutex::new(None),
             channel: Mutex::new(None),
             handler: None,
             refused: Mutex::new(None),
@@ -784,6 +896,26 @@ impl Daemon {
         #[cfg(not(unix))]
         let child = spawn_daemon(&spec, log).map_err(|e| format!("cannot start {}: {e}", spec.program))?;
         let pid = child.id();
+        // The daemon joins the app's job as soon as it exists, before it can start anything of its
+        // own, and the job's handle is kept for the app's lifetime: every descendant then dies with
+        // the app instead of surviving it. If any call fails the app still starts and stops the
+        // daemon as it does today; what is lost is only that kill-tree, so a process the daemon
+        // started can outlive the app (W5b).
+        #[cfg(windows)]
+        {
+            let mut job = self.job.lock().unwrap();
+            if job.is_none() {
+                match create_daemon_job() {
+                    Ok(created) => *job = Some(created),
+                    Err(error) => eprintln!("gentle-dot: cannot create the assistant's job object: {error}"),
+                }
+            }
+            if let Some(job) = job.as_ref() {
+                if let Err(error) = assign_to_job(job, pid) {
+                    eprintln!("gentle-dot: cannot put the assistant's process tree in its job object: {error}");
+                }
+            }
+        }
         // A relaunched app can then tell this daemon from one it did not launch (S35.2).
         if let Err(error) = record_launch(&self.data_dir, pid) {
             eprintln!("gentle-dot: cannot record the assistant's pid: {error}");
@@ -838,6 +970,22 @@ impl Daemon {
     pub fn stop(&self) {
         let child = self.child.lock().unwrap().take();
         if let Some(mut child) = child {
+            // Windows has no `SIGTERM`: the daemon treats the channel closing as a stop and exits
+            // 0, so ask it that way first and give it `STOP_GRACE` to finish before `stop_child`
+            // falls back to terminating it. POSIX keeps its SIGTERM-then-grace order and closes
+            // the channel afterwards. The grace is spent once, here or in `stop_child`.
+            #[cfg(windows)]
+            {
+                if let Some(channel) = self.channel.lock().unwrap().take() {
+                    channel.close();
+                }
+                let deadline = Instant::now() + STOP_GRACE;
+                while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                stop_child(child.as_mut(), deadline.saturating_duration_since(Instant::now()));
+            }
+            #[cfg(not(windows))]
             stop_child(child.as_mut(), STOP_GRACE);
             forget_launch(&self.data_dir, child.id());
         }
@@ -1598,5 +1746,47 @@ done"#;
         let status = child.try_wait().unwrap().expect("child has exited");
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    /// The app's kill-tree: `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` ends every process the job holds
+    /// when its last handle closes, which is what the system does to the app's job when the app
+    /// exits. This observes a directly assigned child; descendants created after it joins the job
+    /// are in the job by Windows' own rule. The sleeper is the long-lived child the pid-file tests
+    /// use.
+    #[cfg(windows)]
+    #[test]
+    fn the_daemons_job_kills_its_tree_when_the_apps_last_handle_closes() {
+        let job = create_daemon_job().expect("a job object");
+        let mut child = sleeper();
+        assign_to_job(&job, child.id()).expect("the child joins the job");
+        assert_eq!(child.try_wait().unwrap(), None, "the child runs while the job is open");
+        drop(job);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let exited = child.try_wait().unwrap().is_some();
+        // Whether or not the job ended it, the sleeper never outlives the test.
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(exited, "the child survived the job's last handle closing");
+    }
+
+    /// `stop_child` on Windows has no signal to send, so the caller asks first (the daemon's
+    /// channel close) and `stop_child` waits out the grace before terminating. A child that would
+    /// exit on its own inside the grace must be allowed to: a terminated one is not a success.
+    #[cfg(windows)]
+    #[test]
+    fn stop_child_waits_out_the_grace_before_terminating() {
+        let mut child = Command::new("cmd.exe")
+            .args(["/C", "ping -n 2 127.0.0.1 > nul"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        stop_child(&mut child, Duration::from_secs(8));
+        let status = child.try_wait().unwrap().expect("the child exited");
+        assert!(status.success(), "the child was terminated instead of waited out: {status:?}");
     }
 }
