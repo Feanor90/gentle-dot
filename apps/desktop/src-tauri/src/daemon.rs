@@ -84,9 +84,46 @@ pub fn process_started(pid: u32) -> Option<u64> {
     fields.get(19)?.parse().ok()
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub fn process_started(_pid: u32) -> Option<u64> {
     None
+}
+
+/// When `pid` started (its creation time, 100 ns ticks since 1601), while it is live; `None` once
+/// it is gone or cannot be read. Windows has no `/proc`: the creation time comes from
+/// `GetProcessTimes` over a handle opened only to query it, which a same-user process may do. A
+/// process that has ended may still be openable by pid while another handle keeps its object alive
+/// (the pid file tests hold the child), so liveness is its handle being unsignaled: a terminated
+/// process is `WAIT_OBJECT_0`, not `WAIT_TIMEOUT`, and reads as gone here (W19).
+#[cfg(windows)]
+pub fn process_started(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, WAIT_TIMEOUT};
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid == 0 {
+        return None;
+    }
+    // SAFETY: OpenProcess takes a pid and returns a handle or null; it dereferences nothing.
+    // `SYNCHRONIZE` is what lets the handle be waited on below; it and the query right do not
+    // confer any ability to read or change the process's memory.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+    // SAFETY: a zero-timeout wait on a process handle: `WAIT_TIMEOUT` while it runs, and
+    // `WAIT_OBJECT_0` once it has terminated (any other result fails closed below).
+    let running = unsafe { WaitForSingleObject(process, 0) } == WAIT_TIMEOUT;
+    let mut created = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let mut exited = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let mut kernel = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let mut user = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    // SAFETY: `process` is a live process handle and every out-pointer is a valid FILETIME.
+    let ok = unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) };
+    // SAFETY: `process` came from OpenProcess and is closed exactly once here.
+    unsafe { CloseHandle(process) };
+    (ok != 0 && running).then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
 }
 
 // The app's own files, and only the user who runs it reads them. Unix expresses that with mode
@@ -178,8 +215,7 @@ fn may_be_daemon(pid: u32) -> bool {
 
 /// Windows has no `getppid` in `std`, and this process's parent is not readable there without a
 /// Win32 call, so the parent check is absent. What remains still refuses this process and the
-/// kernel's low pids. It is also unreachable on Windows by construction: it is consulted only on
-/// the path that wants a channel, and `with_channel` declares none there (L30).
+/// kernel's low pids. Like the Unix arm, only a pid that names a recorded live process reaches it.
 #[cfg(not(unix))]
 fn may_be_daemon(pid: u32) -> bool {
     pid > 1 && pid != std::process::id()
@@ -236,13 +272,36 @@ fn stop_orphan(launch: Launched, grace: Duration) {
     }
 }
 
-/// Windows has no signal to send and no `std` way to end a process that is not its child; ending
-/// one there means Win32 (`OpenProcess` + `TerminateProcess`). This is not that code, and it does
-/// not need to be: `stop_orphan` is reached only from `StartPlan::ReplaceOrphan`, which
-/// `start_plan` returns only when the app wants a channel, and on Windows `with_channel` declares
-/// none, so nothing calls this. It exists so the match stays whole, and it is unreachable by
-/// construction rather than by assumption (L30, option A).
-#[cfg(not(unix))]
+/// Windows has no `SIGTERM` and no `std` way to end a process that is not its child, so the polite
+/// phase cannot exist there either: the process is terminated outright with `TerminateProcess`
+/// after re-checking that the pid still names the recorded process. `grace` is how long the caller
+/// lets the process exit before the port is re-checked (W19).
+#[cfg(windows)]
+fn stop_orphan(launch: Launched, grace: Duration) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_TERMINATE};
+    if !may_be_daemon(launch.pid) {
+        return;
+    }
+    // Checked just before terminating, exactly as the Unix arm does: a pid now used by another
+    // process (another start time) is left alone.
+    if process_started(launch.pid) != Some(launch.started) {
+        return;
+    }
+    // SAFETY: OpenProcess takes a pid and a rights mask and returns a handle or null.
+    let process = unsafe { OpenProcess(PROCESS_TERMINATE, 0, launch.pid) };
+    if process.is_null() {
+        return;
+    }
+    // SAFETY: `process` is a live process handle from OpenProcess, and terminating it is the point.
+    unsafe { TerminateProcess(process, 1) };
+    // SAFETY: waiting on a handle this process owns, with a bounded timeout.
+    unsafe { WaitForSingleObject(process, u32::try_from(grace.as_millis()).unwrap_or(u32::MAX)) };
+    // SAFETY: `process` came from OpenProcess and is closed exactly once here.
+    unsafe { CloseHandle(process) };
+}
+
+#[cfg(not(any(unix, windows)))]
 fn stop_orphan(_launch: Launched, _grace: Duration) {}
 
 /// What [`Daemon::ensure_running`] does, from what it finds.
@@ -785,6 +844,8 @@ mod tests {
     use std::os::unix::net::UnixStream;
     #[cfg(unix)]
     use std::process::Command;
+    #[cfg(windows)]
+    use std::process::{Command, Stdio};
 
     fn env_of(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
         move |key| pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| v.to_string())
@@ -1174,6 +1235,96 @@ done"#;
         other.wait().unwrap();
         fs::write(dir.join(PID_FILE), "not a launch\n").unwrap();
         assert_eq!(recorded_launch(&dir), None);
+    }
+
+    /// Set on a child of this very test binary that has to stay alive while the pid file names it.
+    #[cfg(windows)]
+    const PID_HOLDER: &str = "GENTLE_DOT_TEST_PID_HOLDER";
+
+    /// A live process with a readable creation time, without a shell: a copy of this test binary
+    /// that sleeps. The harness runs [`the_pid_holder_waits_until_it_is_killed`] when a pid-file
+    /// test asks for one, and that test returns at once in an ordinary run.
+    #[cfg(windows)]
+    fn sleeper() -> std::process::Child {
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "daemon::tests::the_pid_holder_waits_until_it_is_killed", "--nocapture"])
+            .env(PID_HOLDER, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    /// Not a test of its own: it is the body of the process [`sleeper`] starts.
+    #[cfg(windows)]
+    #[test]
+    fn the_pid_holder_waits_until_it_is_killed() {
+        if std::env::var_os(PID_HOLDER).is_none() {
+            return;
+        }
+        thread::sleep(Duration::from_secs(120));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_live_process_has_a_start_time_and_a_dead_one_does_not() {
+        let mut child = sleeper();
+        let started = process_started(child.id()).expect("a live process has a start time");
+        assert_eq!(process_started(child.id()), Some(started), "the start time is stable while it runs");
+        assert!(process_started(std::process::id()).is_some(), "this process is live");
+        assert_eq!(process_started(0), None);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(process_started(child.id()), None, "a process that ended has no start time");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_pid_file_names_a_live_process_and_drops_it_when_it_dies() {
+        let dir = scratch_dir("pid-file-windows");
+        fs::create_dir_all(&dir).unwrap();
+        assert_eq!(recorded_launch(&dir), None);
+        let mut child = sleeper();
+        record_launch(&dir, child.id()).unwrap();
+        let recorded = recorded_launch(&dir).expect("a recorded launch");
+        assert_eq!(recorded.pid, child.id());
+        assert_eq!(live_orphan(&dir), Some(recorded));
+        // Another start time under that number names a different process: never taken for it.
+        fs::write(dir.join(PID_FILE), format!("{} {}\n", child.id(), recorded.started + 1)).unwrap();
+        assert_eq!(live_orphan(&dir), None);
+        fs::write(dir.join(PID_FILE), format!("{} {}\n", child.id(), recorded.started)).unwrap();
+        assert_eq!(live_orphan(&dir), Some(recorded));
+        // The app itself is never a daemon it may stop.
+        fs::write(dir.join(PID_FILE), format!("{} {}\n", std::process::id(), 1)).unwrap();
+        assert_eq!(recorded_launch(&dir), None);
+        fs::write(dir.join(PID_FILE), format!("{} {}\n", child.id(), recorded.started)).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(live_orphan(&dir), None, "the record is dropped once the process is gone");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stopping_a_recorded_orphan_terminates_only_the_process_it_recorded() {
+        let dir = scratch_dir("stop-orphan-windows");
+        fs::create_dir_all(&dir).unwrap();
+        let mut orphan = sleeper();
+        record_launch(&dir, orphan.id()).unwrap();
+        let recorded = recorded_launch(&dir).unwrap();
+        // A pid whose live start time is not the recorded one is left alone.
+        stop_orphan(Launched { pid: recorded.pid, started: recorded.started + 1 }, Duration::from_secs(2));
+        assert_eq!(orphan.try_wait().unwrap(), None, "a different start time was terminated");
+        // The recorded process is terminated and stops running.
+        stop_orphan(recorded, Duration::from_secs(5));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while orphan.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(orphan.try_wait().unwrap().is_some(), "the recorded orphan is still running");
+        assert_eq!(process_started(recorded.pid), None);
+        // Never this app, whatever the record says.
+        stop_orphan(Launched { pid: std::process::id(), started: 1 }, Duration::from_secs(1));
     }
 
     /// A pid file naming `pid` with its real start time, as `record_launch` would write it.
