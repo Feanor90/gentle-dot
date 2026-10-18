@@ -24,6 +24,7 @@ import {
 	ConnectorStore,
 	policyEnv,
 } from "./connectors.ts";
+import { claimDaemonDirs, daemonClaimDirs, daemonClaimMessage, releaseDaemonClaims } from "./daemon-claim.ts";
 import { directAccess, type EngineAccess, engineAccess } from "./engine-access.ts";
 import { approvalRequest } from "./extensions/approval-guard.ts";
 import {
@@ -153,6 +154,24 @@ export function startupMessage(url: string, dataDir: string, interactive: boolea
 
 export async function startDaemon(options: DaemonOptions): Promise<DotDaemon> {
 	const log = options.log ?? (() => {});
+	// One daemon per data folder (W24): the port bind only stops a second daemon on the same port, so
+	// the folders the daemon owns are claimed here, before anything is written into them.
+	const claim = claimDaemonDirs(daemonClaimDirs(options.dataDir, options.agentHome));
+	if (claim.status !== "claimed") throw new Error(daemonClaimMessage(claim));
+	try {
+		return await startClaimedDaemon(options, log, claim.files);
+	} catch (error) {
+		// A daemon that did not start must not leave its claim behind either.
+		releaseDaemonClaims(claim.files);
+		throw error;
+	}
+}
+
+async function startClaimedDaemon(
+	options: DaemonOptions,
+	log: (line: string) => void,
+	claims: string[],
+): Promise<DotDaemon> {
 	const token = ensureToken(options.dataDir);
 	const vps = options.vps;
 	// Server mode (S25.8): the daemon's files stay its own, the engine's folders become the engine's,
@@ -404,6 +423,9 @@ export async function startDaemon(options: DaemonOptions): Promise<DotDaemon> {
 		connectorStore.close();
 		authHelper?.close();
 		await memory?.stop();
+		// The folders are free for the next start; a claim left by a kill is taken over by liveness
+		// instead, so this only keeps a clean stop from leaving the file behind.
+		releaseDaemonClaims(claims);
 	};
 	let stopping: Promise<void> | undefined;
 	const close = (): Promise<void> => {
