@@ -562,19 +562,31 @@ fn spawn_snapper(app: AppHandle) -> mpsc::Sender<()> {
 /// possible — the gate is the mitigation, and the panel keeps `effects=none` when it does not
 /// fire. Linux gets nothing, and `WebviewWindowBuilder::effects` is documented as unsupported
 /// there.
+/// The material the panel asks the window system for, as a pure decision so every OS can test it
+/// without opening a window: the effect the panel resolved, mapped to the tauri material and the
+/// corner radius it goes with (`HudWindow` takes 20.0; `Mica` uses the builder's default).
+/// `None` means the OS gets no material, which is Linux and Windows whenever the backdrop facts
+/// do not hold.
+fn panel_material(effect: WindowEffect) -> Option<(Effect, Option<f64>)> {
+    match effect {
+        WindowEffect::HudWindow => Some((Effect::HudWindow, Some(20.0))),
+        WindowEffect::Mica => Some((Effect::Mica, None)),
+        WindowEffect::None => None,
+    }
+}
+
 fn with_panel_effects<'a, R: tauri::Runtime, M: tauri::Manager<R>>(
     panel: WebviewWindowBuilder<'a, R, M>,
     effect: WindowEffect,
 ) -> WebviewWindowBuilder<'a, R, M> {
-    match effect {
-        WindowEffect::HudWindow => panel.effects(
-            EffectsBuilder::new().effect(Effect::HudWindow).state(EffectState::Active).radius(20.0).build(),
-        ),
-        WindowEffect::Mica => {
-            panel.effects(EffectsBuilder::new().effect(Effect::Mica).state(EffectState::Active).build())
-        }
-        WindowEffect::None => panel,
+    let Some((material, radius)) = panel_material(effect) else {
+        return panel;
+    };
+    let mut effects = EffectsBuilder::new().effect(material).state(EffectState::Active);
+    if let Some(radius) = radius {
+        effects = effects.radius(radius);
     }
+    panel.effects(effects.build())
 }
 
 fn build_windows(
@@ -1085,5 +1097,15 @@ mod tests {
         assert!(!conversations_on(None));
         assert!(!conversations_on(Some("0")));
         assert!(!conversations_on(Some("true")));
+    }
+
+    #[test]
+    fn the_panel_material_follows_the_effect_the_os_chose() {
+        assert!(matches!(
+            panel_material(WindowEffect::HudWindow),
+            Some((Effect::HudWindow, Some(radius))) if radius == 20.0
+        ));
+        assert!(matches!(panel_material(WindowEffect::Mica), Some((Effect::Mica, None))));
+        assert!(panel_material(WindowEffect::None).is_none());
     }
 }

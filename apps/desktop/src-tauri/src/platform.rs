@@ -461,13 +461,15 @@ mod tests {
         assert!(!panel_url(effect).ends_with("effects=none"));
     }
 
+    /// `has_panel_effect` *is* `panel_effect(..) != None`, so asserting that pair only restates
+    /// the definition. The two functions that can actually disagree are `panel_effect`, which
+    /// picks the material, and `panel_url`, which decides whether the UI paints its own
+    /// background; that is what this test cross-checks for every OS and fact combination.
     #[test]
-    fn has_panel_effect_agrees_with_the_effect_it_names() {
+    fn the_url_agrees_with_the_effect_the_os_chose() {
         for os in [Os::MacOs, Os::Windows, Os::Linux] {
             for facts in [WindowsBackdrop::unknown(), WINDOWS_11] {
                 let effect = os.panel_effect(facts);
-                assert_eq!(os.has_panel_effect(facts), effect != WindowEffect::None, "{os:?} {facts:?}");
-                // The URL and the requested material agree for every OS and every fact combination.
                 assert_eq!(
                     !panel_url(effect).ends_with("effects=none"),
                     effect != WindowEffect::None,
