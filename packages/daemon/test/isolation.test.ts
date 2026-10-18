@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { type DotDaemon, startDaemon } from "../src/daemon.ts";
 import {
@@ -18,9 +18,12 @@ afterEach(async () => {
 
 describe("isolatedAgentEnv PATH", () => {
 	it("puts the bundled `pi` first so the engine's first-run setup works on a clean machine", () => {
-		const env = isolatedAgentEnv({ PATH: "/usr/bin:/bin", HOME: tempDir() }, tempDir());
-		const [first, ...rest] = (env.PATH ?? "").split(":");
-		expect(first).toMatch(/node_modules\/\.bin$/);
+		// The input PATH is built with the platform's own separator, and read back the same way: a
+		// POSIX-shaped literal is one segment on Windows, and the test then asserts the drive letter of
+		// a path that does start with the bundled folder (W4a's lesson, at the fixture's own input).
+		const env = isolatedAgentEnv({ PATH: ["/usr/bin", "/bin"].join(delimiter), HOME: tempDir() }, tempDir());
+		const [first, ...rest] = (env.PATH ?? "").split(delimiter);
+		expect(first).toMatch(/node_modules[\\/]\.bin$/);
 		expect(existsSync(join(first ?? "", "pi"))).toBe(true);
 		expect(rest).toEqual(["/usr/bin", "/bin"]);
 	});

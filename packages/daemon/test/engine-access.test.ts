@@ -9,12 +9,16 @@ import { engineAccess, insideEngineAccess } from "../src/engine-access.ts";
 import { writePrivateFile } from "../src/private-file.ts";
 import { tempDir } from "./helpers.ts";
 import { canCreateFileSymlinks } from "./support/fixture-capabilities.ts";
+import { hasServerMode } from "./support/platform-absence.ts";
 import { expectPosixMode } from "./support/posix-modes.ts";
 
 const own = { uid: process.getuid?.() ?? 0, gid: process.getgid?.() ?? 0 };
 const SRC = fileURLToPath(new URL("../src/", import.meta.url));
 
-describe("engine access", () => {
+describe.skipIf(
+	// Server mode takes the engine's user with setuid, which Windows does not have (S25.8).
+	!hasServerMode("engine access"),
+)("engine access", () => {
 	it("runs a synchronous call and says it is inside while it runs", () => {
 		const access = engineAccess(own);
 		expect(insideEngineAccess()).toBe(false);
@@ -56,12 +60,17 @@ describe("the daemon's own files", () => {
 		expect(readdirSync(dir).sort()).toEqual(["state.json", "target"]);
 	});
 
-	it("are never written inside an engine-access call, and nothing is left behind", () => {
-		const dir = tempDir();
-		expect(() => engineAccess(own)(() => writePrivateFile(join(dir, "token"), "x"))).toThrow(/engine's user/);
-		expect(existsSync(join(dir, "token"))).toBe(false);
-		expect(readdirSync(dir)).toEqual([]);
-	});
+	it.skipIf(!hasServerMode("the daemon's own files: a call writes no daemon file"))(
+		"are never written inside an engine-access call, and nothing is left behind",
+		() => {
+			const dir = tempDir();
+			expect(() => engineAccess(own)(() => writePrivateFile(join(dir, "token"), "x"))).toThrow(
+				/engine's user/,
+			);
+			expect(existsSync(join(dir, "token"))).toBe(false);
+			expect(readdirSync(dir)).toEqual([]);
+		},
+	);
 });
 
 describe("no file work on libuv's thread pool (S25.8, B1)", () => {

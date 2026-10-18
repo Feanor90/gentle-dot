@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import { type DaemonOptions, type DotDaemon, startDaemon } from "../src/daemon.ts";
 import { FAKE_AGENT, tempDir, waitFor } from "./helpers.ts";
+import { hasServerMode } from "./support/platform-absence.ts";
 
 const CLI = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
 const own = { uid: process.getuid?.() ?? 0, gid: process.getgid?.() ?? 0 };
@@ -101,7 +102,10 @@ const vpsAs = (engine: { uid: number; gid: number }): NonNullable<DaemonOptions[
 	authHelper: { command: process.execPath, args: [CLI, "--auth-helper"] },
 });
 
-describe("server mode: sign-in runs as the engine's user (S25.8, B1)", () => {
+describe.skipIf(
+	// The helper runs as the engine's user, which server mode takes with setuid (S25.8).
+	!hasServerMode("server mode: sign-in runs as the engine's user (S25.8, B1)"),
+)("server mode: sign-in runs as the engine's user (S25.8, B1)", () => {
 	it("never runs a planted `!command` API key in the daemon's own process", async () => {
 		const marker = join(tempDir(), "who-ran-it");
 		const s = await setup(vpsAs(own), (home) => plantCommandKey(home, marker));
