@@ -1,4 +1,4 @@
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.ts";
@@ -71,6 +71,32 @@ describe("loadConfig", () => {
 			GENTLE_DOT_WORKSPACE: join(dataDir, "workspace"),
 		});
 		expect(same.preferredFolder).toBeUndefined();
+	});
+
+	it("reads the memory mode, absent meaning the user's shared Engram", () => {
+		const dataDir = tempDir();
+		expect(loadConfig({ GENTLE_DOT_DATA_DIR: dataDir }).memory).toBe("shared");
+		writeFileSync(join(dataDir, "config.json"), JSON.stringify({ memory: "private" }));
+		expect(loadConfig({ GENTLE_DOT_DATA_DIR: dataDir }).memory).toBe("private");
+	});
+
+	it("lets GENTLE_DOT_ENGRAM win over the file, as GENTLE_DOT_PORT does for port", () => {
+		const dataDir = tempDir();
+		writeFileSync(join(dataDir, "config.json"), JSON.stringify({ memory: "shared" }));
+		expect(loadConfig({ GENTLE_DOT_DATA_DIR: dataDir, GENTLE_DOT_ENGRAM: "private" }).memory).toBe("private");
+		writeFileSync(join(dataDir, "config.json"), JSON.stringify({ memory: "private" }));
+		expect(loadConfig({ GENTLE_DOT_DATA_DIR: dataDir, GENTLE_DOT_ENGRAM: "shared" }).memory).toBe("shared");
+	});
+
+	it("refuses an unknown memory value and leaves the file alone", () => {
+		const dataDir = tempDir();
+		const file = join(dataDir, "config.json");
+		const written = JSON.stringify({ memory: "secret", port: 5000 });
+		writeFileSync(file, written);
+		expect(() => loadConfig({ GENTLE_DOT_DATA_DIR: dataDir })).toThrow(
+			"Invalid memory in config.json: secret",
+		);
+		expect(readFileSync(file, "utf8")).toBe(written);
 	});
 
 	it("rejects an invalid port and a malformed argument list", () => {

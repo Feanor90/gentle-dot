@@ -17,6 +17,7 @@ import { AppChannel } from "./app-channel.ts";
 import { AuthManager, type AuthRuntime, createModelAuthRuntime, resolveAgentHome } from "./auth.ts";
 import { AuthHelper } from "./auth-helper.ts";
 import { type BridgeClient, DotBridge } from "./bridge.ts";
+import { type MemoryMode, memoryMode } from "./config.ts";
 import {
 	APPROVAL_GUARD,
 	ConnectorManager,
@@ -152,6 +153,17 @@ export function startupMessage(url: string, dataDir: string, interactive: boolea
 	return `Gentle Dot is running at ${url.split("#")[0]} (the access key is in ${join(dataDir, "token")})`;
 }
 
+/**
+ * Applies the memory mode (SW9, W26) to the environment the engine starts with. The mode is
+ * written back as `GENTLE_DOT_ENGRAM` — the documented override, and what `isolatedAgentEnv` and
+ * `privateMemory` read — so `config.json`'s `memory` behaves exactly like exporting the variable
+ * does. `shared` leaves the environment as it is: only `private` selects private mode.
+ */
+export function applyMemoryMode(base: NodeJS.ProcessEnv, memory: MemoryMode): NodeJS.ProcessEnv {
+	if (memory !== "private") return base;
+	return { ...base, GENTLE_DOT_ENGRAM: "private" };
+}
+
 export async function startDaemon(options: DaemonOptions): Promise<DotDaemon> {
 	const log = options.log ?? (() => {});
 	// One daemon per data folder (W24): the port bind only stops a second daemon on the same port, so
@@ -193,6 +205,12 @@ async function startClaimedDaemon(
 	let agentEnv = { ...(options.agentEnv ?? process.env) };
 	// The server's secrets key is the daemon's only, whatever the engine is (S25.8).
 	delete agentEnv[SECRETS_KEY_VAR];
+	// Memory is a setting, not an environment variable (SW9, W26): the mode `config.json` names is
+	// applied to the base environment here, before the private server is looked for and before the
+	// isolation, so the engine, its subagents and the private memory server all see one switch.
+	// `GENTLE_DOT_ENGRAM` stays the documented override — `memoryMode` lets it win over the file, as
+	// `GENTLE_DOT_PORT` does for `port` — and it is what `isolatedAgentEnv` and `privateMemory` read.
+	agentEnv = applyMemoryMode(agentEnv, memoryMode(agentEnv, options.dataDir));
 	const homeArgs: string[] = [];
 	const memory = options.agentHome ? await privateMemory(agentEnv, options.dataDir, log, access) : undefined;
 	if (options.agentHome) {
