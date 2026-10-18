@@ -13,7 +13,10 @@ name: Windows
 
 on:
   push:
-    branches: [main]
+    # `main` is the branch this workflow guards. `feat/windows-port` is listed while the staged port
+    # lives there, because its own pushes would otherwise never run the suite they change (W27); the
+    # line goes away with the branch when the port merges.
+    branches: [main, feat/windows-port]
   pull_request:
   workflow_dispatch:
 
@@ -29,9 +32,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The daemon, the protocol, and the UI. These are supposed to be platform-neutral already,
-  # so this job is expected to pass. If it does not, it found real POSIX assumptions that
-  # W4 and W5 exist to remove -- and this job going green is how those units are accepted.
+  # The daemon, the protocol, and the UI. These are platform-neutral, so this job passes on Windows:
+  # the POSIX assumptions W4 and W5 removed are gone, and the suites whose *subject* Windows does not
+  # have -- the inherited fd 3, and server mode's setuid -- skip with a named reason on raw stderr
+  # instead of failing (W27, `packages/daemon/test/support/platform-absence.ts`). The job is blocking,
+  # so a new failure in it is a real one.
   typescript:
     name: TypeScript (daemon, protocol, UI)
     runs-on: windows-latest
@@ -69,22 +74,19 @@ jobs:
       - name: Test
         run: pnpm test
 
-  # Non-blocking on purpose, and the reason is concrete, not decorative: the shell does not
-  # compile on Windows yet. `src/daemon.rs` and `src/app_channel.rs` use `std::os::unix` and
-  # `std::os::fd` unconditionally (a Unix socketpair on fd 3), which W6 gates and W7 replaces.
+  # The shell compiles and passes on Windows, so this job is blocking: measured on a
+  # `windows-latest` runner at `e12d300`, `cargo test` reports `406 passed; 0 failed; 4 ignored`
+  # (2026-10-18, run 39101716169), the same suite a Windows 11 host reports.
   #
-  # It runs anyway because the failure output is the input to that work: it tells us exactly
-  # which modules need a Windows arm, instead of us guessing. Measured on Windows 11: 57 errors,
-  # 46 of them in `daemon.rs` (26 in production, 20 in its test module), one in `app_channel.rs`
-  # and one in `voice/app.rs`.
-  #
-  # REMOVE `continue-on-error` when the job can compile and run on Windows. That is W6 for the
-  # compilation and W7 for the channel, and it is not W7 alone: the job used to fail before a
-  # single line of this crate compiled, because `tauri-build` needs `icons/icon.ico` (W8).
+  # Its history is why the flag was worth stating rather than deleting quietly. It ran with
+  # `continue-on-error` while `src/daemon.rs` and `src/app_channel.rs` used `std::os::unix` and
+  # `std::os::fd` unconditionally, first because `tauri-build` needs `icons/icon.ico` (W8) and then
+  # on 57 compile errors in its own sources (W6). W6 gated the production surface, W6c the test
+  # surface, and W7 replaced the fd-3 channel with a named pipe, so the condition the old comment
+  # named is now met on the runner instead of predicted from a developer machine (W27).
   rust:
-    name: Rust shell (expected to fail until W6 and W7)
+    name: Rust shell
     runs-on: windows-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
 
