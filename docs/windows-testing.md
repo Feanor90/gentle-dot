@@ -47,6 +47,16 @@ A **debug** build is not a substitute. One produced by `tauri dev` loads the UI 
 
 If the build fails inside a dependency's build script with a silent `cl.exe` error and no other output, see the troubleshooting table.
 
+## Running the JavaScript tests
+
+The daemon suite (`npx vitest run packages/daemon/test`, or `pnpm test` for everything) runs on a plain Windows install. Four of its tests need one thing a Windows user does not have by default: the privilege to create a **file** symlink. A plain install refuses it with `EPERM`, so instead of failing those four tests **skip**, and each prints one line on raw stderr naming what it skipped and the way out:
+
+```text
+fixture-capabilities: skipping <the fixture>; this host refuses to create a file symlink (the attempt failed with EPERM), and a file symlink has no unprivileged substitute here (a junction is directory-only and a hardlink is not a link); turn on Windows Developer Mode, or run the suite from an elevated terminal, to run it (see odd/tasks/windows-port.md).
+```
+
+Turn on **Developer Mode** (Settings → System → For developers) or run the suite from an **elevated** terminal, and the four run like any other test. Directory links are junctions, need no privilege, and run either way. The assertions that need no privilege keep running on a host without it — including the hardlink and the plain path spellings in the same file — and no fixture is ever quietly replaced by something weaker.
+
 ## The checklist
 
 Do each step in order and note **Pass**, **Fail**, **Partial**, or **N/A** for each one. If something fails, keep going; later steps often still work.
