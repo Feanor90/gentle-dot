@@ -14,6 +14,11 @@ import { hasServerMode } from "./support/platform-absence.ts";
 
 const CLI = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
 const own = { uid: process.getuid?.() ?? 0, gid: process.getgid?.() ?? 0 };
+// Server mode takes the engine's user with setuid, which Windows does not have (S25.8). The sign-in
+// tests that need the helper to run as that user skip where it is absent; the one that asserts a
+// helper that **cannot** start, and therefore signs nothing in, runs everywhere — "nothing runs" is
+// the property it holds on any host, and gating its whole `describe` took it out on Windows.
+const serverModeSignIn = hasServerMode("server mode: sign-in runs as the engine's user (S25.8, B1)");
 
 const daemons: DotDaemon[] = [];
 afterEach(async () => {
@@ -102,23 +107,7 @@ const vpsAs = (engine: { uid: number; gid: number }): NonNullable<DaemonOptions[
 	authHelper: { command: process.execPath, args: [CLI, "--auth-helper"] },
 });
 
-describe.skipIf(
-	// The helper runs as the engine's user, which server mode takes with setuid (S25.8).
-	!hasServerMode("server mode: sign-in runs as the engine's user (S25.8, B1)"),
-)("server mode: sign-in runs as the engine's user (S25.8, B1)", () => {
-	it("never runs a planted `!command` API key in the daemon's own process", async () => {
-		const marker = join(tempDir(), "who-ran-it");
-		const s = await setup(vpsAs(own), (home) => plantCommandKey(home, marker));
-		const listed = await s.accounts();
-		// The key resolved, so voice is on, but in the helper: the shell's parent is not the daemon.
-		expect(listed.providers.find((p) => p.id === "openai")).toMatchObject({ configured: true });
-		expect(listed.voice).toMatchObject({ transcribe: true });
-		await waitFor(() => existsSync(marker));
-		const parent = Number(readFileSync(marker, "utf8").trim());
-		expect(parent).toBeGreaterThan(0);
-		expect(parent).not.toBe(process.pid);
-	});
-
+describe("server mode: sign-in runs as the engine's user (S25.8, B1)", () => {
 	it("fails closed when the helper cannot start as the engine's user: nothing runs", async () => {
 		// A user the test cannot become: the helper's spawn is refused, like a broken engine user.
 		const marker = join(tempDir(), "who-ran-it");
@@ -133,37 +122,55 @@ describe.skipIf(
 		expect(existsSync(marker)).toBe(false);
 	});
 
-	it("signs in, lists, uses the key for voice, and signs out through the helper", async () => {
-		const s = await setup(vpsAs(own));
-		expect((await s.signIn("openai", "sk-helper-test-not-real")).ok).toBe(true);
-		const auth = JSON.parse(readFileSync(join(s.agentHome, "auth.json"), "utf8"));
-		expect(auth.openai).toMatchObject({ type: "api_key", key: "sk-helper-test-not-real" });
-		const listed = await s.accounts();
-		expect(listed.providers.find((p) => p.id === "openai")).toMatchObject({
-			configured: true,
-			source: "stored",
+	describe.skipIf(
+		// Sign-in through a helper that runs as the engine's user, which server mode takes with setuid.
+		!serverModeSignIn,
+	)("the helper runs as the engine's user", () => {
+		it("never runs a planted `!command` API key in the daemon's own process", async () => {
+			const marker = join(tempDir(), "who-ran-it");
+			const s = await setup(vpsAs(own), (home) => plantCommandKey(home, marker));
+			const listed = await s.accounts();
+			// The key resolved, so voice is on, but in the helper: the shell's parent is not the daemon.
+			expect(listed.providers.find((p) => p.id === "openai")).toMatchObject({ configured: true });
+			expect(listed.voice).toMatchObject({ transcribe: true });
+			await waitFor(() => existsSync(marker));
+			const parent = Number(readFileSync(marker, "utf8").trim());
+			expect(parent).toBeGreaterThan(0);
+			expect(parent).not.toBe(process.pid);
 		});
-		expect(listed.voice).toMatchObject({ transcribe: true });
-		s.send({ type: "auth_logout", providerId: "openai" });
-		await waitFor(() => !JSON.parse(readFileSync(join(s.agentHome, "auth.json"), "utf8")).openai);
-		expect((await s.accounts()).providers.find((p) => p.id === "openai")).toMatchObject({
-			configured: false,
-		});
-	});
 
-	it("cancels a sign-in waiting in the helper", async () => {
-		const s = await setup(vpsAs(own));
-		const seen = s.messages.length;
-		s.send({ type: "auth_login", providerId: "openai", method: "api_key" });
-		const prompt = await s.find("auth_prompt", () => true, seen);
-		s.send({ type: "auth_reply", flowId: prompt.prompt.flowId, cancelled: true });
-		expect(await s.find("auth_done", () => true, seen)).toMatchObject({
-			ok: false,
-			message: "Sign-in cancelled.",
+		it("signs in, lists, uses the key for voice, and signs out through the helper", async () => {
+			const s = await setup(vpsAs(own));
+			expect((await s.signIn("openai", "sk-helper-test-not-real")).ok).toBe(true);
+			const auth = JSON.parse(readFileSync(join(s.agentHome, "auth.json"), "utf8"));
+			expect(auth.openai).toMatchObject({ type: "api_key", key: "sk-helper-test-not-real" });
+			const listed = await s.accounts();
+			expect(listed.providers.find((p) => p.id === "openai")).toMatchObject({
+				configured: true,
+				source: "stored",
+			});
+			expect(listed.voice).toMatchObject({ transcribe: true });
+			s.send({ type: "auth_logout", providerId: "openai" });
+			await waitFor(() => !JSON.parse(readFileSync(join(s.agentHome, "auth.json"), "utf8")).openai);
+			expect((await s.accounts()).providers.find((p) => p.id === "openai")).toMatchObject({
+				configured: false,
+			});
 		});
-		expect(
-			existsSync(join(s.agentHome, "auth.json")) && readFileSync(join(s.agentHome, "auth.json"), "utf8"),
-		).not.toContain("openai");
+
+		it("cancels a sign-in waiting in the helper", async () => {
+			const s = await setup(vpsAs(own));
+			const seen = s.messages.length;
+			s.send({ type: "auth_login", providerId: "openai", method: "api_key" });
+			const prompt = await s.find("auth_prompt", () => true, seen);
+			s.send({ type: "auth_reply", flowId: prompt.prompt.flowId, cancelled: true });
+			expect(await s.find("auth_done", () => true, seen)).toMatchObject({
+				ok: false,
+				message: "Sign-in cancelled.",
+			});
+			expect(
+				existsSync(join(s.agentHome, "auth.json")) && readFileSync(join(s.agentHome, "auth.json"), "utf8"),
+			).not.toContain("openai");
+		});
 	});
 });
 
