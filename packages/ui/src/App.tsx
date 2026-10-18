@@ -16,6 +16,7 @@ import {
 	startDragging,
 	togglePanel,
 } from "./desktop.ts";
+import { startupTrace } from "./startup-trace.ts";
 import { createUploader } from "./uploads.ts";
 import { useComputerAvailable, useComputerState } from "./useComputer.ts";
 import { useDot } from "./useDot.ts";
@@ -66,6 +67,7 @@ function Assistant({ surface }: { surface: Surface }) {
 	/** Why the desktop app could not reach its assistant, in the app's own words (S35.2). */
 	const [unreachable, setUnreachable] = useState<string>();
 	const [focusKey, setFocusKey] = useState(0);
+	const traceSurface = useRef(surface);
 	const { state, send, dismiss, dispatch } = useDot(info);
 	// Files go to the daemon over HTTP, with the same access key as the WebSocket (S31.2).
 	const upload = useMemo(() => (info ? createUploader(info) : undefined), [info]);
@@ -105,11 +107,49 @@ function Assistant({ surface }: { surface: Surface }) {
 
 	useEffect(() => {
 		if (inDesktop()) {
+			const surface = traceSurface.current;
 			let live = true;
-			const connect = () =>
-				connectionInfo().then(
+			let requests = 0;
+			let inFlight = false;
+			let readyPending = false;
+			let recovering = true;
+			let retry: ReturnType<typeof setTimeout> | undefined;
+			// One mount gets one cold-start window; ready events never renew it. Leave room
+			// for the unchanged native 20 s wait, including when a WebView timer runs late.
+			const deadline = performance.now() + 180_000;
+			const clearRetry = () => {
+				clearTimeout(retry);
+				retry = undefined;
+			};
+			const accept = (request: number) => {
+				if (!live) {
+					startupTrace(surface, request, "connection-late-ignored");
+					return false;
+				}
+				inFlight = false;
+				if (readyPending) {
+					readyPending = false;
+					connect();
+					return false;
+				}
+				return true;
+			};
+			const connect = () => {
+				if (!live) return;
+				clearRetry();
+				if (inFlight) {
+					readyPending = true;
+					return;
+				}
+				inFlight = true;
+				const request = ++requests;
+				startupTrace(surface, request, "connection-start");
+				return connectionInfo().then(
 					(next) => {
-						if (!live) return;
+						startupTrace(surface, request, "connection-succeeded");
+						if (!accept(request)) return;
+						recovering = false;
+						clearRetry();
 						// The same assistant keeps its connection; only a new one replaces it.
 						setInfo((current) =>
 							current?.url === next.url && current.token === next.token ? current : next,
@@ -118,18 +158,42 @@ function Assistant({ surface }: { surface: Surface }) {
 						setMissingToken(false);
 					},
 					(error: unknown) => {
-						if (!live) return;
+						startupTrace(surface, request, "connection-failed");
+						if (!accept(request)) return;
 						const reason = typeof error === "string" ? error : error instanceof Error ? error.message : "";
 						if (reason) setUnreachable(reason);
 						else setMissingToken(true);
+						// Only Rust's exact readiness timeout is transient. Security refusals,
+						// missing credentials, and unknown rejections never start a retry loop.
+						const timeout = reason.match(/^the assistant did not answer on port [0-9]+ \(see daemon\.log\)$/);
+						if (timeout?.[0] !== reason) {
+							recovering = false;
+							return;
+						}
+						if (recovering && performance.now() + 1_000 + 20_000 <= deadline) {
+							retry = setTimeout(() => {
+								retry = undefined;
+								if (live && performance.now() + 20_000 <= deadline) connect();
+							}, 1_000);
+						}
 					},
 				);
+			};
 			// A refused or timed-out window recovers without a reopen: the app reports its assistant
 			// ready after Restart assistant, or after a start slower than `connection_info` waits (S35.2).
-			const ready = onDesktopEvent("dot://assistant-ready", () => void connect());
+			startupTrace(surface, 0, "listener-registering");
+			const ready = onDesktopEvent("dot://assistant-ready", () => {
+				startupTrace(surface, 0, "ready-received");
+				void connect();
+			});
+			void ready.then(
+				() => startupTrace(surface, 0, "listener-registered"),
+				() => startupTrace(surface, 0, "listener-failed"),
+			);
 			void connect();
 			return () => {
 				live = false;
+				clearRetry();
 				void ready.then((unlisten) => unlisten());
 			};
 		}

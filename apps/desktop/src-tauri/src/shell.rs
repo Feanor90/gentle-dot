@@ -15,6 +15,7 @@ use crate::platform::{self, LaunchRequest, Os, DOT_TITLE, PANEL_TITLE};
 use crate::position::{self, DotPosition};
 use crate::secure_store::{self, SecretStore};
 use crate::shortcut;
+use crate::startup_trace::{Step, Trace};
 use crate::status::{is_template, tray_status, TrayGlyph};
 use crate::voice::app as voice;
 use std::path::PathBuf;
@@ -49,6 +50,9 @@ const EDGE_MARGIN: i32 = 12;
 const PANEL_GAP: i32 = 8;
 const DRAG_SETTLE: Duration = Duration::from_millis(300);
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(20);
+// Cold login can outlast a window's connection request. Keep the startup worker waiting so
+// ensure_running can emit ASSISTANT_READY when this app's daemon finally answers.
+const DAEMON_COLD_START_TIMEOUT: Duration = Duration::from_secs(180);
 /// Sent to the Dot and the panel each time the assistant this app may use starts answering (at
 /// launch or after Restart assistant): a window that was refused, or whose `connection_info` gave up
 /// first, asks again and connects without a reopen (S35.2).
@@ -222,8 +226,14 @@ async fn connection_info(app: AppHandle) -> CommandResult<ConnectionInfo> {
     let shell = app.state::<Shell>();
     let (config, daemon) = (shell.config.clone(), shell.daemon.clone());
     tauri::async_runtime::spawn_blocking(move || {
-        daemon.wait_ready(DAEMON_START_TIMEOUT)?;
-        read_connection_info(&config)
+        let trace = Trace::begin(Step::ConnectionWaitBegin);
+        let ready = daemon.wait_ready(DAEMON_START_TIMEOUT);
+        trace.outcome(&ready, Step::ConnectionWaitSucceeded, Step::ConnectionWaitFailed);
+        ready?;
+        trace.record(Step::TokenReadBegin);
+        let info = read_connection_info(&config);
+        trace.outcome(&info, Step::TokenReadSucceeded, Step::TokenReadFailed);
+        info
     })
     .await
     .map_err(err)?
@@ -903,7 +913,10 @@ pub fn run() {
                 .with_conversations(config.conversations)
                 .with_channel(Arc::new(service))
                 .on_ready(Arc::new(move || {
-                    if let Err(error) = announcer.emit(ASSISTANT_READY, ()) {
+                    let trace = Trace::begin(Step::ReadyEmitBegin);
+                    let emitted = announcer.emit(ASSISTANT_READY, ());
+                    trace.outcome(&emitted, Step::ReadyEmitSucceeded, Step::ReadyEmitFailed);
+                    if let Err(error) = emitted {
                         eprintln!("gentle-dot: cannot tell the windows the assistant is ready: {error}");
                     }
                 }));
@@ -914,7 +927,10 @@ pub fn run() {
             let daemon = Arc::new(daemon);
             let (starter, notifier) = (daemon.clone(), handle.clone());
             thread::spawn(move || {
-                if let Err(error) = starter.ensure_running(DAEMON_START_TIMEOUT) {
+                let trace = Trace::begin(Step::StartupBegin);
+                let started = starter.ensure_running(DAEMON_COLD_START_TIMEOUT);
+                trace.outcome(&started, Step::StartupSucceeded, Step::StartupFailed);
+                if let Err(error) = started {
                     eprintln!("gentle-dot: {error}");
                     // Another daemon holds the port (S35.2): say so, with the way out, instead of using it.
                     if starter.refusal().is_some() {
@@ -983,6 +999,14 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cold_start_keeps_waiting_after_a_window_gives_up() {
+        assert!(DAEMON_COLD_START_TIMEOUT > DAEMON_START_TIMEOUT);
+        assert_eq!(DAEMON_COLD_START_TIMEOUT, Duration::from_secs(180));
+        // Connection requests and explicit restarts keep their existing bounded wait.
+        assert_eq!(DAEMON_START_TIMEOUT, Duration::from_secs(20));
+    }
 
     #[test]
     fn tray_hides_new_conversation_in_the_single_chat() {

@@ -1523,6 +1523,43 @@ done"#;
     }
 
     #[test]
+    fn a_cold_start_announces_ready_after_the_window_timed_out() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let healthy = Arc::new(AtomicBool::new(false));
+        let announcements = Arc::new(AtomicUsize::new(0));
+        let dir = scratch_dir("cold-start-ready");
+        let daemon = Arc::new(Daemon::new(1, dir.clone(), None)
+            .with_channel(Arc::new(Opened::default()))
+            .with_launch(echo_spec())
+            .with_health({
+                let healthy = healthy.clone();
+                Arc::new(move || healthy.load(Ordering::SeqCst))
+            })
+            .on_ready({
+                let announcements = announcements.clone();
+                Arc::new(move || { announcements.fetch_add(1, Ordering::SeqCst); })
+            }));
+        daemon.spawn().unwrap();
+        // A window's short request expires while the startup worker still owns its daemon.
+        let window = daemon.wait_ready(Duration::ZERO);
+        assert_eq!(window, Err("the assistant did not answer on port 1 (see daemon.log)".into()));
+        assert_eq!(announcements.load(Ordering::SeqCst), 0);
+        let starter = daemon.clone();
+        let worker = thread::spawn(move || starter.ensure_running(Duration::from_secs(5)));
+        healthy.store(true, Ordering::SeqCst);
+        let result = worker.join().unwrap();
+        let reconnected = daemon.wait_ready(Duration::ZERO);
+        let channel_present = daemon.channel().is_some();
+        daemon.stop();
+        assert_eq!(result, Ok(()));
+        assert_eq!(reconnected, Ok(()));
+        assert!(channel_present);
+        assert_eq!(announcements.load(Ordering::SeqCst), 1);
+        assert!(!daemon.owns_running());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_daemon_this_app_spawned_gets_a_channel_until_it_stops() {
         let handler = Arc::new(Opened::default());
         let daemon = Daemon::new(1, scratch_dir("channel-own"), None)

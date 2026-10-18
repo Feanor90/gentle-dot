@@ -17,6 +17,7 @@ pub mod position;
 pub mod secure_store;
 mod shell;
 pub mod shortcut;
+mod startup_trace;
 pub mod status;
 pub mod voice;
 #[cfg(windows)]
