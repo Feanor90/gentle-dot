@@ -26,9 +26,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # The Rust shell is built by cargo, but its build script (apps/desktop/src-tauri/build.rs)
-  # records the node and PATH it finds at build time. Nothing here needs them for `cargo test`,
-  # so the job stays honest about what it actually verifies.
+  # `always` keeps cargo's diagnostics colored, so a failure in the Windows job is readable in the log.
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -77,6 +75,10 @@ jobs:
   # The shell compiles and passes on Windows, so this job is blocking: measured on a
   # `windows-latest` runner at `e12d300`, `cargo test` reports `406 passed; 0 failed; 4 ignored`
   # (2026-10-18, run 39101716169), the same suite a Windows 11 host reports.
+  #
+  # It installs no node and no PATH of its own: `build.rs` records the node and PATH it finds at
+  # build time, and `cargo test` never consults them, so a setup step for either would only make
+  # the job look broader than it is.
   #
   # Its history is why the flag was worth stating rather than deleting quietly. It ran with
   # `continue-on-error` while `src/daemon.rs` and `src/app_channel.rs` used `std::os::unix` and
