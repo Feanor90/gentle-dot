@@ -43,6 +43,8 @@ The second command is a release build. With `apps/desktop/src-tauri/tauri.window
 apps/desktop/src-tauri/target/release/gentle-dot.exe
 ```
 
+A **debug** build is not a substitute. One produced by `tauri dev` loads the UI from the Vite dev server named by `devUrl` and embeds no UI assets, so running `apps/desktop/src-tauri/target/debug/gentle-dot.exe` on its own opens a **blank white window** (measured). To work on the app, run `pnpm --filter @gentle-dot/desktop dev`, which starts that server first.
+
 If the build fails inside a dependency's build script with a silent `cl.exe` error and no other output, see the troubleshooting table.
 
 ## The checklist
