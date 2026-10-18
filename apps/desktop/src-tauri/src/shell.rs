@@ -67,6 +67,8 @@ struct Shell {
     full_screen: Mutex<Option<Rect>>,
     /// The shortcut that toggles the panel now; `None` while none is bound (native Wayland).
     shortcut: Mutex<Option<String>>,
+    /// The assistant's memory mode now (SW9); set by `memory_set` and read by `memory_get`.
+    memory: Mutex<config::MemoryMode>,
 }
 
 /// The Dot and the panel as computer control hides them during a call (S1, S5): never through
@@ -341,6 +343,39 @@ async fn shortcut_set(app: AppHandle, shortcut: String) -> CommandResult<Shortcu
         let saved = shortcut::apply(&host, current.as_deref(), &shortcut, Os::CURRENT)?;
         *current = Some(saved.clone());
         Ok(ShortcutChoice { shortcut: saved })
+    })
+    .await
+    .map_err(err)?
+}
+
+/// Result of `memory_get`/`memory_set` (SW9): the assistant's memory mode as the panel reads it.
+#[derive(serde::Serialize)]
+struct MemoryInfo {
+    memory: &'static str,
+}
+
+#[tauri::command]
+fn memory_get(app: AppHandle) -> MemoryInfo {
+    MemoryInfo { memory: app.state::<Shell>().memory.lock().unwrap().as_str() }
+}
+
+/// Saves the memory mode and restarts the assistant so the engine picks it up (SW9). An unchanged
+/// value is a no-op: nothing is written and the assistant is left running.
+#[tauri::command]
+async fn memory_set(app: AppHandle, memory: String) -> CommandResult<MemoryInfo> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mode = config::MemoryMode::parse(&memory)?;
+        let (data_dir, current) = {
+            let shell = app.state::<Shell>();
+            let current = *shell.memory.lock().unwrap();
+            (shell.config.data_dir.clone(), current)
+        };
+        if current != mode {
+            config::save_memory(&data_dir.join("config.json"), mode)?;
+            *app.state::<Shell>().memory.lock().unwrap() = mode;
+            restart_daemon(app.clone());
+        }
+        Ok(MemoryInfo { memory: mode.as_str() })
     })
     .await
     .map_err(err)?
@@ -836,6 +871,8 @@ pub fn run() {
             set_panel_fullscreen,
             shortcut_get,
             shortcut_set,
+            memory_get,
+            memory_set,
             connector_command,
             computer::computer_endpoint,
             computer::computer_permissions,
@@ -897,6 +934,7 @@ pub fn run() {
                 panel_spot: Mutex::new(None),
                 full_screen: Mutex::new(None),
                 shortcut: Mutex::new(None),
+                memory: Mutex::new(config.memory),
             });
             let (voice_input, voice_model) = voice::start(&handle);
             app.manage(voice_input);
@@ -1005,6 +1043,14 @@ mod tests {
                 .flat_map(|c| c["windows"].as_array().unwrap())
                 .collect();
             assert_eq!(windows, ["panel"], "{permission}");
+        }
+    }
+
+    #[test]
+    fn the_memory_commands_are_registered_in_build_rs() {
+        let build = include_str!("../build.rs");
+        for command in ["memory_get", "memory_set"] {
+            assert!(build.contains(&format!("\"{command}\",")), "{command} is missing from build.rs");
         }
     }
 
