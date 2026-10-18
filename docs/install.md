@@ -161,6 +161,10 @@ The app itself never changes after it is built; everything it writes goes to the
 
 The panel opens with the global shortcut **`Ctrl+Shift+Space`**. macOS and Linux keep `Alt+Space`, which is Windows' window-menu key and a poor default for a global hotkey (it would take that menu away from every app). Change it in the panel's Settings or as `shortcut` in `config.json`; **Launch at login** in the tray menu registers the app as **`Gentle Dot`** under the Windows `Run` key — normally `HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`, or `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run` when the app runs with administrator rights, which starts it for every user.
 
+### Memory
+
+The assistant remembers things in your own Engram. Turn on **Private memory** in the panel's Settings to give it a memory of its own instead: it keeps its memories under `%USERPROFILE%\.gentle-dot\home\.engram`, starts empty, and never reads or writes your own Engram. The choice is saved as `"memory": "shared"` or `"memory": "private"` in `config.json`, and changing it in Settings restarts the assistant so the engine starts in the new mode.
+
 ### Connector secrets and the Windows limit
 
 On Windows, connector secrets (tokens, client secrets, imported header and environment values, and OAuth sign-ins) live in a single file the app owns, `%LOCALAPPDATA%\Gentle Dot\secrets.dat`. It is written with `CryptProtectData` and read with `CryptUnprotectData` at the default user scope (never `CRYPTPROTECT_LOCAL_MACHINE`), is bound to each id, and is replaced atomically. The Windows Credential Manager is deliberately not used: a generic credential's blob is capped at 2560 bytes, and the daemon keeps a sign-in as one JSON secret that already measures 2744 bytes for a Microsoft-backed connector before any token exists.
