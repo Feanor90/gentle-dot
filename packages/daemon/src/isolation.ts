@@ -123,8 +123,9 @@ export function ensureMemoryProject(workspace: string, access: EngineAccess = di
  * (by default under HOME), so `ENGRAM_DATA_DIR` points at the user's real one
  * (`GENTLE_DOT_ENGRAM_DATA_DIR` overrides it) and the memory plugin accepts the
  * user's server. The user's own `ENGRAM_PORT` and `ENGRAM_URL` are kept.
- * `GENTLE_DOT_ENGRAM=private` instead runs a memory of its own under the
- * engine's home, on port 7438 (`GENTLE_DOT_ENGRAM_PORT` overrides it).
+ * `GENTLE_DOT_ENGRAM=private` instead runs a memory of its own under
+ * the engine's home, on port 7438 (`GENTLE_DOT_ENGRAM_PORT` overrides it), with the store named
+ * (`ENGRAM_DATA_DIR=<dataDir>/home/.engram`) rather than left to Engram's default.
  * The server's connector secrets key (`GENTLE_DOT_SECRETS_KEY`, S25.8) is never passed on.
  * Subagents are on (`GENTLE_PI_AGENTS=1`) unless `GENTLE_DOT_SUBAGENTS=off`: their child engines
  * reach connectors only through the daemon's proxy, like the engine itself (S25.4).
@@ -168,7 +169,11 @@ export function isolatedAgentEnv(
 	if (base.GENTLE_DOT_ENGRAM === "private") {
 		env.ENGRAM_PORT = base.GENTLE_DOT_ENGRAM_PORT || PRIVATE_ENGRAM_PORT;
 		delete env.ENGRAM_URL;
-		delete env.ENGRAM_DATA_DIR;
+		// The store is **named**, not left to Engram's default: that default follows `HOME`, which is a
+		// POSIX convention, and on Windows Engram resolves the user profile instead — measured, the
+		// "private" server opened the user's own store there (W25). It is also the path `privateMemory`
+		// already reads when it decides whether the server on the private port is ours to stop.
+		env.ENGRAM_DATA_DIR = join(home, ".engram");
 	} else {
 		env.ENGRAM_DATA_DIR =
 			base.GENTLE_DOT_ENGRAM_DATA_DIR || base.ENGRAM_DATA_DIR || join(realHome, ".engram");
