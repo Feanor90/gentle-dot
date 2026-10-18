@@ -2,6 +2,16 @@
 
 Gentle Dot ships as a self-contained app: it carries its own Node runtime, the assistant engine, and a fallback Engram. Nothing else needs to be installed first.
 
+## Optional: separate conversations on desktop
+
+Gentle Dot defaults to one continuous chat. To show **New conversation** and the conversation list, quit the app, add `"conversations": true` to its `config.json` (keeping existing keys), then reopen it:
+
+```json
+{ "conversations": true }
+```
+
+The file is `~/.gentle-dot/config.json` (`%USERPROFILE%\.gentle-dot\config.json` on Windows, unless the data folder is overridden). This does not delete existing chats or change Launch at login. Remove the key or set it to `false` and reopen to return to the continuous-chat interface. An existing `GENTLE_DOT_CONVERSATIONS` environment variable takes precedence: only `1` enables conversations. No global environment change is needed.
+
 ## macOS
 
 Requirements: a Mac with Apple Silicon (M1 or later) and macOS 12.3 or later.

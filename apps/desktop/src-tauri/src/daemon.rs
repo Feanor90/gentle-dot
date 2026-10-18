@@ -801,6 +801,7 @@ pub struct Daemon {
     port: u16,
     data_dir: PathBuf,
     runtime_dir: Option<PathBuf>,
+    conversations: Option<bool>,
     child: Mutex<Option<Box<dyn ChildProcess>>>,
     /// The private channel to the daemon this app spawned; attached daemons have none.
     channel: Mutex<Option<Arc<AppChannel>>>,
@@ -829,6 +830,7 @@ impl Daemon {
             port,
             data_dir,
             runtime_dir,
+            conversations: None,
             child: Mutex::new(None),
             channel: Mutex::new(None),
             handler: None,
@@ -849,6 +851,20 @@ impl Daemon {
     pub fn with_adoption(mut self, confirm: Confirm) -> Self {
         self.confirm = Some(confirm);
         self
+    }
+
+    /// Keep the child feature flag consistent with the desktop's resolved local setting.
+    pub fn with_conversations(mut self, enabled: bool) -> Self {
+        self.conversations = Some(enabled);
+        self
+    }
+
+    fn configured_launch(&self, mut spec: LaunchSpec) -> LaunchSpec {
+        if let Some(enabled) = self.conversations {
+            spec.envs.retain(|(key, _)| !key.eq_ignore_ascii_case("GENTLE_DOT_CONVERSATIONS"));
+            spec.envs.push(("GENTLE_DOT_CONVERSATIONS".into(), if enabled { "1" } else { "0" }.into()));
+        }
+        spec
     }
 
     /// Every daemon this app spawns gets a channel served by `handler`.
@@ -1012,7 +1028,7 @@ impl Daemon {
                 return Ok(());
             }
         }
-        let spec = self.launch.clone().or(prepared).unwrap_or_else(real_spec);
+        let spec = self.configured_launch(self.launch.clone().or(prepared).unwrap_or_else(real_spec));
         let log = open_private_log(&self.data_dir).map_err(|e| format!("cannot open daemon.log: {e}"))?;
         let pair = match &self.handler {
             Some(_) => Some(channel_pair().map_err(|e| format!("cannot open the assistant's channel: {e}"))?),
@@ -1099,6 +1115,24 @@ impl Daemon {
 mod tests {
     use super::*;
     use crate::app_channel::{AppChannel, Handler};
+
+    #[test]
+    fn conversations_setting_reaches_the_child_without_changing_other_launch_fields() {
+        let spec = LaunchSpec {
+            program: "node".into(),
+            args: vec!["daemon.js".into()],
+            envs: vec![("PATH".into(), "runtime".into()), ("GENTLE_DOT_CONVERSATIONS".into(), "old".into())],
+        };
+        let daemon = Daemon::new(4317, PathBuf::from("unused"), None);
+        assert_eq!(daemon.configured_launch(spec.clone()), spec);
+        for enabled in [true, false] {
+            let daemon = Daemon::new(4317, PathBuf::from("unused"), None).with_conversations(enabled);
+            let actual = daemon.configured_launch(spec.clone());
+            assert_eq!(actual.program, spec.program);
+            assert_eq!(actual.args, spec.args);
+            assert_eq!(actual.envs, vec![("PATH".into(), "runtime".into()), ("GENTLE_DOT_CONVERSATIONS".into(), if enabled { "1" } else { "0" }.into())]);
+        }
+    }
     #[cfg(unix)]
     use std::io::{BufRead, BufReader};
     use std::io::Write;

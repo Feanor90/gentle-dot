@@ -163,7 +163,7 @@ Every daemon message carries `seq` (monotonic per connection) so the UI can dete
 
 ### One continuous chat (S22)
 
-The UI shows one endless chat: no conversations list, no new conversation, and the header shows the assistant (the rose glyph and "Gentle Dot"). The code and protocol for several conversations stay behind `features.conversations` (`GENTLE_DOT_CONVERSATIONS=1`); with it off, the UI also ignores the menu bar's `dot://new-conversation`. The daemon rotates the session underneath when it grows (§7), and `history` / `get_earlier` read through the chain of session files, so earlier messages, including those before any compaction, stay reachable with "Show earlier".
+The UI shows one endless chat: no conversations list, no new conversation, and the header shows the assistant (the rose glyph and "Gentle Dot"). The code and protocol for several conversations stay behind `features.conversations` (`GENTLE_DOT_CONVERSATIONS=1`, or the desktop-local `conversations` setting in §10); with it off, the UI also ignores the menu bar's `dot://new-conversation`. The daemon rotates the session underneath when it grows (§7), and `history` / `get_earlier` read through the chain of session files, so earlier messages, including those before any compaction, stay reachable with "Show earlier".
 
 ### Computer control (macOS, S24)
 
@@ -251,7 +251,7 @@ The user changes the main assistant's model from the chat, in the panel and the 
 ### Menu bar
 
 - Template icon: the hand-drawn rose glyph (`docs/brand/rose-glyph.svg`), with one variant per state: ready, working (dashed outer petals; also used while thinking), needs you (a filled badge dot), and unavailable (dimmed; starting, restarting, and error).
-- Menu: Open (`⌥ Space`), Open in browser, Restart assistant, Launch at login (toggle), Quit. New conversation appears after Open only with the conversations list on (`GENTLE_DOT_CONVERSATIONS=1`).
+- Menu: Open (`⌥ Space`), Open in browser, Restart assistant, Launch at login (toggle), Quit. New conversation appears after Open only with the conversations list on (`GENTLE_DOT_CONVERSATIONS=1`, or the desktop-local `conversations` setting in §10).
 
 ### Web
 
@@ -335,7 +335,7 @@ The Dot drags with `getCurrentWindow().startDragging()` (permission `core:window
 
 ### Menu bar and shortcut
 
-Tray menu: Open (`⌥ Space`), New conversation (only with `GENTLE_DOT_CONVERSATIONS=1`, read like the daemon reads it), Open in browser, Hide the rose / Show the rose, Restart assistant, Launch at login (check item), Quit. The global shortcut `Alt+Space` (configurable as `shortcut` in `config.json`, or in the panel's Settings) toggles the panel.
+Tray menu: Open (`⌥ Space`), New conversation (only with conversations enabled through the environment or desktop-local setting in §10, resolved consistently for the daemon), Open in browser, Hide the rose / Show the rose, Restart assistant, Launch at login (check item), Quit. The global shortcut `Alt+Space` (configurable as `shortcut` in `config.json`, or in the panel's Settings) toggles the panel.
 
 Settings (S33): a gear in the desktop panel header opens a Settings screen styled like Accounts. Its "Keyboard shortcut" section shows the shortcut (⌘ ⌥ ⌃ ⇧ on macOS, names elsewhere); "Change" records the next key combination from the physical key (`code`), Esc alone cancels recording without hiding the panel (the recorder listens in the capture phase and marks the keys it takes as handled), and "Reset to default" sets `Alt+Space`. At start the app binds the saved shortcut, then each default of the platform in turn (`platform::default_shortcuts`: `Alt+Space`, plus `Ctrl+Alt+Space` on Windows, where other launchers often hold `Alt+Space`); a fallback is shown on the tray and in Settings but never saved, so the saved one is tried again at the next start. `shortcut_set` applies it live, with no restart (`src/shortcut.rs`):
 
@@ -377,6 +377,6 @@ Windows (`daemon.rs`, `win_spawn.rs`, `engram_bootstrap.rs`): the start time is 
 { "port": 4317, "workspace": "~/Documents", "shortcut": "Alt+Space", "launchAtLogin": false }
 ```
 
-All keys are optional. `workspace` is the user's preferred working folder: the engine is told about it but always runs in `<dataDir>/workspace`. Changing the shortcut in Settings rewrites `shortcut` and keeps every other key.
+All keys are optional. `workspace` is the user's preferred working folder: the engine is told about it but always runs in `<dataDir>/workspace`. Changing the shortcut in Settings rewrites `shortcut` and keeps every other key. Desktop users can add `"conversations": true` to opt into the existing conversation list and New conversation action, then quit and reopen the app. The default remains one continuous chat; this setting does not delete or migrate session files. `GENTLE_DOT_CONVERSATIONS`, when present, overrides this desktop setting (`1` enables it; every other value disables it). The tray and spawned daemon use the same resolved value. Standalone daemon launches still use the environment flag.
 
 Environment overrides: `GENTLE_DOT_AGENT_HOME` (default `~/.gentle-dot/agent`), `GENTLE_DOT_ENGRAM_DATA_DIR` (default: the user's Engram data folder), `GENTLE_DOT_ENGRAM` (`private` for a memory of the assistant's own), `GENTLE_DOT_ENGRAM_PORT` (private memory only, default `7438`), `GENTLE_DOT_SUBAGENTS` (`off` turns the engine's subagents off), `GENTLE_DOT_PORT`, `GENTLE_DOT_HOST` (default `127.0.0.1`; `0.0.0.0` only inside a container), `GENTLE_DOT_DATA_DIR`, `GENTLE_DOT_WORKSPACE`, `GENTLE_DOT_UI_DIR`, `GENTLE_DOT_AGENT_BIN`, `GENTLE_DOT_AGENT_ARGS` (JSON array), `GENTLE_DOT_ALLOWED_ORIGINS` (JSON array), `GENTLE_DOT_CONVERSATIONS` (`1` turns the conversations list on), `GENTLE_DOT_ROTATE_BYTES` (default 20 MB), `GENTLE_DOT_ROTATE_COMPACTIONS` (default 10), `GENTLE_DOT_HISTORY_PAGE` (default 100).

@@ -584,11 +584,6 @@ fn build_windows(
     Ok(())
 }
 
-/// Whether the conversations list is on, read like the daemon reads it (`GENTLE_DOT_CONVERSATIONS=1`).
-fn conversations_on(value: Option<&str>) -> bool {
-    value == Some("1")
-}
-
 /// The tray menu, top to bottom (`-` is a separator). "New conversation" only exists with the
 /// conversations list on; in the single continuous chat there is nothing new to start.
 /// "Stop computer control" and "Yolo mode" exist where computer control does (macOS, S24.3, S24.9).
@@ -619,7 +614,7 @@ fn build_tray(app: &AppHandle, config: &DesktopConfig, rose_hidden: bool) -> tau
         .or_else(|_| MenuItem::with_id(app, "open", "Open", true, None::<&str>))?;
     app.manage(OpenMenuItem(open.clone()));
     let menu = Menu::new(app)?;
-    let conversations = conversations_on(std::env::var("GENTLE_DOT_CONVERSATIONS").ok().as_deref());
+    let conversations = config.conversations;
     for id in tray_menu_ids(conversations, cfg!(target_os = "macos")) {
         match id {
             "open" => menu.append(&open)?,
@@ -905,6 +900,7 @@ pub fn run() {
             let runtime_dir = daemon::runtime_dir(|key| std::env::var(key).ok(), app.path().resource_dir().ok());
             let announcer = handle.clone();
             let daemon = Daemon::new(config.port, config.data_dir.clone(), runtime_dir)
+                .with_conversations(config.conversations)
                 .with_channel(Arc::new(service))
                 .on_ready(Arc::new(move || {
                     if let Err(error) = announcer.emit(ASSISTANT_READY, ()) {
@@ -1074,10 +1070,12 @@ mod tests {
     }
 
     #[test]
-    fn conversations_flag_reads_like_the_daemon() {
-        assert!(conversations_on(Some("1")));
-        assert!(!conversations_on(None));
-        assert!(!conversations_on(Some("0")));
-        assert!(!conversations_on(Some("true")));
+    fn conversations_setting_controls_the_tray() {
+        for (file, env_value, enabled) in [(None, None, false), (Some(r#"{"conversations":true}"#), None, true), (Some(r#"{"conversations":true}"#), Some("0"), false), (None, Some("1"), true)] {
+            let config = config::parse_config(PathBuf::from("unused"), file, |key| {
+                (key == "GENTLE_DOT_CONVERSATIONS").then(|| env_value.map(str::to_string)).flatten()
+            });
+            assert_eq!(tray_menu_ids(config.conversations, false).contains(&"new"), enabled);
+        }
     }
 }

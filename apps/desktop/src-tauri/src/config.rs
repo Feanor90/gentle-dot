@@ -11,6 +11,7 @@ pub struct DesktopConfig {
     pub data_dir: PathBuf,
     pub port: u16,
     pub shortcut: String,
+    pub conversations: bool,
 }
 
 /// Result of the `connection_info` command (design §9).
@@ -38,7 +39,7 @@ fn valid_port(value: Option<u64>) -> Option<u16> {
     value.and_then(|port| u16::try_from(port).ok())
 }
 
-/// Resolves the port and shortcut: environment first, then the file, then defaults.
+/// Resolves desktop settings: environment first, then the file, then defaults.
 /// A missing or invalid file never prevents the app from starting.
 pub fn parse_config(
     data_dir: PathBuf,
@@ -58,7 +59,10 @@ pub fn parse_config(
         .filter(|s| !s.is_empty())
         .unwrap_or(DEFAULT_SHORTCUT)
         .to_string();
-    DesktopConfig { data_dir, port, shortcut }
+    let conversations = env("GENTLE_DOT_CONVERSATIONS")
+        .map(|value| value == "1")
+        .unwrap_or_else(|| file["conversations"].as_bool().unwrap_or(false));
+    DesktopConfig { data_dir, port, shortcut, conversations }
 }
 
 /// The home folder: `HOME`. Windows usually has no `HOME`, so there it falls back to `USERPROFILE`,
@@ -199,7 +203,7 @@ mod tests {
     #[test]
     fn defaults_without_file() {
         let config = parse_config(dir(), None, env_of(&[]));
-        assert_eq!(config, DesktopConfig { data_dir: dir(), port: DEFAULT_PORT, shortcut: DEFAULT_SHORTCUT.into() });
+        assert_eq!(config, DesktopConfig { data_dir: dir(), port: DEFAULT_PORT, shortcut: DEFAULT_SHORTCUT.into(), conversations: false });
     }
 
     #[test]
@@ -207,6 +211,29 @@ mod tests {
         let config = parse_config(dir(), Some(r#"{ "port": 5000, "shortcut": "Cmd+Shift+K", "workspace": "~" }"#), env_of(&[]));
         assert_eq!(config.port, 5000);
         assert_eq!(config.shortcut, "Cmd+Shift+K");
+    }
+
+    #[test]
+    fn conversations_can_be_enabled_locally_without_changing_other_settings() {
+        let config = parse_config(dir(), Some(r#"{ "conversations": true, "port": 5000, "shortcut": "F5" }"#), env_of(&[]));
+        assert!(config.conversations);
+        assert_eq!(config.port, 5000);
+        assert_eq!(config.shortcut, "F5");
+        for file in [None, Some(r#"{"conversations":false}"#), Some(r#"{"conversations":"true"}"#), Some("{bad"), Some("[]")] {
+            assert!(!parse_config(dir(), file, env_of(&[])).conversations);
+        }
+        let saved = with_shortcut(Some(r#"{"conversations":true,"workspace":"~"}"#), "F6").unwrap();
+        assert!(parse_config(dir(), Some(&saved), env_of(&[])).conversations);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&saved).unwrap()["workspace"], "~");
+    }
+
+    #[test]
+    fn conversations_environment_overrides_local_opt_in_exactly() {
+        for (value, expected) in [("1", true), ("0", false), ("true", false), ("", false)] {
+            let env = |key: &str| (key == "GENTLE_DOT_CONVERSATIONS").then(|| value.to_string());
+            assert_eq!(parse_config(dir(), Some(r#"{"conversations":true}"#), env).conversations, expected);
+        }
+        assert!(parse_config(dir(), None, env_of(&[("GENTLE_DOT_CONVERSATIONS", "1")])).conversations);
     }
 
     #[test]
@@ -253,7 +280,7 @@ mod tests {
         // The file the app writes reads back like any hand-written one: port, shortcut, defaults.
         let text = with_shortcut(Some(r#"{ "port": 5000, "workspace": "~" }"#), "Shift+Super+K").unwrap();
         let config = parse_config(dir(), Some(&text), env_of(&[]));
-        assert_eq!(config, DesktopConfig { data_dir: dir(), port: 5000, shortcut: "Shift+Super+K".into() });
+        assert_eq!(config, DesktopConfig { data_dir: dir(), port: 5000, shortcut: "Shift+Super+K".into(), conversations: false });
         let config = parse_config(dir(), Some(&text), env_of(&[("GENTLE_DOT_PORT", "6000")]));
         assert_eq!(config.port, 6000);
         let text = with_shortcut(None, "F5").unwrap();
