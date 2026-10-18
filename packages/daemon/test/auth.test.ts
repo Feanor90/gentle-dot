@@ -1,11 +1,12 @@
-import { readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { readdirSync } from "node:fs";
+import { join, resolve } from "node:path";
 import type { ServerMessage } from "@gentle-dot/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import { createModelAuthRuntime, resolveAgentHome } from "../src/auth.ts";
 import { type DotDaemon, startDaemon } from "../src/daemon.ts";
 import { fakeAuthRuntime } from "./fake-auth-runtime.ts";
+import { expectPrivatePath, privateTempDir } from "./file-privacy-assertions.ts";
 import { FAKE_AGENT, tempDir, waitFor } from "./helpers.ts";
 
 const daemons: DotDaemon[] = [];
@@ -244,7 +245,7 @@ describe("sign-in", () => {
 
 describe("createModelAuthRuntime (Pi's runtime, offline)", () => {
 	it("stores an API key in the assistant's home and a fresh runtime sees it", async () => {
-		const home = tempDir();
+		const home = privateTempDir();
 		const saved = process.env.OPENAI_API_KEY;
 		delete process.env.OPENAI_API_KEY;
 		try {
@@ -252,7 +253,7 @@ describe("createModelAuthRuntime (Pi's runtime, offline)", () => {
 			await first.login("openai", "api_key", { prompt: async () => "sk-test-not-real", notify: () => {} });
 			const fresh = await createModelAuthRuntime(home, home);
 			expect(fresh.getProviderAuthStatus("openai")).toEqual({ configured: true, source: "stored" });
-			expect(statSync(join(home, "auth.json")).mode & 0o777).toBe(0o600);
+			expectPrivatePath(join(home, "auth.json"), 0o600);
 			await fresh.logout("openai");
 			expect((await createModelAuthRuntime(home, home)).getProviderAuthStatus("openai").configured).toBe(
 				false,
@@ -290,10 +291,10 @@ describe("createModelAuthRuntime (Pi's runtime, offline)", () => {
 describe("resolveAgentHome", () => {
 	it("belongs to the assistant: <dataDir>/agent unless overridden, never the user's Gentle Shell home", () => {
 		const dataDir = tempDir();
-		expect(resolveAgentHome({}, dataDir)).toBe(`${dataDir}/agent`);
+		expect(resolveAgentHome({}, dataDir)).toBe(join(dataDir, "agent"));
 		expect(resolveAgentHome({ GENTLE_SHELL_HOME: "/x", PI_CODING_AGENT_DIR: "/z" }, dataDir)).toBe(
-			`${dataDir}/agent`,
+			join(dataDir, "agent"),
 		);
-		expect(resolveAgentHome({ GENTLE_DOT_AGENT_HOME: "/y" }, dataDir)).toBe("/y");
+		expect(resolveAgentHome({ GENTLE_DOT_AGENT_HOME: "/y" }, dataDir)).toBe(resolve("/y"));
 	});
 });

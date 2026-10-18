@@ -4,7 +4,6 @@ import {
 	readdirSync,
 	readFileSync,
 	rmSync,
-	statSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
@@ -23,6 +22,7 @@ import {
 import { isReadOnlyCall } from "../src/extensions/approval-guard.ts";
 import { MemorySecretSource } from "../src/secret-source.ts";
 import { fakeOAuth } from "./fake-oauth.ts";
+import { expectPrivatePath, privateTempDir } from "./file-privacy-assertions.ts";
 import { tempDir, waitFor } from "./helpers.ts";
 
 describe("connectors catalog", () => {
@@ -69,8 +69,8 @@ describe("connector store", () => {
 		for (const s of stores.splice(0)) s.close();
 	});
 
-	function store() {
-		const dataDir = tempDir();
+	function store(privateParent = false) {
+		const dataDir = privateParent ? privateTempDir() : tempDir();
 		const agentHome = join(dataDir, "agent");
 		const workspace = join(dataDir, "workspace");
 		mkdirSync(agentHome);
@@ -100,7 +100,7 @@ describe("connector store", () => {
 	}
 
 	it("is the only writer: both files private, with no hash, and the state is read once at start", () => {
-		const { store: s, dataDir, agentHome, workspace } = store();
+		const { store: s, dataDir, agentHome, workspace } = store(true);
 		expect(s.enforce()).toBe(false);
 		expect(existsSync(join(agentHome, "mcp.json"))).toBe(false);
 		s.update((state) => {
@@ -111,8 +111,8 @@ describe("connector store", () => {
 			version: 2,
 			connectors: { notion: { enabled: true, mode: "read_only" } },
 		});
-		expect(statSync(join(dataDir, "connectors.json")).mode & 0o777).toBe(0o600);
-		expect(statSync(join(agentHome, "mcp.json")).mode & 0o777).toBe(0o600);
+		expectPrivatePath(join(dataDir, "connectors.json"), 0o600);
+		expectPrivatePath(join(agentHome, "mcp.json"), 0o600);
 		// The old sign-in home is never made again.
 		expect(existsSync(s.signinHome)).toBe(false);
 		expect(readdirSync(agentHome).filter((f) => f.includes(".tmp"))).toEqual([]);

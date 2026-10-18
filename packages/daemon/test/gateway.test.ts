@@ -1,5 +1,5 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { delimiter, join } from "node:path";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { delimiter, join, sep } from "node:path";
 import type { ServerMessage } from "@gentle-dot/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
@@ -11,6 +11,7 @@ import {
 	startupMessage,
 } from "../src/daemon.ts";
 import { HIDDEN_NAMES, presentText } from "../src/white-label.ts";
+import { expectPrivatePath, privateTempDir } from "./file-privacy-assertions.ts";
 import { FAKE_AGENT, tempDir, waitFor } from "./helpers.ts";
 
 const daemons: DotDaemon[] = [];
@@ -493,7 +494,7 @@ describe("own instance", () => {
 		mkdirSync(realHome);
 		writeFileSync(join(realHome, ".gitconfig"), "[user]\n\tname = Someone\n");
 		const envFile = join(scratch, "env.json");
-		const dataDir = tempDir();
+		const dataDir = privateTempDir();
 		const d = await startDaemon({
 			port: 0,
 			host: "127.0.0.1",
@@ -529,7 +530,9 @@ describe("own instance", () => {
 			GIT_CONFIG_GLOBAL: join(realHome, ".gitconfig"),
 			// The bundled `pi` folder first, then the user's PATH unchanged.
 			PATH: expect.stringMatching(
-				new RegExp(`node_modules/\\.bin${delimiter}${escapeRegExp(process.env.PATH ?? "")}$`),
+				new RegExp(
+					`${escapeRegExp(join(sep, "node_modules", ".bin") + delimiter)}${escapeRegExp(process.env.PATH ?? "")}$`,
+				),
 			),
 			// The user's global Engram: its data dir, so the memory plugin accepts the user's server.
 			ENGRAM_DATA_DIR: join(realHome, ".engram"),
@@ -539,19 +542,20 @@ describe("own instance", () => {
 			// Subagents on, behind the proxy and with the guard (S25.4).
 			GENTLE_PI_AGENTS: "1",
 		});
-		expect(statSync(home).mode & 0o777).toBe(0o700);
+		expectPrivatePath(home, 0o700);
 		expect(existsSync(join(dataDir, "workspace"))).toBe(true);
 	});
 
-	it("keeps the data folder and the access key private, repairing looser modes", () => {
-		const dataDir = join(tempDir(), "data");
+	it("keeps the data folder and the access key private, repairing looser Unix modes", () => {
+		// On Windows the desktop secures the parent; Node preserves its inherited ACL.
+		const dataDir = join(privateTempDir(), "data");
 		mkdirSync(dataDir, { mode: 0o755 });
 		chmodSync(dataDir, 0o755);
 		writeFileSync(join(dataDir, "token"), `${"k".repeat(43)}\n`, { mode: 0o644 });
 		chmodSync(join(dataDir, "token"), 0o644);
 		expect(ensureToken(dataDir)).toBe("k".repeat(43));
-		expect(statSync(dataDir).mode & 0o777).toBe(0o700);
-		expect(statSync(join(dataDir, "token")).mode & 0o777).toBe(0o600);
+		expectPrivatePath(dataDir, 0o700);
+		expectPrivatePath(join(dataDir, "token"), 0o600);
 	});
 
 	it("shows the access key only on an interactive terminal", () => {
@@ -559,7 +563,9 @@ describe("own instance", () => {
 		expect(startupMessage(url, "/data", true)).toBe(`Gentle Dot is running at ${url}`);
 		const piped = startupMessage(url, "/data", false);
 		expect(piped).not.toContain("secret-token");
-		expect(piped).toBe("Gentle Dot is running at http://127.0.0.1:4317/ (the access key is in /data/token)");
+		expect(piped).toBe(
+			`Gentle Dot is running at http://127.0.0.1:4317/ (the access key is in ${join("/data", "token")})`,
+		);
 	});
 });
 
