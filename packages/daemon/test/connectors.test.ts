@@ -1,12 +1,4 @@
-import {
-	existsSync,
-	mkdirSync,
-	readdirSync,
-	readFileSync,
-	rmSync,
-	symlinkSync,
-	writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
@@ -23,6 +15,7 @@ import { isReadOnlyCall } from "../src/extensions/approval-guard.ts";
 import { MemorySecretSource } from "../src/secret-source.ts";
 import { fakeOAuth } from "./fake-oauth.ts";
 import { tempDir, waitFor } from "./helpers.ts";
+import { symlinkDirectory } from "./support/fixture-capabilities.ts";
 import { expectPosixMode } from "./support/posix-modes.ts";
 
 describe("connectors catalog", () => {
@@ -224,7 +217,7 @@ describe("connector store", () => {
 		rmSync(join(workspace, ".pi"), { recursive: true });
 		const elsewhere = tempDir();
 		writeFileSync(join(elsewhere, "mcp.json"), "{}");
-		symlinkSync(elsewhere, join(workspace, ".pi"));
+		symlinkDirectory(elsewhere, join(workspace, ".pi"));
 		expect(s.enforce()).toBe(true);
 		expect(existsSync(join(workspace, ".pi"))).toBe(false);
 		expect(readFileSync(join(elsewhere, "mcp.json"), "utf8")).toBe("{}");

@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 import { engineAccess, insideEngineAccess } from "../src/engine-access.ts";
 import { writePrivateFile } from "../src/private-file.ts";
 import { tempDir } from "./helpers.ts";
+import { canCreateFileSymlinks } from "./support/fixture-capabilities.ts";
 import { expectPosixMode } from "./support/posix-modes.ts";
 
 const own = { uid: process.getuid?.() ?? 0, gid: process.getgid?.() ?? 0 };
@@ -40,7 +41,9 @@ describe("engine access", () => {
 });
 
 describe("the daemon's own files", () => {
-	it("are written whole, private, and replace a link at their place without following it", () => {
+	it.skipIf(
+		!canCreateFileSymlinks("engine-access: the daemon's state file, replaced where a symlink held it"),
+	)("are written whole, private, and replace a link at their place without following it", () => {
 		const dir = tempDir();
 		const target = join(dir, "target");
 		writeFileSync(target, "keep");
