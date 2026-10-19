@@ -8,12 +8,12 @@
 //! - `Recognizer` turns that PCM into partial and final text. Apple's Speech framework
 //!   (`macos::AppleSpeech`) is the default on macOS; the optional local model (S30.5,
 //!   `parakeet::Parakeet`, NVIDIA Parakeet through sherpa-onnx) is preferred once the user has
-//!   downloaded it (`model`), and it is the only engine on Linux (`engine::Preferred`).
+//!   downloaded it (`model`), and it is the only engine on Linux and Windows (`engine::Preferred`).
 //!
 //! `Voice` is the pure state machine between them (idle → starting → recording → stopping,
 //! single flight, cancel, error mapping, level throttling, locale fallback), tested on every OS
 //! with fakes. The objc2 bindings live in `macos`; Linux records through a command-line recorder
-//! (`pipe`); elsewhere the commands answer "unavailable".
+//! (`pipe`); Windows uses shared/event-driven WASAPI (`win_mic`).
 //!
 //! SpeechAnalyzer/SpeechTranscriber (macOS 26) are Swift-only, with no Objective-C interface to
 //! bind from Rust, and the app supports macOS 12.3, so `SFSpeechRecognizer` is the recognizer.
@@ -21,6 +21,10 @@
 pub mod app;
 pub mod audio;
 pub mod engine;
+#[cfg(target_os = "windows")]
+mod win_audio;
+#[cfg(target_os = "windows")]
+mod win_mic;
 #[cfg(test)]
 mod fake;
 pub mod locale;
@@ -47,7 +51,7 @@ pub const PARTIAL_EVENT: &str = "voice://partial";
 pub const LEVEL_EVENT: &str = "voice://level";
 /// A failure while recording (permission, recognizer, interruption): `{message}`.
 pub const ERROR_EVENT: &str = "voice://error";
-pub const UNSUPPORTED: &str = "Voice input is available on macOS and Linux.";
+pub const UNSUPPORTED: &str = "Voice input is available on macOS, Linux and Windows.";
 
 /// The `voice_status` reply: `{available, reason?}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -123,7 +127,7 @@ pub enum VoiceError {
     MicrophoneDenied,
     MicrophoneRestricted,
     NoRecognizer(String),
-    /// The local model is the only engine here (Linux) and it is not downloaded.
+    /// The local model is the only engine here (Linux/Windows) and it is not downloaded.
     NoModel,
     NoMicrophone,
     /// Linux: neither `parec` nor `arecord` is installed.
@@ -261,7 +265,7 @@ mod tests {
         assert_eq!(serde_json::to_value(VoiceStatus::available()).unwrap(), serde_json::json!({"available": true}));
         assert_eq!(
             serde_json::to_value(VoiceStatus::unavailable(UNSUPPORTED)).unwrap(),
-            serde_json::json!({"available": false, "reason": "Voice input is available on macOS and Linux."})
+            serde_json::json!({"available": false, "reason": "Voice input is available on macOS, Linux and Windows."})
         );
     }
 
