@@ -29,7 +29,7 @@ use tauri::tray::{TrayIcon, TrayIconBuilder};
 #[cfg(target_os = "macos")]
 use tauri::window::{Effect, EffectState, EffectsBuilder};
 use tauri::{
-    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, RunEvent, WebviewUrl, WebviewWindow,
+    AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder, WindowEvent,
 };
 #[cfg(not(windows))]
@@ -38,6 +38,11 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
 use tauri_plugin_opener::OpenerExt;
 
+#[cfg(not(windows))]
+use tauri::{LogicalPosition, LogicalSize};
+#[cfg(windows)]
+use tauri::{PhysicalPosition, PhysicalSize};
+
 const DOT: &str = "dot";
 pub(crate) const PANEL: &str = "panel";
 const TRAY: &str = "main";
@@ -45,7 +50,7 @@ const TRAY: &str = "main";
 /// ring for its shadow. About the screen area of the earlier 64 × 84 rose.
 const DOT_SIZE: (f64, f64) = (72.0, 72.0);
 const PANEL_SIZE: (f64, f64) = (420.0, 640.0);
-/// All placement runs in points (see `geometry`), so margins never depend on a scale factor.
+/// Point dimensions; Windows scales them for the destination monitor.
 const EDGE_MARGIN: i32 = 12;
 const PANEL_GAP: i32 = 8;
 const DRAG_SETTLE: Duration = Duration::from_millis(300);
@@ -305,7 +310,14 @@ fn set_panel_fullscreen(app: AppHandle, on: bool) -> CommandResult<bool> {
             *full_screen = Some(before);
         }
         (false, Some(before)) => {
-            set_frame(&panel, geometry::restore_rect(before, &monitors, EDGE_MARGIN))?;
+            #[cfg(windows)]
+            let before = {
+                let monitor = geometry::monitor_for(before, &monitors);
+                let (width, height) = size_for(&panel, PANEL_SIZE, monitor)?;
+                Rect { width, height, ..before }
+            };
+            let margin = length_for(&panel, EDGE_MARGIN, geometry::monitor_for(before, &monitors))?;
+            set_frame(&panel, geometry::restore_rect(before, &monitors, margin))?;
             *full_screen = None;
         }
         _ => {}
@@ -397,21 +409,22 @@ fn set_dot_state(app: AppHandle, state: String) -> CommandResult {
     tray.set_icon_as_template(is_template(Os::CURRENT)).map_err(err)
 }
 
-/// The window frame in points. Tao reports it in pixels of the window's current scale factor.
+/// Window frame in the platform's shared placement space (physical on Windows).
 fn rect_of(window: &WebviewWindow) -> CommandResult<Rect> {
     let position = window.outer_position().map_err(err)?;
     let size = window.outer_size().map_err(err)?;
     let scale = window.scale_factor().map_err(err)?;
-    Ok(geometry::to_points((position.x, position.y), (size.width, size.height), scale))
+    Ok(geometry::placement_rect((position.x, position.y), (size.width, size.height), scale, cfg!(windows)))
 }
 
-/// Work area (without menu bar and Dock) of a monitor in points, using that monitor's own scale factor.
+/// Work area excluding taskbars/menu bars, in the shared placement space.
 fn work_area(monitor: &tauri::Monitor) -> Rect {
     let area = monitor.work_area();
-    geometry::to_points(
+    geometry::placement_rect(
         (area.position.x, area.position.y),
         (area.size.width, area.size.height),
         monitor.scale_factor(),
+        cfg!(windows),
     )
 }
 
@@ -420,30 +433,67 @@ fn monitor_rects(window: &WebviewWindow) -> CommandResult<Vec<Rect>> {
 }
 
 fn move_to(window: &WebviewWindow, (x, y): (i32, i32)) -> CommandResult {
-    window.set_position(LogicalPosition::new(f64::from(x), f64::from(y))).map_err(err)
+    #[cfg(windows)]
+    let position = PhysicalPosition::new(x, y);
+    #[cfg(not(windows))]
+    let position = LogicalPosition::new(f64::from(x), f64::from(y));
+    window.set_position(position).map_err(err)
 }
 
 fn set_frame(window: &WebviewWindow, rect: Rect) -> CommandResult {
-    window.set_size(LogicalSize::new(f64::from(rect.width), f64::from(rect.height))).map_err(err)?;
+    set_size(window, (rect.width, rect.height))?;
     move_to(window, (rect.x, rect.y))
 }
 
-/// The work area under the pointer, or the primary one. Tao reports the pointer in pixels of the
-/// primary monitor's scale factor.
+/// Work area under the pointer, or primary. Only macOS/Linux need the primary-scale conversion.
 fn current_monitor(app: &AppHandle, monitors: &[Rect]) -> CommandResult<Option<Rect>> {
     let primary = app.primary_monitor().map_err(err)?;
     let scale = primary.as_ref().map_or(1.0, |m| m.scale_factor());
-    let points = |value: f64| (value / scale).round() as i32;
+    let points = |value: f64| (value / if cfg!(windows) { 1.0 } else { scale }).round() as i32;
     let pointer = app.cursor_position().ok().map(|p| Rect::new(points(p.x), points(p.y), 0, 0));
     Ok(pointer.and_then(|p| geometry::monitor_for(p, monitors)).or_else(|| primary.as_ref().map(work_area)))
 }
 
-/// Keeps the Dot at exactly `DOT_SIZE` points, in case macOS or a monitor change resized it.
-fn keep_dot_size(dot: &WebviewWindow, current: Rect) -> CommandResult {
-    if (current.width, current.height) == (DOT_SIZE.0 as i32, DOT_SIZE.1 as i32) {
-        return Ok(());
+/// Tauri seam: resolve the destination monitor's scale, never the source window's.
+fn length_for(window: &WebviewWindow, points: i32, monitor: Option<Rect>) -> CommandResult<i32> {
+    #[cfg(windows)]
+    let scale = window.available_monitors().map_err(err)?.iter()
+        .find(|m| Some(work_area(m)) == monitor).map_or(1.0, |m| m.scale_factor());
+    #[cfg(not(windows))]
+    let scale = { let _ = (window, monitor); 1.0 };
+    Ok(geometry::placement_length(points, scale, cfg!(windows)))
+}
+
+fn size_for(window: &WebviewWindow, points: (f64, f64), monitor: Option<Rect>) -> CommandResult<(i32, i32)> {
+    Ok((length_for(window, points.0 as i32, monitor)?, length_for(window, points.1 as i32, monitor)?))
+}
+
+fn set_size(window: &WebviewWindow, (width, height): (i32, i32)) -> CommandResult {
+    #[cfg(windows)]
+    let size = PhysicalSize::new(width as u32, height as u32);
+    #[cfg(not(windows))]
+    let size = LogicalSize::new(f64::from(width), f64::from(height));
+    window.set_size(size).map_err(err)
+}
+
+fn keep_size(window: &WebviewWindow, current: Rect, size: (i32, i32)) -> CommandResult {
+    if (current.width, current.height) == size { return Ok(()); }
+    set_size(window, size)
+}
+
+/// A dragged panel also crosses DPI boundaries independently of the Dot.
+#[cfg(windows)]
+fn rescale_panel(app: &AppHandle) -> CommandResult {
+    let panel = window(app, PANEL)?;
+    let current = rect_of(&panel)?;
+    let monitor = geometry::monitor_for(current, &monitor_rects(&panel)?);
+    let fullscreen = app.state::<Shell>().full_screen.lock().unwrap().is_some();
+    if fullscreen {
+        if let Some(area) = monitor { set_frame(&panel, area)?; }
+        Ok(())
+    } else {
+        keep_size(&panel, current, size_for(&panel, PANEL_SIZE, monitor)?)
     }
-    dot.set_size(LogicalSize::new(DOT_SIZE.0, DOT_SIZE.1)).map_err(err)
 }
 
 fn place_panel(app: &AppHandle) -> CommandResult {
@@ -462,20 +512,29 @@ fn place_panel_alone(app: &AppHandle) -> CommandResult {
         return Ok(());
     };
     let remembered = *app.state::<Shell>().panel_spot.lock().unwrap();
-    let size = (PANEL_SIZE.0 as i32, PANEL_SIZE.1 as i32);
-    move_to(&panel, geometry::place_panel_alone(remembered, size, current, EDGE_MARGIN))
+    let size = size_for(&panel, PANEL_SIZE, Some(current))?;
+    let margin = length_for(&panel, EDGE_MARGIN, Some(current))?;
+    #[cfg(windows)]
+    set_size(&panel, size)?;
+    move_to(&panel, geometry::place_panel_alone(remembered, size, current, margin))
 }
 
 fn place_panel_next_to_dot(app: &AppHandle) -> CommandResult {
     let (dot, panel) = (window(app, DOT)?, window(app, PANEL)?);
     let mut dot_rect = rect_of(&dot)?;
-    (dot_rect.width, dot_rect.height) = (DOT_SIZE.0 as i32, DOT_SIZE.1 as i32);
+    #[cfg(not(windows))]
+    { (dot_rect.width, dot_rect.height) = (DOT_SIZE.0 as i32, DOT_SIZE.1 as i32); }
     let Some(monitor) = geometry::monitor_for(dot_rect, &monitor_rects(&dot)?) else {
         return Ok(());
     };
     // Both windows have fixed sizes. On Linux a panel that was never shown reports 0 × 0.
-    let size = (PANEL_SIZE.0 as i32, PANEL_SIZE.1 as i32);
-    let position = geometry::place_panel(dot_rect, size, monitor, PANEL_GAP, EDGE_MARGIN);
+    (dot_rect.width, dot_rect.height) = size_for(&dot, DOT_SIZE, Some(monitor))?;
+    let size = size_for(&panel, PANEL_SIZE, Some(monitor))?;
+    let gap = length_for(&panel, PANEL_GAP, Some(monitor))?;
+    let margin = length_for(&panel, EDGE_MARGIN, Some(monitor))?;
+    let position = geometry::place_panel(dot_rect, size, monitor, gap, margin);
+    #[cfg(windows)]
+    set_size(&panel, size)?;
     move_to(&panel, position)
 }
 
@@ -491,9 +550,13 @@ fn show_panel(app: &AppHandle) -> CommandResult {
 fn snap_dot(app: &AppHandle) -> CommandResult {
     let dot = window(app, DOT)?;
     let mut current = rect_of(&dot)?;
-    keep_dot_size(&dot, current)?;
-    (current.width, current.height) = (DOT_SIZE.0 as i32, DOT_SIZE.1 as i32);
-    let (x, y) = geometry::snap_to_edge(current, &monitor_rects(&dot)?, EDGE_MARGIN);
+    let monitors = monitor_rects(&dot)?;
+    let monitor = geometry::monitor_for(current, &monitors);
+    let size = size_for(&dot, DOT_SIZE, monitor)?;
+    keep_size(&dot, current, size)?;
+    (current.width, current.height) = size;
+    let margin = length_for(&dot, EDGE_MARGIN, monitor)?;
+    let (x, y) = geometry::snap_to_edge(current, &monitors, margin);
     if (x, y) != (current.x, current.y) {
         move_to(&dot, (x, y))?;
     }
@@ -576,17 +639,23 @@ fn build_windows(
 
     // Restore the saved position (re-snapped in case the monitors changed), or
     // default to the right edge of the primary monitor, vertically centered.
-    // Everything is in points: before it is shown, the window may sit on a
-    // monitor with another scale factor than the one it is moved to.
+    // Windows uses physical coordinates and destination-scaled dimensions;
+    // macOS/Linux retain their global logical-point placement.
     let monitors = monitor_rects(&dot).unwrap_or_default();
-    let size = (DOT_SIZE.0 as i32, DOT_SIZE.1 as i32);
     let primary = app.primary_monitor()?.as_ref().map(work_area);
     let saved = position::load(&desktop_file(config)).map(|p| (p.x, p.y));
-    if let Some((x, y)) = geometry::initial_dot_position(saved, size, &monitors, primary, EDGE_MARGIN) {
-        dot.set_position(LogicalPosition::new(f64::from(x), f64::from(y)))?;
+    #[cfg(windows)]
+    let target = saved.and_then(|(x, y)| geometry::monitor_for(Rect::new(x, y, DOT_SIZE.0 as i32, DOT_SIZE.1 as i32), &monitors)).or(primary);
+    #[cfg(not(windows))]
+    let target = primary;
+    let io_error = |error| tauri::Error::Io(std::io::Error::other(error));
+    let size = size_for(&dot, DOT_SIZE, target).map_err(io_error)?;
+    let margin = length_for(&dot, EDGE_MARGIN, target).map_err(io_error)?;
+    if let Some(spot) = geometry::initial_dot_position(saved, size, &monitors, primary, margin) {
+        move_to(&dot, spot).map_err(io_error)?;
     }
-    // Set the size again once the window is in place, so it is exactly DOT_SIZE points there.
-    dot.set_size(LogicalSize::new(DOT_SIZE.0, DOT_SIZE.1))?;
+    // Reassert size in the destination space even before the window is shown.
+    set_size(&dot, size).map_err(io_error)?;
     // A hidden rose stays placed, ready for "Show the rose".
     if !rose_hidden {
         dot.show()?;
@@ -975,6 +1044,17 @@ pub fn run() {
                         let _ = snap.send(());
                     }
                 });
+                #[cfg(windows)]
+                {
+                    let app = handle.clone();
+                    window(&handle, PANEL)?.on_window_event(move |event| {
+                        if let WindowEvent::ScaleFactorChanged { .. } = event {
+                            if let Err(error) = rescale_panel(&app) {
+                                eprintln!("gentle-dot: cannot resize the panel: {error}");
+                            }
+                        }
+                    });
+                }
             } else {
                 eprintln!(
                     "gentle-dot: native Wayland: the desktop places the windows and owns shortcuts; bind `gentle-dot --toggle` (docs/linux-testing.md)"

@@ -1,5 +1,6 @@
-//! Pure placement math for the Dot and the panel, in logical points: the
-//! global macOS screen space that every monitor shares, whatever its scale.
+//! Pure placement math in one shared screen space: physical virtual-screen
+//! pixels on Windows, global logical points on macOS/Linux. Point dimensions
+//! are scaled only on Windows, using the destination monitor's scale.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
@@ -38,11 +39,8 @@ impl Rect {
     }
 }
 
-/// Converts a rectangle tao reports in physical pixels back to points. Tao
-/// derives each physical rectangle from points times one scale factor (a
-/// monitor's own, or the window's current one), so `scale` must be that same
-/// factor. Physical rectangles of monitors with different scales overlap and
-/// cannot be compared; their points can.
+/// Converts macOS/Linux rectangles back to their global logical point space.
+/// Do not use this conversion for Windows virtual-screen pixels.
 pub fn to_points(position: (i32, i32), size: (u32, u32), scale: f64) -> Rect {
     let points = |value: f64| (value / scale).round() as i32;
     Rect::new(
@@ -167,11 +165,65 @@ pub fn restore_rect(before: Rect, monitors: &[Rect], margin: i32) -> Rect {
     }
 }
 
+/// Rectangle in the platform's shared placement space.
+pub fn placement_rect(position: (i32, i32), size: (u32, u32), scale: f64, physical: bool) -> Rect {
+    if physical {
+        Rect::new(position.0, position.1, size.0 as i32, size.1 as i32)
+    } else {
+        to_points(position, size, scale)
+    }
+}
+
+/// Point lengths converted to the placement space of the destination monitor.
+pub fn placement_length(points: i32, scale: f64, physical: bool) -> i32 {
+    if physical { (f64::from(points) * scale).round() as i32 } else { points }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const SCREEN: Rect = Rect { x: 0, y: 0, width: 1920, height: 1080 };
+
+    #[test]
+    fn windows_mixed_dpi_selection_uses_one_physical_space() {
+        for origin in [(1920, 0), (-3840, 0), (0, -2160)] {
+            let secondary = placement_rect(origin, (3840, 2160), 1.5, true);
+            assert_eq!(secondary, Rect::new(origin.0, origin.1, 3840, 2160));
+            let monitors = [SCREEN, secondary];
+            let window = placement_rect((origin.0 + 300, origin.1 + 300), (108, 108), 1.5, true);
+            let cursor = placement_rect((origin.0 + 350, origin.1 + 350), (0, 0), 1.0, true);
+            assert_eq!(monitor_for(window, &monitors), Some(secondary));
+            assert_eq!(monitor_for(cursor, &monitors), Some(secondary));
+            // Primary pixels 1400..1920 overlap the secondary when incorrectly divided by 1.5.
+            assert_eq!(monitor_for(Rect::new(1500, 300, 72, 72), &monitors), Some(SCREEN));
+        }
+    }
+
+    #[test]
+    fn windows_target_scale_sizes_snaps_and_places_the_panel() {
+        let monitor = placement_rect((1920, 0), (3840, 2160), 1.5, true);
+        let length = |points| placement_length(points, 1.5, true);
+        assert_eq!((length(72), length(12), length(8)), (108, 18, 12));
+        assert_eq!(placement_length(3, 1.5, true), 5);
+        let dot = Rect::new(5600, 800, length(72), length(72));
+        let spot = snap_to_edge(dot, &[SCREEN, monitor], length(12));
+        assert_eq!(spot, (5634, 800));
+        assert_eq!(initial_dot_position(None, (108, 108), &[monitor], Some(monitor), 18), Some((5634, 1026)));
+        let dot = Rect::new(spot.0, spot.1, 108, 108);
+        let panel = (length(420), length(640));
+        assert_eq!(panel, (630, 960));
+        let spot = place_panel(dot, panel, monitor, length(8), length(12));
+        assert_eq!(spot, (4992, 374));
+        assert_eq!(place_panel_alone(None, panel, monitor, 18), (5112, 600));
+        assert_eq!(full_screen_rect(Rect::new(spot.0, spot.1, panel.0, panel.1), &[SCREEN, monitor]), Some(Rect::new(1920, 0, 3840, 2160)));
+    }
+
+    #[test]
+    fn logical_placement_retains_the_existing_conversion_and_lengths() {
+        assert_eq!(placement_rect((2736, 1200), (144, 144), 2.0, false), to_points((2736, 1200), (144, 144), 2.0));
+        assert_eq!(placement_length(12, 2.0, false), 12);
+    }
 
     fn dot(x: i32, y: i32) -> Rect {
         Rect::new(x, y, 56, 56)

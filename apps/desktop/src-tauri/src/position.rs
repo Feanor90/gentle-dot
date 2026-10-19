@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::Path;
 
-/// Top-left corner of the Dot window, in logical points.
+/// Top-left corner: physical virtual-screen pixels on Windows, logical points
+/// on macOS/Linux. At Windows 100 % these have the same numeric values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DotPosition {
     pub x: i32,
@@ -14,7 +15,8 @@ pub struct DotPosition {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct DesktopState {
-    /// Older builds saved `dot` in physical pixels; that key is ignored.
+    /// Keep the file key: Windows stores physical pixels here; macOS/Linux
+    /// store logical points. The older `dot` key is still ignored.
     dot_points: Option<DotPosition>,
     /// Missing in files written before the rose could be hidden.
     #[serde(default)]

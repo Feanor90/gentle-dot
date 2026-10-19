@@ -301,11 +301,11 @@ The desktop app bundles the built UI (`packages/ui/dist/app`) as its frontend, s
 
 | Label | Size | URL | Properties |
 |---|---|---|---|
-| `dot` | 72 × 72 pt (the rose in a 66 pt black disc) | `index.html?surface=dot` | title `Gentle Dot`; transparent outside the disc, no decorations, always on top, not resizable, skip taskbar, visible on all workspaces, shadow off; placed in logical points |
+| `dot` | 72 × 72 pt (the rose in a 66 pt black disc) | `index.html?surface=dot` | title `Gentle Dot`; transparent outside the disc, no decorations, always on top, not resizable, skip taskbar, visible on all workspaces, shadow off; placed in logical points on macOS/Linux, physical virtual-screen pixels on Windows |
 | `panel` | 420 × 640 | `index.html?surface=panel` (Linux: `&effects=none`) | title `Gentle Dot Panel`; transparent with macOS vibrancy (`HudWindow`), no decorations, always on top, hidden at start, skip taskbar. With `effects=none` the UI sets `data-effects="none"` on `<html>` and paints the panel opaque (`--bg`, no backdrop blur). |
 | `glow` (macOS) | the display where the agent acts | `index.html?surface=glow` | title `Gentle Dot Glow`; the computer-control glow overlay (S28, §4): transparent, no decorations, not focusable, ignores cursor events, above menus, on every Space, shown only during a control session. Its own capability allows only `core:event:allow-listen` and `allow-unlisten`; it never connects to the daemon. |
 
-When the panel opens, it is placed next to the Dot on the side with more room, and it stays inside the monitor.
+When the panel opens, it is placed next to the Dot on the side with more room, and it stays inside the monitor. On Windows, monitor work areas, windows and the pointer share physical virtual-screen pixels; the 72 pt Dot, 420 × 640 pt panel, 12 pt margin and 8 pt gap are multiplied by the destination monitor's scale and rounded. Both windows resize on a scale change; a full-screen panel continues to fill the work area. macOS/Linux keep global logical-point placement.
 
 ### Rust commands the UI calls (`@tauri-apps/api/core` `invoke`)
 
@@ -322,7 +322,7 @@ When the panel opens, it is placed next to the Dot on the side with more room, a
 | `shortcut_set` (panel only) | `{ "shortcut": string }` | `{ "shortcut": string }` as saved, or a rejection with a reason for the user (see "Menu bar and shortcut") |
 | `connector_command` (panel only) | `{ "clientId": string, "message": ClientMessage }` | sends a connector change (S25.2) to the daemon over the app channel on behalf of the window `clientId`; resolves once the daemon handled it (after any native confirmation), or rejects with a reason (no channel: the app did not start this daemon) |
 
-The Dot drags with `getCurrentWindow().startDragging()` (permission `core:window:allow-start-dragging`). After a drag ends (no move events for 300 ms), Rust snaps the Dot, by its real window size, to the nearest monitor edge with a 12 px margin and saves the position in `~/.gentle-dot/desktop.json`; the next launch restores it, or defaults to the right edge, vertically centered.
+The Dot drags with `getCurrentWindow().startDragging()` (permission `core:window:allow-start-dragging`). After a drag ends (no move events for 300 ms), Rust snaps the Dot, by its real window size, to the nearest monitor edge with a 12 pt margin and saves the position (`dot_points`: physical pixels on Windows, logical points on macOS/Linux; unchanged numerically at Windows 100 %) in `~/.gentle-dot/desktop.json`; the next launch restores it, or defaults to the right edge, vertically centered.
 
 ### Events Rust emits to the UI (`@tauri-apps/api/event` `listen`)
 
