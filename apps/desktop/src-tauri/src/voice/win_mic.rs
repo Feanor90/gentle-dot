@@ -14,11 +14,9 @@ use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects, WaitForSingleObject};
 
-const MICROPHONE_PRIVACY: &str = "Microphone access is off for Gentle Dot. Turn on Microphone access and Let desktop apps access your microphone in Windows Settings → Privacy & security → Microphone.";
-
 fn api_error(code: HRESULT) -> VoiceError {
     match code {
-        E_ACCESSDENIED => VoiceError::Failed(MICROPHONE_PRIVACY.into()),
+        E_ACCESSDENIED => VoiceError::MicrophoneDenied,
         code if code == HRESULT::from_win32(ERROR_NOT_FOUND.0) => VoiceError::NoMicrophone,
         AUDCLNT_E_DEVICE_INVALIDATED | AUDCLNT_E_SERVICE_NOT_RUNNING | AUDCLNT_E_RESOURCES_INVALIDATED => VoiceError::Interrupted,
         _ => VoiceError::Failed(format!("The microphone could not record: {code}")),
@@ -79,11 +77,75 @@ impl Event {
     }
 }
 
+/// The microphone switches of Windows Settings → Privacy & security → Microphone: the device
+/// switch (HKLM), "Microphone access" (HKCU) and "Let desktop apps access" (HKCU `NonPackaged`).
+const CONSENT: &str = r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone";
+/// Group policy `LetAppsAccessMicrophone`: 1 forces access on, 2 forces it off.
+const POLICY: &str = r"SOFTWARE\Policies\Microsoft\Windows\AppPrivacy";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hive { User, Machine }
+
+trait Registry {
+    fn string(&self, hive: Hive, key: &str, name: &str) -> Option<String>;
+    fn dword(&self, hive: Hive, key: &str, name: &str) -> Option<u32>;
+}
+
+/// The microphone permission as Windows Settings holds it. There is no prompt on the desktop, so
+/// it is never `NotDetermined`: a switch that is unset or unknown counts as on, and opening the
+/// device still reports a denial the registry did not show.
+fn consent(registry: &impl Registry) -> Authorization {
+    match registry.dword(Hive::Machine, POLICY, "LetAppsAccessMicrophone") {
+        Some(1) => return Authorization::Authorized,
+        Some(2) => return Authorization::Restricted,
+        _ => {}
+    }
+    let desktop = format!(r"{CONSENT}\NonPackaged");
+    let off = |hive, key: &str| registry.string(hive, key, "Value").is_some_and(|value| value.eq_ignore_ascii_case("Deny"));
+    if off(Hive::Machine, CONSENT) || off(Hive::User, CONSENT) || off(Hive::User, &desktop) {
+        Authorization::Denied
+    } else {
+        Authorization::Authorized
+    }
+}
+
+/// The real registry; any read error counts as an unset value.
+struct System;
+impl System {
+    fn read(hive: Hive, key: &str, name: &str, flags: u32, data: *mut std::ffi::c_void, size: &mut u32) -> bool {
+        use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+        use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+        let wide = |text: &str| text.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+        let (key, name) = (wide(key), wide(name));
+        let root = match hive { Hive::User => HKEY_CURRENT_USER, Hive::Machine => HKEY_LOCAL_MACHINE };
+        // SAFETY: the strings are NUL-terminated and `data` spans `size` bytes.
+        let status = unsafe { RegGetValueW(root, key.as_ptr(), name.as_ptr(), flags, std::ptr::null_mut(), data, size) };
+        status == ERROR_SUCCESS
+    }
+}
+impl Registry for System {
+    fn string(&self, hive: Hive, key: &str, name: &str) -> Option<String> {
+        // "Allow" / "Deny": anything longer is not a value this reads.
+        let mut buffer = [0u16; 32];
+        let mut size = std::mem::size_of_val(&buffer) as u32;
+        let flags = windows_sys::Win32::System::Registry::RRF_RT_REG_SZ;
+        if !Self::read(hive, key, name, flags, buffer.as_mut_ptr().cast(), &mut size) { return None; }
+        let len = buffer.iter().position(|&unit| unit == 0).unwrap_or(buffer.len());
+        String::from_utf16(&buffer[..len]).ok()
+    }
+    fn dword(&self, hive: Hive, key: &str, name: &str) -> Option<u32> {
+        let mut value = 0u32;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        let flags = windows_sys::Win32::System::Registry::RRF_RT_REG_DWORD;
+        Self::read(hive, key, name, flags, (&mut value as *mut u32).cast(), &mut size).then_some(value)
+    }
+}
+
 pub struct WinMicrophone;
 impl Microphone for WinMicrophone {
-    // WASAPI has no desktop permission-prompt API. These mean "try open", not privacy proof.
-    fn authorization(&self) -> Authorization { Authorization::Authorized }
-    fn request_authorization(&self) -> Authorization { Authorization::Authorized }
+    // Desktop apps get no permission prompt: requesting only reads the switches again.
+    fn authorization(&self) -> Authorization { consent(&System) }
+    fn request_authorization(&self) -> Authorization { consent(&System) }
     fn open(&self, sink: Sink) -> Result<Box<dyn Stream>, VoiceError> {
         open_capture(sink, Wasapi::open)
     }
@@ -271,8 +333,8 @@ mod tests {
 
     struct TestMic(Mutex<Option<Result<FakeCapture, VoiceError>>>);
     impl Microphone for TestMic {
-        fn authorization(&self) -> Authorization { WinMicrophone.authorization() }
-        fn request_authorization(&self) -> Authorization { WinMicrophone.request_authorization() }
+        fn authorization(&self) -> Authorization { Authorization::Authorized }
+        fn request_authorization(&self) -> Authorization { Authorization::Authorized }
         fn open(&self, sink: Sink) -> Result<Box<dyn Stream>, VoiceError> {
             let result = self.0.lock().unwrap().take().unwrap();
             open_capture(sink, move || result)
@@ -304,13 +366,13 @@ mod tests {
     fn startup_errors_are_synchronous_and_cancel_the_recognizer() {
         for error in [VoiceError::NoMicrophone, api_error(E_ACCESSDENIED), VoiceError::Interrupted] {
             let (voice, recognizer, events) = rig(Err(error.clone()));
-            assert!(voice.status().available, "status cannot establish Windows privacy authorization");
+            assert!(voice.status().available, "an open failure is only known once recording starts");
             assert_eq!(voice.start(None, events.events()), Err(error));
             assert_eq!(recognizer.log.lock().unwrap().cancelled, 1);
             assert_eq!(voice.cancel(), Ok(()));
             assert!(events.seen().is_empty());
         }
-        assert_eq!(api_error(E_ACCESSDENIED).to_string(), MICROPHONE_PRIVACY);
+        assert_eq!(api_error(E_ACCESSDENIED), VoiceError::MicrophoneDenied);
         assert_eq!(api_error(AUDCLNT_E_DEVICE_INVALIDATED), VoiceError::Interrupted);
         assert_eq!(api_error(HRESULT::from_win32(ERROR_NOT_FOUND.0)), VoiceError::NoMicrophone);
     }
@@ -489,5 +551,107 @@ mod tests {
         drop(stream);
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
         v.cancel().unwrap();
+    }
+
+    /// The privacy switches as the registry holds them; absent values are simply missing.
+    #[derive(Default)]
+    struct FakeRegistry {
+        strings: Vec<(Hive, String, &'static str)>,
+        policy: Option<u32>,
+    }
+
+    impl FakeRegistry {
+        fn with(mut self, hive: Hive, key: &str, value: &'static str) -> Self {
+            self.strings.push((hive, key.into(), value));
+            self
+        }
+    }
+
+    impl Registry for FakeRegistry {
+        fn string(&self, hive: Hive, key: &str, name: &str) -> Option<String> {
+            assert_eq!(name, "Value");
+            self.strings.iter().find(|(h, k, _)| *h == hive && k == key).map(|(_, _, v)| v.to_string())
+        }
+        fn dword(&self, hive: Hive, key: &str, name: &str) -> Option<u32> {
+            assert_eq!((hive, key, name), (Hive::Machine, POLICY, "LetAppsAccessMicrophone"));
+            self.policy
+        }
+    }
+
+    fn desktop() -> String { format!(r"{CONSENT}\NonPackaged") }
+
+    #[test]
+    fn consent_reads_the_windows_microphone_privacy_switches() {
+        let allowed = FakeRegistry::default()
+            .with(Hive::Machine, CONSENT, "Allow")
+            .with(Hive::User, CONSENT, "Allow")
+            .with(Hive::User, &desktop(), "Allow");
+        assert_eq!(consent(&allowed), Authorization::Authorized);
+        assert_eq!(consent(&FakeRegistry::default()), Authorization::Authorized, "unset switches default to on");
+        for (hive, key) in [(Hive::Machine, CONSENT.to_string()), (Hive::User, CONSENT.to_string()), (Hive::User, desktop())] {
+            let denied = FakeRegistry::default().with(hive, &key, "Deny");
+            assert_eq!(consent(&denied), Authorization::Denied, "{key} off");
+        }
+        assert_eq!(consent(&FakeRegistry::default().with(Hive::User, CONSENT, "deny")), Authorization::Denied);
+        assert_eq!(consent(&FakeRegistry::default().with(Hive::User, CONSENT, "Prompt")), Authorization::Authorized);
+    }
+
+    #[test]
+    fn the_app_privacy_policy_overrides_the_user_switches() {
+        let forced_off = FakeRegistry { policy: Some(2), ..FakeRegistry::default() }.with(Hive::User, CONSENT, "Allow");
+        assert_eq!(consent(&forced_off), Authorization::Restricted);
+        let forced_on = FakeRegistry { policy: Some(1), ..FakeRegistry::default() }.with(Hive::User, &desktop(), "Deny");
+        assert_eq!(consent(&forced_on), Authorization::Authorized);
+        let user_choice = FakeRegistry { policy: Some(0), ..FakeRegistry::default() }.with(Hive::User, CONSENT, "Deny");
+        assert_eq!(consent(&user_choice), Authorization::Denied);
+    }
+
+    struct ConsentMic(FakeRegistry, AtomicUsize);
+    impl Microphone for ConsentMic {
+        fn authorization(&self) -> Authorization { consent(&self.0) }
+        fn request_authorization(&self) -> Authorization { consent(&self.0) }
+        fn open(&self, _: Sink) -> Result<Box<dyn Stream>, VoiceError> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            Err(VoiceError::Interrupted)
+        }
+    }
+
+    #[test]
+    fn status_reports_a_windows_privacy_denial_before_recording() {
+        for (registry, error) in [
+            (FakeRegistry::default().with(Hive::User, &desktop(), "Deny"), VoiceError::MicrophoneDenied),
+            (FakeRegistry { policy: Some(2), ..FakeRegistry::default() }, VoiceError::MicrophoneRestricted),
+        ] {
+            let mic = Arc::new(ConsentMic(registry, AtomicUsize::new(0)));
+            let voice = Voice::new(mic.clone(), Arc::new(FakeRecognizer::granted()), Arc::new(FakeClock(AtomicU64::new(0))));
+            assert_eq!(voice.status(), crate::voice::VoiceStatus::unavailable(error.to_string()));
+            let events = Recorder::default();
+            assert_eq!(voice.start(None, events.events()), Err(error));
+            assert_eq!(mic.1.load(Ordering::SeqCst), 0, "a denied microphone is never opened");
+            assert!(events.seen().is_empty());
+        }
+    }
+
+    #[test]
+    fn privacy_reasons_name_the_windows_settings() {
+        assert_eq!(
+            VoiceError::MicrophoneDenied.to_string(),
+            "Microphone access is off for Gentle Dot. Turn on Microphone access and Let desktop apps access your microphone in Windows Settings → Privacy & security → Microphone."
+        );
+        assert_eq!(
+            VoiceError::MicrophoneRestricted.to_string(),
+            "Microphone access for desktop apps is turned off by a Windows policy on this PC. Ask your administrator to allow it."
+        );
+    }
+
+    #[test]
+    fn the_system_registry_reads_strings_and_dwords_and_treats_missing_values_as_unset() {
+        let version = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+        let build = System.string(Hive::Machine, version, "CurrentBuild").expect("every Windows has a build number");
+        assert!(!build.is_empty() && build.chars().all(|c| c.is_ascii_digit()), "{build}");
+        assert!(System.dword(Hive::Machine, version, "CurrentMajorVersionNumber").is_some_and(|major| major >= 10));
+        assert_eq!(System.string(Hive::Machine, version, "CurrentMajorVersionNumber"), None, "a DWORD is not a string");
+        assert_eq!(System.string(Hive::User, r"Software\Gentle Dot\no such key", "Value"), None);
+        assert_eq!(System.dword(Hive::Machine, POLICY, "no such value"), None);
     }
 }

@@ -106,7 +106,7 @@ impl VoiceEvent {
 /// Delivers events to the webview that started the recording; called from any thread.
 pub type Events = Arc<dyn Fn(VoiceEvent) + Send + Sync>;
 
-/// A macOS privacy permission, as the system reports it.
+/// A privacy permission, as the system reports it (macOS; the Windows microphone switches).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Authorization {
     NotDetermined,
@@ -136,6 +136,17 @@ pub enum VoiceError {
     Failed(String),
 }
 
+#[cfg(not(target_os = "windows"))]
+const MICROPHONE_DENIED: &str =
+    "Microphone access is off for Gentle Dot. Turn it on in System Settings → Privacy & Security → Microphone.";
+#[cfg(not(target_os = "windows"))]
+const MICROPHONE_RESTRICTED: &str = "Microphone access is restricted on this Mac.";
+#[cfg(target_os = "windows")]
+const MICROPHONE_DENIED: &str = "Microphone access is off for Gentle Dot. Turn on Microphone access and Let desktop apps access your microphone in Windows Settings → Privacy & security → Microphone.";
+#[cfg(target_os = "windows")]
+const MICROPHONE_RESTRICTED: &str =
+    "Microphone access for desktop apps is turned off by a Windows policy on this PC. Ask your administrator to allow it.";
+
 impl fmt::Display for VoiceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -148,10 +159,8 @@ impl fmt::Display for VoiceError {
                 "Speech Recognition is off for Gentle Dot. Turn it on in System Settings → Privacy & Security → Speech Recognition.",
             ),
             VoiceError::SpeechRestricted => f.write_str("Speech Recognition is restricted on this Mac."),
-            VoiceError::MicrophoneDenied => f.write_str(
-                "Microphone access is off for Gentle Dot. Turn it on in System Settings → Privacy & Security → Microphone.",
-            ),
-            VoiceError::MicrophoneRestricted => f.write_str("Microphone access is restricted on this Mac."),
+            VoiceError::MicrophoneDenied => f.write_str(MICROPHONE_DENIED),
+            VoiceError::MicrophoneRestricted => f.write_str(MICROPHONE_RESTRICTED),
             VoiceError::NoRecognizer(locale) => write!(f, "Speech recognition is not available for {locale}."),
             VoiceError::NoModel => f.write_str("Download the local voice model to use voice input."),
             VoiceError::NoMicrophone => f.write_str("No microphone is available."),
