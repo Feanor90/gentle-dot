@@ -855,7 +855,7 @@ export class ConnectorStore {
 			try {
 				moved = await this.otherFolderKeyFor(source, scopedId, signed);
 			} catch (error) {
-				cannot(`the other data folders' keys could not be listed (${(error as Error).message})`);
+				cannot(`the other data folders' keys could not be listed or read (${(error as Error).message})`);
 				return;
 			}
 		}

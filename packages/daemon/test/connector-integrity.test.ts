@@ -660,10 +660,48 @@ describe("one signing key per data folder (S18)", () => {
 		const { notices } = await started(after, source, logs);
 		expect(notices).toEqual([INTEGRITY_UNCHECKED]);
 		expect(logs.join("\n")).toContain(
-			"the other data folders' keys could not be listed (keychain unavailable)",
+			"the other data folders' keys could not be listed or read (keychain unavailable)",
 		);
 		expect(readFileSync(join(after, "connectors.json"), "utf8")).toBe(bytes);
 		expect(rejectedFiles(after)).toEqual([]);
+		expect(source.values.has(scopedIntegrityKeyId(after))).toBe(false);
+	});
+
+	it("a folder key the store cannot read fails closed for a moved folder's file", async () => {
+		const { dataDir: before, source } = await signedInstall();
+		const after = join(tempDir(), "moved");
+		renameSync(before, after);
+		const bytes = readFileSync(join(after, "connectors.json"), "utf8");
+		const get = source.get.bind(source);
+		source.get = async (id: string) => {
+			if (id === scopedIntegrityKeyId(before)) throw new Error("keychain unavailable");
+			return get(id);
+		};
+		const logs: string[] = [];
+		const { notices } = await started(after, source, logs);
+		expect(notices).toEqual([INTEGRITY_UNCHECKED]);
+		expect(logs.join("\n")).toContain(
+			"the other data folders' keys could not be listed or read (keychain unavailable)",
+		);
+		expect(readFileSync(join(after, "connectors.json"), "utf8")).toBe(bytes);
+		expect(rejectedFiles(after)).toEqual([]);
+		expect(source.values.has(scopedIntegrityKeyId(after))).toBe(false);
+	});
+
+	it("a moved folder whose own copy of the key cannot be stored keeps its connectors", async () => {
+		const { dataDir: before, source } = await signedInstall();
+		const after = join(tempDir(), "moved");
+		renameSync(before, after);
+		const put = source.put.bind(source);
+		source.put = async (id: string, value: string) => {
+			if (id === scopedIntegrityKeyId(after)) throw new Error("keychain full");
+			return put(id, value);
+		};
+		const logs: string[] = [];
+		const { store, notices } = await started(after, source, logs);
+		expect(notices).toEqual([]);
+		expect(Object.keys(store.state().connectors).sort()).toEqual(["discord", "plain"]);
+		expect(logs.join("\n")).toContain("the previous folder's entry stays in use");
 		expect(source.values.has(scopedIntegrityKeyId(after))).toBe(false);
 	});
 
