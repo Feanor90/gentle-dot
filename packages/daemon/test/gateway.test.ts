@@ -590,6 +590,21 @@ describe("white label", () => {
 		for (const name of HIDDEN_NAMES) expect(text).not.toMatch(name);
 	});
 
+	it("corrects MCP warning advice without hiding warning detail or errors", async () => {
+		const client = await authed(await daemon());
+		send(client, { type: "send", text: "notify:mcp" });
+		await find(client, "message_done");
+		const toasts = client.messages.filter((m) => m.type === "toast");
+		expect(toasts.map(({ level, message }) => ({ level, message }))).toEqual([
+			{
+				level: "warning",
+				message: "MCP server notion failed: connection closed. Open Connectors to review the connection.",
+			},
+			{ level: "error", message: "MCP server notion error: connection closed." },
+		]);
+		expect(JSON.stringify(toasts)).not.toContain("Run /mcp to fix.");
+	});
+
 	it("rewrites branded ask text", async () => {
 		const d = await daemon();
 		const client = await authed(d);

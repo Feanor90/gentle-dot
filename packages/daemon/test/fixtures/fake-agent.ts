@@ -10,6 +10,7 @@
 //   "propose:<json>" runs the approval guard's real propose_connector with <json> as its arguments
 //   "hang"         starts a run that only ends on abort (an aborted answer), or on a
 //                  session switch (Pi then ends it with an error: "This operation was aborted")
+//   "notify:mcp"   emits synthetic MCP info, warning, and error notifications
 //   "fail"         the provider fails: an answer that ends with stopReason "error"
 //   "slow"         answers after 1.5 s, leaving time to queue messages
 //   "crash"        starts a run and exits with code 1
@@ -298,6 +299,17 @@ async function runPrompt(text: string, images?: Rec[]) {
 			hanging = resolve;
 		});
 		endedAnswer(stopReason, "This operation was aborted");
+		return endRun();
+	}
+	if (text === "notify:mcp") {
+		for (const [notifyType, message] of [
+			["info", "MCP startup info"],
+			["warning", "MCP server notion failed: connection closed. Run /mcp to fix."],
+			["error", "MCP server notion error: connection closed."],
+		]) {
+			out({ type: "extension_ui_request", id: randomUUID(), method: "notify", notifyType, message });
+		}
+		assistantText("Notifications sent.");
 		return endRun();
 	}
 	if (text === "fail") {

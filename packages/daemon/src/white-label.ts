@@ -16,6 +16,7 @@ export const HIDDEN_NAMES: RegExp[] = [
 ];
 
 const REWRITES: [RegExp, string][] = [
+	[/Run \/mcp to fix\./g, "Open Connectors to review the connection."],
 	[/\/gentle:[\w:-]+/gi, ""],
 	[/\bel gentleman\b/gi, "Gentle Dot"],
 	[/\bgentle[ -]?(?:shell|ai|pi)\b/gi, "Gentle Dot"],

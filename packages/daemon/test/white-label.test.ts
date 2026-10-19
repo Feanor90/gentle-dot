@@ -24,6 +24,19 @@ describe("presentText", () => {
 		expect(presentText(input)).toBe(expected);
 	});
 
+	it("replaces only the exact MCP repair instruction and preserves warning detail", () => {
+		const shown = presentText("MCP server notion failed: connection closed. Run /mcp to fix.");
+		expect(shown).toBe(
+			"MCP server notion failed: connection closed. Open Connectors to review the connection.",
+		);
+		expect(shown).not.toContain("Run /mcp to fix.");
+	});
+
+	it.each(["/mcp", "What does /mcp do?", "https://example.test/mcp", "Run /mcp to inspect."])(
+		"preserves ordinary MCP text %j",
+		(text) => expect(presentText(text)).toBe(text),
+	);
+
 	it("leaves ordinary text alone", () => {
 		const text = "Pick a color: Pi is 3.14, odd numbers are fine, and gentle reminders help.";
 		expect(presentText(text)).toBe(text);
