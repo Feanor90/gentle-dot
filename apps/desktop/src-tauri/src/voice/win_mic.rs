@@ -33,6 +33,7 @@ fn capture_event(result: WAIT_EVENT) -> Result<bool, VoiceError> {
     match result {
         WAIT_OBJECT_0 => Ok(false),
         value if value.0 == WAIT_OBJECT_0.0 + 1 => Ok(true),
+        WAIT_TIMEOUT => Err(VoiceError::Failed("The microphone stopped delivering audio.".into())),
         _ => Err(VoiceError::Interrupted),
     }
 }
@@ -348,7 +349,7 @@ mod tests {
         let result = unsafe { WaitForMultipleObjects(&[stop.handle(), audio.handle()], false, 0) };
         assert_eq!(capture_event(result), Ok(false));
         assert_eq!(capture_event(WAIT_EVENT(1)), Ok(true));
-        for event in [WAIT_TIMEOUT, WAIT_EVENT(u32::MAX), WAIT_EVENT(128)] {
+        for event in [WAIT_EVENT(u32::MAX), WAIT_EVENT(128)] {
             assert_eq!(capture_event(event), Err(VoiceError::Interrupted));
         }
     }
@@ -398,6 +399,47 @@ mod tests {
             assert_eq!(events.seen(), before);
             assert_eq!(recognizer.log.lock().unwrap().fed, vec![0.25; 160]);
         }
+    }
+
+    #[test]
+    fn stalled_delivery_fills_queue_and_interrupts_without_blocking_capture_release() {
+        let (device, tx, released) = device();
+        let (voice, recognizer, events) = rig(Ok(device));
+        voice.start(None, events.events()).unwrap();
+        // Deliberately pin honest failure under backpressure: never block capture or
+        // silently drop transcript audio. One packet can be in delivery, eight queued.
+        let stalled = recognizer.log.lock().unwrap();
+        // Capture may exit on packet nine before delivery receives its first packet.
+        let sent = (0..10).filter(|_| tx.send(Ok(vec![0.25; 160])).is_ok()).count();
+        until(|| released.load(Ordering::SeqCst) == 1);
+        drop(stalled);
+        assert!(sent > 8);
+        until(|| events.seen().iter().any(|event| matches!(event, VoiceEvent::Error(_))));
+        until(|| recognizer.log.lock().unwrap().cancelled == 1);
+        assert_eq!(voice.stop(), Err(VoiceError::NotRecording));
+        voice.cancel().unwrap();
+        assert_eq!(events.seen().into_iter().filter(|event| matches!(event, VoiceEvent::Error(_))).collect::<Vec<_>>(),
+            vec![VoiceEvent::Error(VoiceError::Interrupted.to_string())]);
+        assert_eq!(recognizer.log.lock().unwrap().cancelled, 1);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn watchdog_timeout_reports_audio_stall_through_the_failure_path() {
+        let expected = VoiceError::Failed("The microphone stopped delivering audio.".into());
+        assert_eq!(capture_event(WAIT_TIMEOUT), Err(expected.clone()));
+        let (device, tx, released) = device();
+        let (voice, recognizer, events) = rig(Ok(device));
+        voice.start(None, events.events()).unwrap();
+        tx.send(capture_event(WAIT_TIMEOUT).map(|_| vec![])).unwrap();
+        until(|| events.seen().iter().any(|event| matches!(event, VoiceEvent::Error(_))));
+        until(|| recognizer.log.lock().unwrap().cancelled == 1);
+        assert_eq!(events.seen(), vec![VoiceEvent::Error(expected.to_string())]);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        assert_eq!(recognizer.log.lock().unwrap().cancelled, 1);
+        assert_eq!(voice.stop(), Err(VoiceError::NotRecording));
+        voice.cancel().unwrap();
+        assert_eq!(events.seen(), vec![VoiceEvent::Error(expected.to_string())]);
     }
 
     #[test]
