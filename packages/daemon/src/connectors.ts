@@ -2420,6 +2420,7 @@ export class ConnectorManager {
 	private async runLogin(flow: Flow): Promise<void> {
 		const { store, oauth } = this.options;
 		const done = { type: "auth_done", flowId: flow.id, providerId: flow.connectorId } as const;
+		let signedIn = false;
 		try {
 			const target = await store.signInTarget(flow.connectorId);
 			if (flow.cancelled) throw new SignInCancelledError();
@@ -2430,6 +2431,7 @@ export class ConnectorManager {
 			});
 			const state = await flow.signIn.done;
 			await store.saveSignIn(flow.connectorId, state);
+			signedIn = true;
 			this.log(`signed in to connector ${flow.connectorId}`);
 			flow.emit({ ...done, ok: true });
 		} catch (error) {
@@ -2450,7 +2452,9 @@ export class ConnectorManager {
 			}
 		} finally {
 			if (this.flow === flow) this.flow = undefined;
-			this.onChanged(false);
+			// The engine may have initialized this connector before its credentials existed.
+			// Reload only after a successful save; the bridge waits for any running answer.
+			this.onChanged(signedIn);
 		}
 	}
 

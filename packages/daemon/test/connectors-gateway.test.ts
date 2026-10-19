@@ -7,7 +7,7 @@ import WebSocket from "ws";
 import { type DotDaemon, startDaemon } from "../src/daemon.ts";
 import { fakeApp, sendLikeThePanel } from "./fake-app.ts";
 import { fakeAuthRuntime } from "./fake-auth-runtime.ts";
-import { oauthOptions } from "./fake-oauth.ts";
+import { fakeOAuth, oauthOptions } from "./fake-oauth.ts";
 import { FAKE_AGENT, tempDir, waitFor } from "./helpers.ts";
 
 const GUARD = fileURLToPath(new URL("../src/extensions/approval-guard.ts", import.meta.url));
@@ -27,6 +27,7 @@ async function setup(options: { home?: boolean; browser?: "auto" } = {}) {
 	const argsFile = join(dataDir, "agent-args.json");
 	const logs: string[] = [];
 	const fake = fakeAuthRuntime();
+	const oauth = fakeOAuth();
 	// Connector changes come from the desktop app (S25.2); it allows the ones it confirms.
 	const app = fakeApp([], "allow");
 	const d = await startDaemon({
@@ -45,7 +46,7 @@ async function setup(options: { home?: boolean; browser?: "auto" } = {}) {
 		},
 		...(options.home ? { agentHome } : {}),
 		authRuntime: async () => fake.runtime,
-		connectorOAuth: oauthOptions(options.browser === "auto"),
+		connectorOAuth: oauthOptions(options.browser === "auto", oauth),
 		appChannel: app.daemonEnd,
 		log: (line) => logs.push(line),
 	});
@@ -57,6 +58,7 @@ async function setup(options: { home?: boolean; browser?: "auto" } = {}) {
 		dataDir,
 		agentHome,
 		logs,
+		oauth,
 		agentEnv,
 		agentArgs,
 		...(await connect(d, app)),
@@ -128,6 +130,24 @@ describe("connectors over the protocol", () => {
 		);
 	});
 
+	it("reloads tools when OAuth finishes after the connect-time engine restart", async () => {
+		const { d, send, find, oauth } = await setup();
+		await waitFor(() => d.supervisor.state === "ready");
+		const initialPid = d.supervisor.pid;
+		send({ type: "connector_connect", connectorId: "notion" });
+		const link = await find("auth_event", (m) => m.event.kind === "auth_url");
+		await find("auth_prompt");
+		await waitFor(() => d.supervisor.pid !== initialPid && d.supervisor.state === "ready");
+		const unsignedPid = d.supervisor.pid;
+		expect(oauth.issued()).toBe(0);
+		const address = oauth.callbackFor(link.event.kind === "auth_url" ? link.event.url : "");
+		send({ type: "auth_reply", flowId: link.flowId, value: address.href });
+		expect(await find("auth_done")).toMatchObject({ ok: true, providerId: "notion" });
+		await find("connectors", (m) => m.connectors[0]?.status === "connected");
+		await waitFor(() => d.supervisor.pid !== unsignedPid && d.supervisor.state === "ready");
+		expect(oauth.issued()).toBe(1);
+	});
+
 	it("waits for the running answer before restarting for a connector change", async () => {
 		const { d, send, find } = await setup({ browser: "auto" });
 		send({ type: "send", text: "hang" });
@@ -166,15 +186,23 @@ describe("connectors over the protocol", () => {
 	});
 
 	it("keeps a connector the user turned off turned off when the agent edits the files and ends itself (B1)", async () => {
-		const { d, send, find, messages, dataDir, agentHome, agentEnv } = await setup({ browser: "auto" });
+		const { d, send, find, messages, dataDir, agentHome, agentEnv, oauth } = await setup();
 		const started = d.supervisor.pid;
 		send({ type: "connector_connect", connectorId: "notion" });
-		await find("auth_done");
-		// The sign-in is quick: let the restart for connecting finish before the next change.
+		const link = await find("auth_event", (m) => m.event.kind === "auth_url");
+		await find("auth_prompt");
+		// Finish the connect-time restart before completing OAuth, which requests another restart.
 		await waitFor(() => d.supervisor.pid !== started && d.supervisor.state === "ready");
+		const unsignedPid = d.supervisor.pid;
+		const address = oauth.callbackFor(link.event.kind === "auth_url" ? link.event.url : "");
+		send({ type: "auth_reply", flowId: link.flowId, value: address.href });
+		expect(await find("auth_done")).toMatchObject({ ok: true, providerId: "notion" });
+		await waitFor(() => d.supervisor.pid !== unsignedPid && d.supervisor.state === "ready");
+		const signedPid = d.supervisor.pid;
 		send({ type: "connector_disconnect", connectorId: "notion" });
-		await waitFor(() => !JSON.parse(agentEnv().GENTLE_DOT_CONNECTOR_POLICY ?? "{}").connectors?.notion);
-		await waitFor(() => d.supervisor.state === "ready" && !d.supervisor.busy);
+		await waitFor(() => d.supervisor.pid !== signedPid && d.supervisor.state === "ready");
+		expect(JSON.parse(agentEnv().GENTLE_DOT_CONNECTOR_POLICY ?? "{}").connectors).toEqual({});
+		expect(d.supervisor.busy).toBe(false);
 		const approved = {
 			connectors: readFileSync(join(dataDir, "connectors.json"), "utf8"),
 			mcp: readFileSync(join(agentHome, "mcp.json"), "utf8"),
