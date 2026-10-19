@@ -5,7 +5,7 @@ import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/config.ts";
 import { bundledMcpCli } from "../src/connectors.ts";
 import { isolatedAgentEnv } from "../src/isolation.ts";
-import { engramKnownDirs, resolveEngramBin } from "../src/runtime.ts";
+import { appendUserGitPath, engramKnownDirs, resolveEngramBin } from "../src/runtime.ts";
 
 const { shellAnswers, execFileSync } = vi.hoisted(() => ({
 	shellAnswers: new Map<string, string | undefined>(),
@@ -104,6 +104,24 @@ describe("installed runtime (GENTLE_DOT_RUNTIME)", () => {
 		expect(env.PATH).toBe([join(runtime, "bin"), "/usr/bin", "/bin"].join(delimiter));
 		const again = isolatedAgentEnv({ ...base, PATH: env.PATH }, tempDir());
 		expect(again.PATH).toBe(env.PATH);
+	});
+
+	it("keeps bundled pi first when only the user's git folder is appended", () => {
+		const runtime = fakeRuntime();
+		const git = tempDir();
+		touch(join(git, "git.exe"), "", 0o755);
+		const base = {
+			PATH: join(runtime, "node", "bin"),
+			GENTLE_DOT_RUNTIME: runtime,
+			GENTLE_DOT_USER_PATH: `${join(git, "missing")};${git}`,
+			HOME: tempDir(),
+			ENGRAM_BIN: "explicit-engram",
+		};
+		const env = isolatedAgentEnv(base, tempDir());
+		const expected = [join(runtime, "bin"), base.PATH];
+		if (process.platform === "win32") expected.push(git);
+		expect(env.PATH).toBe(expected.join(delimiter));
+		expect(env.ENGRAM_BIN).toBe("explicit-engram");
 	});
 
 	it("passes the user's ENGRAM_BIN to the engine and keeps the global memory", () => {
@@ -248,6 +266,50 @@ describe("Windows Engram resolution", () => {
 			join(runtime, "bin", "engram.exe"),
 		);
 		expect(execFileSync).not.toHaveBeenCalled();
+	});
+});
+
+describe("appendUserGitPath", () => {
+	const runtime = "C:\\Dot\\runtime";
+	const path = `${runtime}\\bin;C:\\Windows\\System32`;
+	const git = "C:\\User\\Git\\cmd";
+	const env = { PATH: path, GENTLE_DOT_USER_PATH: `C:\\Other;${git}`, GENTLE_DOT_RUNTIME: runtime };
+	const options = { platform: "win32" as const, isFile: (file: string) => file === `${git}\\git.exe` };
+
+	it("appends only the first user's git folder after runtime bins, without mutating the input", () => {
+		expect(appendUserGitPath(env, runtime, options)).toBe(`${path};${git}`);
+		expect(env.PATH).toBe(path);
+	});
+
+	it("falls back to PATH when the saved user PATH is absent", () => {
+		expect(appendUserGitPath({ PATH: `${path};${git}` }, runtime, options)).toBe(`${path};${git}`);
+	});
+
+	it("leaves PATH byte-for-byte unchanged without git or with an explicitly empty user PATH", () => {
+		expect(appendUserGitPath(env, runtime, { ...options, isFile: () => false })).toBe(path);
+		expect(appendUserGitPath({ ...env, GENTLE_DOT_USER_PATH: "" }, runtime, options)).toBe(path);
+	});
+
+	it("ignores empty, relative, drive-relative, and resolved runtime-bin entries", () => {
+		const isFile = vi.fn(() => true);
+		const userPath = `;relative;C:relative;${runtime}\\BIN;${runtime}\\node\\bin\\..\\bin;${git};C:\\Later`;
+		expect(
+			appendUserGitPath({ ...env, GENTLE_DOT_USER_PATH: userPath }, runtime, { ...options, isFile }),
+		).toBe(`${path};${git}`);
+		expect(isFile.mock.calls).toEqual([[`${git}\\git.exe`]]);
+	});
+
+	it("does not duplicate a folder already present with different case and dot segments", () => {
+		const existing = `${path};c:\\user\\git\\cmd\\.`;
+		expect(appendUserGitPath({ ...env, PATH: existing }, runtime, options)).toBe(existing);
+	});
+
+	it("does not probe or change PATH outside installed Windows", () => {
+		const isFile = vi.fn(() => true);
+		for (const platform of ["linux", "darwin"] as const)
+			expect(appendUserGitPath(env, runtime, { platform, isFile })).toBe(path);
+		expect(appendUserGitPath(env, undefined, { ...options, isFile })).toBe(path);
+		expect(isFile).not.toHaveBeenCalled();
 	});
 });
 

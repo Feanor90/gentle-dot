@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { bundledGentleShell } from "./config.ts";
 import { directAccess, type EngineAccess } from "./engine-access.ts";
-import { resolveEngramBin, runtimeDir } from "./runtime.ts";
+import { appendUserGitPath, resolveEngramBin, runtimeDir } from "./runtime.ts";
 
 /**
  * The folder with the `pi` executable bundled with the daemon. The engine's
@@ -139,7 +139,8 @@ export function ensureMemoryProject(workspace: string, access: EngineAccess = di
  * DACL, set by the desktop app (win_file.rs), which every folder made here inherits.
  *
  * An installed app (`GENTLE_DOT_RUNTIME`) also names the Engram binary
- * (`ENGRAM_BIN`, see `resolveEngramBin`), since its PATH has no user folders.
+ * (`ENGRAM_BIN`, see `resolveEngramBin`). On Windows, only the user's git folder
+ * is appended to PATH when found, after the runtime and system entries.
  */
 export function isolatedAgentEnv(
 	base: NodeJS.ProcessEnv,
@@ -196,7 +197,10 @@ export function isolatedAgentEnv(
 			base.GENTLE_DOT_ENGRAM_DATA_DIR || base.ENGRAM_DATA_DIR || join(realHome, ".engram");
 	}
 	const runtime = runtimeDir(base);
-	if (runtime) env.ENGRAM_BIN = resolveEngramBin(base, runtime, { home: realHome });
+	if (runtime) {
+		env.ENGRAM_BIN = resolveEngramBin(base, runtime, { home: realHome });
+		env.PATH = appendUserGitPath({ ...base, PATH: env.PATH }, runtime);
+	}
 	const gitConfig = join(realHome, ".gitconfig");
 	if (!base.GIT_CONFIG_GLOBAL && existsSync(gitConfig)) env.GIT_CONFIG_GLOBAL = gitConfig;
 	return env;

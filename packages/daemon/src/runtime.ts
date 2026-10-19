@@ -53,6 +53,27 @@ function loginShellEngram(env: NodeJS.ProcessEnv, home: string): string | undefi
 	}
 }
 
+/** Append only the user's git folder to an installed Windows engine's PATH. */
+export function appendUserGitPath(
+	env: NodeJS.ProcessEnv,
+	runtime: string | undefined,
+	options: { platform?: NodeJS.Platform; isFile?: (path: string) => boolean } = {},
+): string | undefined {
+	if (!runtime || (options.platform ?? process.platform) !== "win32") return env.PATH;
+	const normalize = (dir: string) => win32.resolve(dir).toLowerCase();
+	const runtimeBins = [win32.join(runtime, "bin"), win32.join(runtime, "node", "bin")].map(normalize);
+	const dirs = (env.GENTLE_DOT_USER_PATH ?? env.PATH ?? "").split(";");
+	for (const dir of dirs) {
+		if (!win32.isAbsolute(dir) || runtimeBins.includes(normalize(dir))) continue;
+		if (!(options.isFile ?? isExecutableFile)(win32.join(dir, "git.exe"))) continue;
+		const path = env.PATH ?? "";
+		if (path.split(";").some((entry) => win32.isAbsolute(entry) && normalize(entry) === normalize(dir)))
+			return env.PATH;
+		return path ? `${path};${dir}` : dir;
+	}
+	return env.PATH;
+}
+
 /**
  * The Engram binary of an installed app: `ENGRAM_BIN`, then an `engram` on the
  * user's login PATH (GENTLE_DOT_USER_PATH, or PATH minus this runtime's bins,
