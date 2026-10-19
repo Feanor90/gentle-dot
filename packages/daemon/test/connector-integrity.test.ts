@@ -8,6 +8,7 @@ import {
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	statSync,
 	symlinkSync,
@@ -585,6 +586,85 @@ describe("one signing key per data folder (S18)", () => {
 		expect(notices).toEqual([INTEGRITY_UNCHECKED]);
 		expect(readFileSync(join(dataDir, "connectors.json"), "utf8")).toBe(before);
 		expect(rejectedFiles(dataDir)).toEqual([]);
+	});
+
+	// A folder's key is tied to its path, so a moved data folder has no entry of its own at the new
+	// path; its file is still signed by the key it had (T8e2-C2).
+	it("a moved data folder keeps its connectors under the key it had, which becomes its own", async () => {
+		const { dataDir: before, source } = await signedInstall();
+		const oldKey = source.values.get(scopedIntegrityKeyId(before));
+		const after = join(tempDir(), "moved");
+		renameSync(before, after);
+		const logs: string[] = [];
+		const { store, notices } = await started(after, source, logs);
+		expect(notices).toEqual([]);
+		expect(rejectedFiles(after)).toEqual([]);
+		expect(Object.keys(store.state().connectors).sort()).toEqual(["discord", "plain"]);
+		expect(source.values.get(scopedIntegrityKeyId(after))).toBe(oldKey);
+		expect(source.values.get(scopedIntegrityKeyId(before))).toBe(oldKey);
+		expect(source.values.get("connector/discord/value/token")).toBe(TOKEN);
+		expect(logs).toContain("connectors.json signing key now has its own store entry for this data folder");
+		store.close();
+		const next = await started(after, source);
+		expect(next.notices).toEqual([]);
+		expect(Object.keys(next.store.state().connectors).sort()).toEqual(["discord", "plain"]);
+	});
+
+	it("a file signed under none of the store's folder keys is still set aside", async () => {
+		const dataDir = tempDir();
+		const source = new MemorySecretSource();
+		source.values.set(`${INTEGRITY_KEY_ID}/00112233445566aa`, "22".repeat(32));
+		legacySignedFile(dataDir, "11".repeat(32));
+		const { store, notices } = await started(dataDir, source);
+		expect(notices).toEqual([SET_ASIDE_NOTICE]);
+		expect(rejectedFiles(dataDir)).toHaveLength(1);
+		expect(store.state().connectors).toEqual({});
+		expect(source.values.get(scopedIntegrityKeyId(dataDir))).not.toBe("22".repeat(32));
+	});
+
+	it("only folder signing keys are tried, never another secret that happens to look like one", async () => {
+		const dataDir = tempDir();
+		const source = new MemorySecretSource();
+		const lookalike = "0f".repeat(32);
+		source.values.set("connector/plain/value/token", lookalike);
+		source.values.set(`${INTEGRITY_KEY_ID}-old`, lookalike);
+		legacySignedFile(dataDir, lookalike);
+		const { store, notices } = await started(dataDir, source);
+		expect(notices).toEqual([SET_ASIDE_NOTICE]);
+		expect(rejectedFiles(dataDir)).toHaveLength(1);
+		expect(store.state().connectors).toEqual({});
+	});
+
+	it("a folder with its own key never takes another folder's key for its file", async () => {
+		const { dataDir: own, source } = await signedInstall();
+		const other = tempDir();
+		(await started(other, source)).store.close();
+		const otherKey = source.values.get(scopedIntegrityKeyId(other));
+		writeFileSync(join(other, "connectors.json"), readFileSync(join(own, "connectors.json")));
+		const { store, notices } = await started(other, source);
+		expect(notices).toEqual([SET_ASIDE_NOTICE]);
+		expect(rejectedFiles(other)).toHaveLength(1);
+		expect(store.state().connectors).toEqual({});
+		expect(source.values.get(scopedIntegrityKeyId(other))).toBe(otherKey);
+	});
+
+	it("a store that cannot list its keys fails closed for a moved folder's file", async () => {
+		const { dataDir: before, source } = await signedInstall();
+		const after = join(tempDir(), "moved");
+		renameSync(before, after);
+		const bytes = readFileSync(join(after, "connectors.json"), "utf8");
+		source.list = async () => {
+			throw new Error("keychain unavailable");
+		};
+		const logs: string[] = [];
+		const { notices } = await started(after, source, logs);
+		expect(notices).toEqual([INTEGRITY_UNCHECKED]);
+		expect(logs.join("\n")).toContain(
+			"the other data folders' keys could not be listed (keychain unavailable)",
+		);
+		expect(readFileSync(join(after, "connectors.json"), "utf8")).toBe(bytes);
+		expect(rejectedFiles(after)).toEqual([]);
+		expect(source.values.has(scopedIntegrityKeyId(after))).toBe(false);
 	});
 
 	// On a file system that ignores case (Windows, macOS by default) one folder has many spellings.

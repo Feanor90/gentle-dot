@@ -839,7 +839,28 @@ export class ConnectorStore {
 				return;
 			}
 		}
-		let key = parseIntegrityKey(stored) ?? parseIntegrityKey(legacy);
+		// A folder's key is tied to its path, so a moved or renamed folder has no entry of its own;
+		// its signed file is checked against the other folders' keys before it is set aside (T8e2-C2).
+		// A matching mac attests that one of them signed this very record. Only a folder without its
+		// own key looks: one that has a key keeps judging its file by it alone.
+		let moved: string | undefined;
+		const signed = this.loaded?.record;
+		const legacyKey = parseIntegrityKey(legacy);
+		if (
+			stored === undefined &&
+			signed !== undefined &&
+			"mac" in signed &&
+			!(legacyKey && macMatches(legacyKey, signed))
+		) {
+			try {
+				moved = await this.otherFolderKeyFor(source, scopedId, signed);
+			} catch (error) {
+				cannot(`the other data folders' keys could not be listed (${(error as Error).message})`);
+				return;
+			}
+		}
+		const inherited = moved ?? legacy;
+		let key = parseIntegrityKey(stored) ?? parseIntegrityKey(inherited);
 		if (!key) {
 			const created = newIntegrityKey();
 			try {
@@ -879,20 +900,40 @@ export class ConnectorStore {
 			return;
 		}
 		if (record && macMatches(key, record)) {
-			// An existing install's key moves to this folder's own entry once it verified the file.
-			if (legacy !== undefined && stored === undefined) {
+			// An existing install's key (or a moved folder's) moves to this folder's own entry once it
+			// verified the file.
+			if (inherited !== undefined && stored === undefined) {
 				try {
-					await this.verifiedPut(source, scopedId, legacy);
+					await this.verifiedPut(source, scopedId, inherited);
 					this.log("connectors.json signing key now has its own store entry for this data folder");
 				} catch (error) {
 					this.log(
-						`could not store this data folder's copy of the signing key (${(error as Error).message}); the legacy entry stays in use`,
+						`could not store this data folder's copy of the signing key (${(error as Error).message}); the ${moved === undefined ? "legacy" : "previous folder's"} entry stays in use`,
 					);
 				}
 			}
 			return;
 		}
 		this.setAside();
+	}
+
+	/**
+	 * The stored key of another data folder that signed `record`, or undefined. Only entries under
+	 * the folder-key prefix are tried, never another secret; a list or read failure rejects.
+	 */
+	private async otherFolderKeyFor(
+		source: SecretSource,
+		scopedId: string,
+		record: Record<string, unknown>,
+	): Promise<string | undefined> {
+		const prefix = `${INTEGRITY_KEY_ID}/`;
+		for (const id of await source.list()) {
+			if (!id.startsWith(prefix) || id === scopedId) continue;
+			const text = await source.get(id);
+			const key = parseIntegrityKey(text);
+			if (key && macMatches(key, record)) return text;
+		}
+		return undefined;
 	}
 
 	/** Waits for the secrets {@link update} is still storing. */
