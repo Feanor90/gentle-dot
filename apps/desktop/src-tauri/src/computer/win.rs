@@ -10,6 +10,8 @@
 use super::blocklist::{blocked_name, blocked_reason, AppIdentity, UNIDENTIFIED};
 use super::coords::{fit_long_edge, Point, ScreenshotGeometry, MAX_LONG_EDGE};
 use super::encode::{bgra_to_jpeg, JPEG_QUALITY};
+use super::risk::{AxElement, Focus};
+use super::winaccess::{element, is_default, unreadable, UIA_BUTTON, UIA_WINDOW};
 use super::winapps::{answers_to, app_pids, executable_target, hosted_page, request, shortcut_named, strip_ci, Request, TopWindow};
 use super::winput::{releases, steps, Step, VirtualScreen};
 use super::{AppInfo, Capture, InputEvent, MouseButton};
@@ -40,12 +42,14 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, DrawIconEx, EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW,
-    GetCursorInfo, GetCursorPos, GetForegroundWindow, GetIconInfo, GetSystemMetrics, GetWindow, GetWindowDisplayAffinity,
-    GetWindowLongPtrW, GetWindowThreadProcessId, GetWindowTextLengthW, GetWindowTextW, IsIconic, IsWindowVisible,
-    SetForegroundWindow, SetWindowDisplayAffinity, ShowWindow, WindowFromPoint, CURSORINFO, CURSOR_SHOWING, DI_NORMAL,
-    GA_ROOT, GA_ROOTOWNER, GWL_EXSTYLE, GW_OWNER, ICONINFO, SM_CXCURSOR, SM_CXVIRTUALSCREEN, SM_CYCURSOR,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_RESTORE, SW_SHOWNORMAL, WDA_EXCLUDEFROMCAPTURE,
-    WDA_NONE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    GetCursorInfo, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetIconInfo,
+    GetSystemMetrics, GetWindow, GetWindowDisplayAffinity, GetWindowLongPtrW,
+    GetWindowThreadProcessId, GetWindowTextLengthW, GetWindowTextW, IsIconic, IsWindowVisible,
+    SetForegroundWindow, SetWindowDisplayAffinity, ShowWindow, WindowFromPoint, CURSORINFO,
+    CURSOR_SHOWING, DI_NORMAL, GA_ROOT, GA_ROOTOWNER, GUITHREADINFO, GWL_EXSTYLE, GW_OWNER,
+    ICONINFO, SM_CXCURSOR, SM_CXVIRTUALSCREEN, SM_CYCURSOR, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SW_RESTORE, SW_SHOWNORMAL, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
+    WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 
 /// Pause between the events of one action, so apps see distinct presses (as on macOS).
@@ -534,6 +538,9 @@ fn is_frame_host(id: &AppIdentity) -> bool {
     id.bundle_id.as_deref().is_some_and(|exe| exe.eq_ignore_ascii_case("ApplicationFrameHost.exe"))
 }
 
+/// The process id of an app whose process is not even known (a failed focus query).
+const NO_PROCESS: i32 = 0;
+
 /// The app Windows does not identify, which the blocklist refuses.
 fn unidentified(pid: i32) -> AppIdentity {
     AppIdentity { pid, bundle_id: None, name: UNIDENTIFIED.to_string() }
@@ -565,6 +572,60 @@ pub fn frontmost_app() -> Option<AppIdentity> {
     // SAFETY: plain queries.
     let root = unsafe { GetAncestor(GetForegroundWindow(), GA_ROOT) };
     (!root.is_null()).then(|| target_of(root))
+}
+
+/// The app the keys go to: the focus window's top-level app, through the same window checks as
+/// every target, and the process of the focus window itself (Windows sends keys there), the more
+/// restrictive of the two. UI Automation's focused element, when it answers, is checked too: a
+/// refused one, or one in another process (a panel), is what is returned. A
+/// refused app other than Gentle Dot carries no process id, so the helper never drops it as the
+/// front app; a focus window Windows does not report is the refused Unidentified app.
+pub fn focused_app() -> Option<AppIdentity> {
+    let own = std::process::id() as i32;
+    let refused = |id: &AppIdentity| blocked_reason(id, own).is_some();
+    // UI Automation's answer: none when it did not answer; a Store frame's host leaves it to the window.
+    let from_uia = focused_pid().and_then(|pid| {
+        let id = identity(pid);
+        (!is_frame_host(&id)).then(|| known(id).unwrap_or_else(|| unidentified(NO_PROCESS)))
+    });
+    // The focus window's answer: an error when Windows did not say, none when no window has the focus.
+    // SAFETY: plain queries; `info` is a valid out-pointer whose size is set.
+    let from_window: Result<Option<AppIdentity>, ()> = unsafe {
+        let foreground = GetForegroundWindow();
+        let thread = if foreground.is_null() { 0 } else { GetWindowThreadProcessId(foreground, null_mut()) };
+        let mut info: GUITHREADINFO = zeroed();
+        info.cbSize = size_of::<GUITHREADINFO>() as u32;
+        if thread == 0 || GetGUIThreadInfo(thread, &mut info) == 0 {
+            Err(())
+        } else if info.hwndFocus.is_null() {
+            Ok(None)
+        } else {
+            // The window with the focus may be another process's (a child window it hosts): that
+            // process receives the keys, so it is checked too, the more restrictive one returned.
+            let root = target_of(GetAncestor(info.hwndFocus, GA_ROOT));
+            let pid = window_pid(info.hwndFocus);
+            let own_window = if pid == 0 {
+                unidentified(NO_PROCESS)
+            } else {
+                let id = identity(pid);
+                if is_frame_host(&id) { root.clone() } else { known(id).unwrap_or_else(|| unidentified(NO_PROCESS)) }
+            };
+            Ok(Some(if !refused(&root) && (refused(&own_window) || own_window.pid != root.pid) { own_window } else { root }))
+        }
+    };
+    let answers = [from_window.clone().ok().flatten(), from_uia.clone()];
+    if let Some(blocked) = answers.iter().flatten().find(|id| refused(id)) {
+        // Gentle Dot keeps its own id, which is what refuses it when its executable is renamed.
+        let pid = if blocked.pid == own { own } else { NO_PROCESS };
+        return Some(AppIdentity { pid, ..blocked.clone() });
+    }
+    match from_window {
+        Err(()) => Some(unidentified(NO_PROCESS)),
+        // A focused element in another process (a panel) receives the keys; the helper checks it.
+        Ok(Some(window)) => Some(from_uia.filter(|uia| uia.pid != window.pid).unwrap_or(window)),
+        // No focus window: keys go to the foreground window, checked as the front app.
+        Ok(None) => from_uia,
+    }
 }
 
 /// The app owning the topmost window under `at`. Click-through windows (the glow) are skipped
@@ -709,7 +770,16 @@ fn with_exe(name: &str) -> String {
 }
 
 mod uia {
-    pub use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+    pub use windows::core::Interface;
+    pub use windows::Win32::System::Variant::VARIANT;
+    pub use windows::Win32::Foundation::POINT;
+    pub use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
+    pub use windows::Win32::UI::Accessibility::{
+        CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationElement, IUIAutomationLegacyIAccessiblePattern,
+        IUIAutomationValuePattern, TreeScope_Descendants, UIA_ControlTypePropertyId,
+        UIA_IsLegacyIAccessiblePatternAvailablePropertyId, UIA_IsValuePatternAvailablePropertyId,
+        UIA_LegacyIAccessiblePatternId, UIA_LegacyIAccessibleStatePropertyId, UIA_PROPERTY_ID, UIA_ValuePatternId,
+    };
 }
 
 struct Apartment(bool);
@@ -937,6 +1007,224 @@ pub fn open_app_identified(name: &str) -> Result<Option<AppIdentity>, String> {
         Some(pid) => Ok(Some(identity(pid))),
         None => Ok(new_app_identity(&before, &expected).filter(|id| blocked_reason(id, own).is_none())),
     }
+}
+
+/// How many ancestors of the element under a point are read (text inside a button), as on macOS.
+const AX_ANCESTORS: usize = 4;
+/// How far up the focused element its window is looked for.
+const WINDOW_SEARCH: usize = 32;
+/// At most this many of a window's buttons are checked for the default one. The query itself is
+/// one cross-process call, bounded by the UI Automation timeout.
+const DEFAULT_BUTTON_SCAN: i32 = 1024;
+/// UI Automation gives up on an unresponsive app after this long.
+const UIA_TIMEOUT_MS: u32 = 500;
+
+/// A UI Automation client for one call, on a COM apartment it owns when it had to join one.
+struct Automation {
+    client: uia::IUIAutomation,
+    /// Declared after `client` so the client is released before COM is left.
+    _apartment: Apartment,
+}
+
+impl Automation {
+    fn new() -> Option<Automation> {
+        let apartment = Apartment::join();
+        // SAFETY: creating the system's UI Automation object.
+        let client: uia::IUIAutomation =
+            unsafe { uia::CoCreateInstance(&uia::CUIAutomation8, None, uia::CLSCTX_INPROC_SERVER) }.ok()?;
+        // Without its timeouts a hung app could stall the helper: no client then (what it would
+        // have read is unreadable, which asks for a confirmation).
+        let timeouts = uia::Interface::cast::<uia::IUIAutomation2>(&client).ok()?;
+        // SAFETY: plain setters on a live client.
+        unsafe {
+            timeouts.SetConnectionTimeout(UIA_TIMEOUT_MS).ok()?;
+            timeouts.SetTransactionTimeout(UIA_TIMEOUT_MS).ok()?;
+        }
+        Some(Automation { client, _apartment: apartment })
+    }
+
+    fn parent(&self, of: &uia::IUIAutomationElement) -> Option<uia::IUIAutomationElement> {
+        // SAFETY: calls on live COM objects.
+        unsafe { self.client.ControlViewWalker().ok()?.GetParentElement(of).ok() }
+    }
+
+    /// Whether `of` ends its chain of ancestors: the desktop itself, or a top-level window.
+    fn ends_chain(&self, of: &uia::IUIAutomationElement) -> bool {
+        // SAFETY: calls on live COM objects.
+        let root = unsafe { self.client.GetRootElement() }
+            .and_then(|root| unsafe { self.client.CompareElements(&root, of) })
+            .is_ok_and(|same| same.as_bool());
+        root || control_type(of) == UIA_WINDOW
+    }
+}
+
+fn control_type(of: &uia::IUIAutomationElement) -> i32 {
+    // SAFETY: a call on a live COM object.
+    unsafe { of.CurrentControlType() }.map_or(0, |t| t.0)
+}
+
+/// The legacy accessible state, where the default button is marked.
+/// A boolean property; an error when UI Automation did not answer.
+fn property_bool(of: &uia::IUIAutomationElement, property: uia::UIA_PROPERTY_ID) -> Result<bool, ()> {
+    // SAFETY: a call on a live COM object.
+    let value = unsafe { of.GetCurrentPropertyValue(property) }.map_err(|_| ())?;
+    bool::try_from(&value).map_err(|_| ())
+}
+
+/// The legacy accessible state, where the default button is marked: none for an element without
+/// one, an error when UI Automation did not answer.
+fn legacy_state(of: &uia::IUIAutomationElement) -> Result<Option<u32>, ()> {
+    if !property_bool(of, uia::UIA_IsLegacyIAccessiblePatternAvailablePropertyId)? {
+        return Ok(None);
+    }
+    // SAFETY: calls on live COM objects.
+    unsafe {
+        let legacy = of
+            .GetCurrentPatternAs::<uia::IUIAutomationLegacyIAccessiblePattern>(uia::UIA_LegacyIAccessiblePatternId)
+            .map_err(|_| ())?;
+        legacy.CurrentState().map(Some).map_err(|_| ())
+    }
+}
+
+/// An element in the risk check's terms. Any property UI Automation does not report (type, name,
+/// help text, whether it is a password, whether it has a value, the value) makes it an unreadable
+/// element, which asks for a confirmation. A password field's value is never read.
+fn describe(of: &uia::IUIAutomationElement) -> AxElement {
+    // SAFETY: calls on live COM objects.
+    unsafe {
+        let (Ok(kind), Ok(name), Ok(help), Ok(password)) =
+            (of.CurrentControlType(), of.CurrentName(), of.CurrentHelpText(), of.CurrentIsPassword())
+        else {
+            return unreadable();
+        };
+        let Ok(has_value) = property_bool(of, uia::UIA_IsValuePatternAvailablePropertyId) else { return unreadable() };
+        let value = if password.as_bool() || !has_value {
+            None
+        } else {
+            let read = of
+                .GetCurrentPatternAs::<uia::IUIAutomationValuePattern>(uia::UIA_ValuePatternId)
+                .and_then(|pattern| pattern.CurrentValue());
+            match read {
+                Ok(value) => Some(value.to_string()),
+                Err(_) => return unreadable(),
+            }
+        };
+        element(kind.0, Some(name.to_string()), Some(help.to_string()), value)
+    }
+}
+
+/// The element under `at`, then its ancestors (as many as macOS reads); empty when unknown.
+/// UI Automation that does not answer makes the element an unreadable one, which asks for a
+/// confirmation: an action is never let through because Windows did not say what is there.
+/// Clippy: the `is_none_or` it suggests postdates the adopted source, which stays as written.
+#[allow(clippy::nonminimal_bool)]
+pub fn element_at(at: Point) -> Vec<AxElement> {
+    let Some(automation) = Automation::new() else { return vec![unreadable()] };
+    let point = uia::POINT { x: at.x.round() as i32, y: at.y.round() as i32 };
+    // SAFETY: a call on a live COM object.
+    let Ok(mut current) = (unsafe { automation.client.ElementFromPoint(point) }) else { return vec![unreadable()] };
+    // The hit test went through Gentle Dot's click-through glow while another app owns the window
+    // there: what is under the glow cannot be read, so it asks for a confirmation.
+    let own = std::process::id() as i32;
+    // SAFETY: a call on a live COM object.
+    // A process Windows does not report counts as Gentle Dot's: the element is not read either.
+    let hit_own = unsafe { current.CurrentProcessId() }.map_or(true, |pid| pid == own);
+    // Only Gentle Dot's own window there (whose actions are refused anyway) is described.
+    if hit_own && !window_owner_at(at).is_some_and(|owner| owner.pid == own) {
+        return vec![unreadable()];
+    }
+    let mut chain = vec![describe(&current)];
+    while chain.len() <= AX_ANCESTORS {
+        let Some(parent) = automation.parent(&current) else {
+            // Cut short before the window: what holds the element is not known, so it asks.
+            if !automation.ends_chain(&current) {
+                chain.push(unreadable());
+            }
+            break;
+        };
+        chain.push(describe(&parent));
+        current = parent;
+    }
+    chain
+}
+
+/// The window holding `of`: its nearest Window ancestor, as macOS reads `AXWindow`.
+/// Its window; none when there is none (the desktop); an error when the way up was cut short.
+fn window_of(automation: &Automation, of: &uia::IUIAutomationElement) -> Result<Option<uia::IUIAutomationElement>, ()> {
+    let mut current = of.clone();
+    for _ in 0..WINDOW_SEARCH {
+        // SAFETY: a call on a live COM object.
+        let kind = unsafe { current.CurrentControlType() }.map_err(|_| ())?;
+        if kind.0 == UIA_WINDOW {
+            return Ok(Some(current));
+        }
+        match automation.parent(&current) {
+            Some(parent) => current = parent,
+            None if automation.ends_chain(&current) => return Ok(None),
+            None => return Err(()),
+        }
+    }
+    Err(())
+}
+
+/// The window's default button (`AXDefaultButton` on macOS). One cross-process call fetches every
+/// button of the window with its legacy state, within the UI Automation timeout.
+/// The window's default button, if it has one; an error when Windows did not answer.
+fn default_button(
+    automation: &Automation,
+    window: &uia::IUIAutomationElement,
+) -> windows::core::Result<Option<uia::IUIAutomationElement>> {
+    // SAFETY: calls on live COM objects.
+    unsafe {
+        let buttons = automation.client.CreatePropertyCondition(uia::UIA_ControlTypePropertyId, &uia::VARIANT::from(UIA_BUTTON))?;
+        let cache = automation.client.CreateCacheRequest()?;
+        cache.AddProperty(uia::UIA_LegacyIAccessibleStatePropertyId)?;
+        let found = window.FindAllBuildCache(uia::TreeScope_Descendants, &buttons, &cache)?;
+        let count = found.Length()?.min(DEFAULT_BUTTON_SCAN);
+        // Every button is read: one that cannot be could be the default, so the scan fails.
+        for i in 0..count {
+            let button = found.GetElement(i)?;
+            let state = button.GetCachedPropertyValue(uia::UIA_LegacyIAccessibleStatePropertyId)?;
+            let state = i32::try_from(&state)?;
+            if is_default(state as u32) {
+                return Ok(Some(button));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// The focused element, whether it is its window's default button, and that button.
+/// A focus UI Automation does not report is an unreadable element (Return and Space then ask for
+/// a confirmation), and a default button it does not report an unreadable one (Return asks).
+pub fn focused_element() -> Option<Focus> {
+    let unknown = || Some(Focus { element: unreadable(), is_default_button: false, default_button: None });
+    let Some(automation) = Automation::new() else { return unknown() };
+    // SAFETY: a call on a live COM object.
+    let Ok(focused) = (unsafe { automation.client.GetFocusedElement() }) else { return unknown() };
+    let default = match window_of(&automation, &focused) {
+        Ok(Some(window)) => default_button(&automation, &window).map_err(|_| ()),
+        Ok(None) => Ok(None),
+        Err(()) => Err(()),
+    };
+    // A comparison or state UI Automation does not answer counts as the default button.
+    // SAFETY: a call on a live COM object.
+    let same = |button: &uia::IUIAutomationElement| unsafe { automation.client.CompareElements(button, &focused) }.map_or(true, |b| b.as_bool());
+    let marked = legacy_state(&focused).map_or(true, |state| state.is_some_and(is_default));
+    let is_default_button = marked || default.as_ref().is_ok_and(|d| d.as_ref().is_some_and(same));
+    let default_button = match &default {
+        Ok(found) => found.as_ref().map(describe),
+        Err(()) => Some(unreadable()),
+    };
+    Some(Focus { element: describe(&focused), is_default_button, default_button })
+}
+
+/// The process of the focused UI Automation element.
+fn focused_pid() -> Option<i32> {
+    let automation = Automation::new()?;
+    // SAFETY: calls on live COM objects.
+    let pid = unsafe { automation.client.GetFocusedElement().ok()?.CurrentProcessId().ok()? };
+    (pid > 0).then_some(pid)
 }
 
 /// These need the user's interactive desktop (not an SSH or service session): they take a real
