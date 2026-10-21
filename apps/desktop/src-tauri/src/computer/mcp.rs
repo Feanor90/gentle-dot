@@ -73,6 +73,17 @@ before deciding the next step. The user must allow a session, risky actions ask 
 some apps (System Settings, password managers) are off limits. Keys and text require the app of the latest \
 screenshot, or a validated click/drag target or the natively identified app requested by open_app; if its identity is unavailable or another app is in front, take a new screenshot.";
 
+/// The `open_app` tool description, and the system an `open_app` confirmation names.
+#[cfg(not(windows))]
+const OPEN_APP_DESCRIPTION: &str = "Open or bring forward an app by name or bundle id.";
+#[cfg(windows)]
+const OPEN_APP_DESCRIPTION: &str =
+    "Open or bring forward an app by name (as the Start menu shows it) or by the path of its program (.exe).";
+#[cfg(not(windows))]
+const SYSTEM: &str = "macOS";
+#[cfg(windows)]
+const SYSTEM: &str = "Windows";
+
 pub struct HttpRequest<'a> {
     pub method: &'a str,
     pub path: &'a str,
@@ -172,10 +183,6 @@ fn coordinate(description: &str) -> Value {
 fn tools() -> Value {
     let x = coordinate("Pixels from the left edge of the latest screenshot.");
     let y = coordinate("Pixels from the top edge of the latest screenshot.");
-    #[cfg(not(windows))]
-    let open_description = "Open or bring forward an app by name or bundle id.";
-    #[cfg(windows)]
-    let open_description = "Open or bring forward an app by name or bundle id. In a batch, following keys require native identity of that app; otherwise take a screenshot first.";
     json!([
         {"name": "screenshot", "description": "Take a screenshot of the display under the pointer. Returns the image and its size.",
          "inputSchema": schema(json!({}), &[])},
@@ -193,7 +200,7 @@ fn tools() -> Value {
          "inputSchema": schema(json!({"text": {"type": "string"}}), &["text"])},
         {"name": "key", "description": "Press a key combo in the frontmost app, for example `cmd+shift+t`, `return`, or `esc`.",
          "inputSchema": schema(json!({"combo": {"type": "string"}}), &["combo"])},
-        {"name": "open_app", "description": open_description,
+        {"name": "open_app", "description": OPEN_APP_DESCRIPTION,
          "inputSchema": schema(json!({"name": {"type": "string"}}), &["name"])},
         {"name": "list_apps", "description": "List the running apps.",
          "inputSchema": schema(json!({}), &[])},
@@ -909,7 +916,7 @@ impl Helper {
                     return Err(format!("Gentle Dot does not control {label}. The app was not opened."));
                 }
                 let action = format!("Open {name}");
-                self.confirm_if_risky(assess(Act::Other, intent), &action, "macOS")?;
+                self.confirm_if_risky(assess(Act::Other, intent), &action, SYSTEM)?;
                 self.still_running(epoch)?;
                 self.desktop.open_app(&name)?;
                 Ok((format!("{action}: done."), OPEN_APP_SETTLE_MS))
@@ -1032,7 +1039,7 @@ impl Helper {
                     return Err(format!("Gentle Dot does not control {label}. The app was not opened."));
                 }
                 let action = format!("Open {name}");
-                self.confirm_if_risky(assess(Act::Other, intent), &action, "macOS")?;
+                self.confirm_if_risky(assess(Act::Other, intent), &action, SYSTEM)?;
                 self.still_running(epoch)?;
                 let requested = self.desktop.open_app_identified(&name)?;
                 // Opening changes the intended keyboard target even if activation fails or
@@ -1306,6 +1313,20 @@ mod tests {
         assert_eq!(click["inputSchema"]["properties"]["button"]["enum"], json!(["left", "right"]));
         let wait = tools.iter().find(|t| t["name"] == "wait").unwrap();
         assert_eq!(wait["inputSchema"]["properties"]["ms"]["maximum"], 5000);
+    }
+
+    #[test]
+    fn tools_list_describes_open_app_for_the_platform() {
+        let rig = rig();
+        let tools = rig.rpc("tools/list", json!({}))["result"]["tools"].clone();
+        let open = tools.as_array().unwrap().iter().find(|t| t["name"] == "open_app").unwrap();
+        #[cfg(not(windows))]
+        assert_eq!(open["description"], "Open or bring forward an app by name or bundle id.");
+        #[cfg(windows)]
+        assert_eq!(
+            open["description"],
+            "Open or bring forward an app by name (as the Start menu shows it) or by the path of its program (.exe)."
+        );
     }
 
     #[test]
@@ -1701,6 +1722,31 @@ mod tests {
         rig.ready();
         rig.call("scroll", json!({"x": 1, "y": 1, "dx": 0, "dy": 10, "intent": "buy the ticket"}));
         assert_eq!(rig.dialogs.confirmations.lock().unwrap().len(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_risky_open_app_confirmation_names_the_system() {
+        let rig = rig();
+        rig.ready();
+        let result = rig.call("open_app", json!({"name": "Mail", "intent": "buy the ticket"}));
+        assert!(!is_error(&result), "{result}");
+        let asked = rig.dialogs.confirmations.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1);
+        assert!(asked[0].contains("Open Mail in Windows."), "{asked:?}");
+        assert!(!asked[0].contains("macOS"), "{asked:?}");
+        assert_eq!(*rig.desktop.opened.lock().unwrap(), vec!["Mail"]);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_risky_open_app_confirmation_still_names_macos() {
+        let rig = rig();
+        rig.ready();
+        rig.call("open_app", json!({"name": "Mail", "intent": "buy the ticket"}));
+        let asked = rig.dialogs.confirmations.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1);
+        assert!(asked[0].contains("Open Mail in macOS."), "{asked:?}");
     }
 
     #[test]
