@@ -7,16 +7,22 @@
 //! Points are physical pixels of the virtual screen: the app is per-monitor DPI aware, so the
 //! pointer, the monitors, and `SendInput` all use them.
 
+use super::blocklist::{AppIdentity, UNIDENTIFIED};
 use super::coords::{fit_long_edge, Point, ScreenshotGeometry, MAX_LONG_EDGE};
 use super::encode::{bgra_to_jpeg, JPEG_QUALITY};
+use super::winapps::{app_pids, hosted_page, TopWindow};
 use super::winput::{releases, steps, Step, VirtualScreen};
-use super::{Capture, InputEvent, MouseButton};
+use super::{AppInfo, Capture, InputEvent, MouseButton};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
 use std::time::Duration;
-use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
-use windows_sys::Win32::Graphics::Dwm::DwmFlush;
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetLastError, HWND, LPARAM, POINT, RECT};
+use windows_sys::Win32::Graphics::Dwm::{DwmFlush, DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GdiFlush, GetDC, GetMonitorInfoW, MonitorFromPoint,
     ReleaseDC, SelectObject, SetBrushOrgEx, SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
@@ -29,10 +35,12 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEINPUT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DrawIconEx, EnumWindows, GetCursorInfo, GetCursorPos, GetIconInfo, GetSystemMetrics, GetWindowDisplayAffinity,
-    GetWindowThreadProcessId, IsWindowVisible, SetWindowDisplayAffinity, CURSORINFO, CURSOR_SHOWING, DI_NORMAL,
-    ICONINFO, SM_CXCURSOR, SM_CXVIRTUALSCREEN, SM_CYCURSOR, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
+    DrawIconEx, EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetCursorInfo, GetCursorPos,
+    GetForegroundWindow, GetIconInfo, GetSystemMetrics, GetWindow, GetWindowDisplayAffinity, GetWindowLongPtrW,
+    GetWindowThreadProcessId, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible, SetWindowDisplayAffinity,
+    WindowFromPoint, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, GA_ROOT, GWL_EXSTYLE, GW_OWNER, ICONINFO, SM_CXCURSOR,
+    SM_CXVIRTUALSCREEN, SM_CYCURSOR, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 
 /// Pause between the events of one action, so apps see distinct presses (as on macOS).
@@ -339,6 +347,241 @@ pub fn set_capture_excluded(hwnd: *mut c_void, excluded: bool) -> Result<(), Str
     }
 }
 
+/// The Store apps' frame window and the window of the app it hosts.
+const FRAME_CLASS: &str = "ApplicationFrameWindow";
+const CORE_CLASS: &str = "Windows.UI.Core.CoreWindow";
+
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(Some(0)).collect()
+}
+
+/// The window's class, or none when Windows does not say (every window has one).
+fn class_name(hwnd: HWND) -> Option<String> {
+    let mut buffer = [0u16; 256];
+    // SAFETY: the buffer's length is passed.
+    let length = unsafe { GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+    (length > 0).then(|| String::from_utf16_lossy(&buffer[..length as usize]))
+}
+
+/// The window's title, `Some("")` for a window without one, or none when Windows did not answer.
+fn title_checked(hwnd: HWND) -> Option<String> {
+    // SAFETY: the buffer holds the reported length plus the terminator; the last error is reset
+    // first, so a zero length is told apart from a failed query.
+    unsafe {
+        SetLastError(0);
+        let length = GetWindowTextLengthW(hwnd);
+        if length <= 0 {
+            return (GetLastError() == 0).then(String::new);
+        }
+        let mut buffer = vec![0u16; length as usize + 1];
+        let copied = GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+        (copied > 0 || GetLastError() == 0).then(|| String::from_utf16_lossy(&buffer[..copied.max(0) as usize]))
+    }
+}
+
+fn title(hwnd: HWND) -> String {
+    // SAFETY: the buffer holds the reported length plus the terminator.
+    unsafe {
+        let length = GetWindowTextLengthW(hwnd);
+        if length <= 0 {
+            return String::new();
+        }
+        let mut buffer = vec![0u16; length as usize + 1];
+        let copied = GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+        String::from_utf16_lossy(&buffer[..copied.max(0) as usize])
+    }
+}
+
+/// The app a top-level window belongs to: its own process, or for a Store app's frame the
+/// process of the core window inside it (none when that window is not found).
+fn app_pid(root: HWND) -> Option<i32> {
+    let frame_pid = window_pid(root);
+    // A window whose class Windows does not report could be a Store frame: no app is assumed.
+    if class_name(root)? != FRAME_CLASS {
+        return (frame_pid != 0).then_some(frame_pid);
+    }
+    struct Search {
+        frame_pid: i32,
+        found: i32,
+    }
+    unsafe extern "system" fn visit(child: HWND, state: LPARAM) -> i32 {
+        // SAFETY: `state` is the `Search` passed below, alive for the whole enumeration.
+        let search = unsafe { &mut *(state as *mut Search) };
+        let pid = window_pid(child);
+        if class_name(child).as_deref() == Some(CORE_CLASS) && pid != search.frame_pid {
+            search.found = pid;
+            return 0;
+        }
+        1
+    }
+    let mut search = Search { frame_pid, found: 0 };
+    // SAFETY: the callback only reads windows and writes `search`, which outlives the call.
+    unsafe { EnumChildWindows(root, Some(visit), &mut search as *mut Search as LPARAM) };
+    (search.found != 0).then_some(search.found)
+}
+
+/// Every top-level window, front to back, with the app it belongs to.
+fn top_windows() -> Vec<(HWND, TopWindow)> {
+    unsafe extern "system" fn collect(hwnd: HWND, state: LPARAM) -> i32 {
+        // SAFETY: `state` is the vector passed below, alive for the whole enumeration.
+        unsafe { (*(state as *mut Vec<HWND>)).push(hwnd) };
+        1
+    }
+    let mut handles: Vec<HWND> = Vec::new();
+    // SAFETY: the callback only appends to `handles`, which outlives the call.
+    unsafe { EnumWindows(Some(collect), &mut handles as *mut Vec<HWND> as LPARAM) };
+    handles
+        .into_iter()
+        .map(|hwnd| {
+            // SAFETY: plain queries on a window handle (a vanished window just reads as empty).
+            let (visible, style, owner) =
+                unsafe { (IsWindowVisible(hwnd) != 0, GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32, GetWindow(hwnd, GW_OWNER)) };
+            let mut cloaked = 0u32;
+            // SAFETY: `cloaked` is a valid out-pointer of the size passed.
+            let read = unsafe {
+                DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED as u32, &mut cloaked as *mut u32 as *mut c_void, size_of::<u32>() as u32)
+            };
+            let window = TopWindow {
+                // Listed under its host while its app is not found; never a target then.
+                pid: app_pid(hwnd).unwrap_or_else(|| window_pid(hwnd)),
+                title: title(hwnd),
+                visible,
+                cloaked: read == 0 && cloaked != 0,
+                tool: style & WS_EX_TOOLWINDOW != 0,
+                app_window: style & WS_EX_APPWINDOW != 0,
+                owned: !owner.is_null(),
+            };
+            (hwnd, window)
+        })
+        .collect()
+}
+
+/// The executable's full path, when the process lets itself be queried.
+fn process_path(pid: i32) -> Option<String> {
+    // SAFETY: the handle is checked and closed; the buffer's length is passed and updated.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+        if process.is_null() {
+            return None;
+        }
+        // The longest path Windows supports.
+        let mut buffer = vec![0u16; 32768];
+        let mut length = buffer.len() as u32;
+        let ok = QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut length);
+        CloseHandle(process);
+        (ok != 0).then(|| String::from_utf16_lossy(&buffer[..length as usize]))
+    }
+}
+
+/// The executable's file description (what Task Manager shows as the app name).
+fn file_description(path: &str) -> Option<String> {
+    let path = wide(path);
+    // SAFETY: every buffer and out-pointer is valid; `VerQueryValueW` points into `data`, which
+    // lives until the strings are copied out.
+    unsafe {
+        let size = GetFileVersionInfoSizeW(path.as_ptr(), null_mut());
+        if size == 0 {
+            return None;
+        }
+        let mut data = vec![0u8; size as usize];
+        if GetFileVersionInfoW(path.as_ptr(), 0, size, data.as_mut_ptr() as *mut c_void) == 0 {
+            return None;
+        }
+        let query = |sub: &str| -> Option<(*const c_void, u32)> {
+            let (mut pointer, mut length) = (null_mut::<c_void>(), 0u32);
+            let ok = VerQueryValueW(data.as_ptr() as *const c_void, wide(sub).as_ptr(), &mut pointer, &mut length);
+            (ok != 0 && !pointer.is_null() && length > 0).then_some((pointer as *const c_void, length))
+        };
+        let (translation, length) = query("\\VarFileInfo\\Translation")?;
+        if length < 4 {
+            return None;
+        }
+        let pair = std::slice::from_raw_parts(translation as *const u16, 2);
+        let (text, length) = query(&format!("\\StringFileInfo\\{:04x}{:04x}\\FileDescription", pair[0], pair[1]))?;
+        let units = std::slice::from_raw_parts(text as *const u16, length as usize);
+        let description = String::from_utf16_lossy(units).trim_end_matches('\0').trim().to_string();
+        (!description.is_empty()).then_some(description)
+    }
+}
+
+/// An app's identity: its executable's file name and its display name, or `process <pid>`
+/// when Windows does not let the process be queried (an elevated one, say).
+pub fn identity(pid: i32) -> AppIdentity {
+    let path = process_path(pid);
+    let executable = path.as_deref().and_then(|p| p.rsplit('\\').next()).map(str::to_string);
+    let stem = executable.as_deref().map(|exe| exe.rsplit_once('.').map_or(exe, |(stem, _)| stem).to_string());
+    let name = path
+        .as_deref()
+        .and_then(file_description)
+        .or(stem)
+        .unwrap_or_else(|| format!("process {pid}"));
+    AppIdentity { pid, bundle_id: executable, name }
+}
+
+/// An identity Windows actually gave: the executable is known.
+fn known(id: AppIdentity) -> Option<AppIdentity> {
+    id.bundle_id.is_some().then_some(id)
+}
+
+fn is_frame_host(id: &AppIdentity) -> bool {
+    id.bundle_id.as_deref().is_some_and(|exe| exe.eq_ignore_ascii_case("ApplicationFrameHost.exe"))
+}
+
+/// The app Windows does not identify, which the blocklist refuses.
+fn unidentified(pid: i32) -> AppIdentity {
+    AppIdentity { pid, bundle_id: None, name: UNIDENTIFIED.to_string() }
+}
+
+/// The app an action aimed at a top-level window targets. A File Explorer window showing a
+/// blocked page (Credential Manager) is that page; an app Windows does not identify is
+/// `UNIDENTIFIED`.
+fn target_of(root: HWND) -> AppIdentity {
+    let Some(pid) = app_pid(root) else { return unidentified(window_pid(root)) };
+    let Some(id) = known(identity(pid)) else { return unidentified(pid) };
+    // The Store frame's host is never an app of its own: its app was not found.
+    if is_frame_host(&id) {
+        return unidentified(pid);
+    }
+    // A File Explorer window whose title Windows does not report could be a blocked page.
+    let Some(title) = title_checked(root) else {
+        let explorer = id.bundle_id.as_deref().is_some_and(|exe| exe.eq_ignore_ascii_case("explorer.exe"));
+        return if explorer { unidentified(pid) } else { id };
+    };
+    match hosted_page(id.bundle_id.as_deref(), &title) {
+        Some(page) => AppIdentity { pid: id.pid, bundle_id: None, name: page.to_string() },
+        None => id,
+    }
+}
+
+/// The app owning the foreground window.
+pub fn frontmost_app() -> Option<AppIdentity> {
+    // SAFETY: plain queries.
+    let root = unsafe { GetAncestor(GetForegroundWindow(), GA_ROOT) };
+    (!root.is_null()).then(|| target_of(root))
+}
+
+/// The app owning the topmost window under `at`. Click-through windows (the glow) are skipped
+/// by Windows itself; a point with no window has no owner.
+pub fn window_owner_at(at: Point) -> Option<AppIdentity> {
+    let point = POINT { x: at.x.round() as i32, y: at.y.round() as i32 };
+    // SAFETY: plain queries.
+    let root = unsafe { GetAncestor(WindowFromPoint(point), GA_ROOT) };
+    (!root.is_null()).then(|| target_of(root))
+}
+
+/// The running apps, front to back.
+pub fn list_apps() -> Vec<AppInfo> {
+    let active = frontmost_app().map(|app| app.pid);
+    let windows: Vec<TopWindow> = top_windows().into_iter().map(|(_, window)| window).collect();
+    app_pids(&windows)
+        .into_iter()
+        .map(|pid| {
+            let id = identity(pid);
+            AppInfo { name: id.name, bundle_id: id.bundle_id, active: active == Some(pid) }
+        })
+        .collect()
+}
+
 /// These need the user's interactive desktop (not an SSH or service session): they take a real
 /// screenshot and move the real pointer, then put it back.
 #[cfg(test)]
@@ -349,6 +592,15 @@ mod tests {
         use windows_sys::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
         // SAFETY: plain call; the app itself is already per-monitor aware.
         unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    }
+
+    #[test]
+    fn this_process_is_identified_by_its_executable_and_a_name() {
+        let own = identity(std::process::id() as i32);
+        let exe = own.bundle_id.expect("the test process can query itself");
+        assert!(exe.to_ascii_lowercase().ends_with(".exe"), "{exe}");
+        assert!(!own.name.is_empty() && !own.name.starts_with("process "), "{}", own.name);
+        assert_eq!(identity(-5).name, "process -5", "an unknown process keeps its number");
     }
 
     #[test]
