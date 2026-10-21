@@ -47,6 +47,12 @@ Runtime overrides:
 
 `shortcut` in `~/.gentle-dot/config.json` changes the global shortcut (default `Alt+Space`; on Windows, when another program holds it, `Ctrl+Alt+Space` for that session). The Dot position is saved in `~/.gentle-dot/desktop.json` as `dot_points`, in macOS points (the screen space every monitor shares, whatever its scale factor). The `dot` key written by older builds was in physical pixels and is ignored, so the Dot starts once more at the right edge of the main display.
 
+## Windows computer control
+
+Computer control runs on Windows too ([design.md, S24.10](../../docs/design.md#computer-control-macos-and-windows-s24)): `SendInput` and GDI capture, UI Automation for the risk check, a Windows blocklist, task dialogs that refuse by default, **Alt+Shift+Esc** to stop, and the glow. Windows asks for no permission for computer control. The working ring shows the same top-edge line as on macOS; the Dot and panel return without taking keyboard focus (`ShowWindow` with `SW_SHOWNA`).
+
+Elevated apps cannot be driven under Windows UIPI. Store apps without a core window stay Unidentified (refused). UI Automation uses a 0.5 s timeout, not a hard deadline for the whole action; read-only documents count as text areas and unreadable elements can require more confirmations. Real input, capture, dialogs, and glow require the user's own interactive desktop session for validation.
+
 ## Menu bar
 
 | Item | What it does |

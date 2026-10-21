@@ -128,6 +128,12 @@ A Windows installer can be built from source (below), but it is not released yet
 - **Limits on Windows:** programs running as your Windows user and administrators can still read the data folder, as on any desktop. Only the folder and the files the app lists change; other files already inside keep their earlier access until the assistant rewrites them. Files outside the data folder, such as your workspace and the attachments saved in it, keep the access of the folder they are in. The data folder has to be on a drive that supports Windows permissions (NTFS); FAT and exFAT drives are refused. Running Gentle Dot as administrator (elevated) makes Windows give the files it creates to the Administrators group, so they are not treated as private and the app refuses to adopt them; run it as your normal user.
 - The panel shortcut is `Alt+Space`, as on macOS and Linux; while Gentle Dot holds it, `Alt+Space` no longer opens the window menu of other apps (use the title bar or `Win+Arrow` keys instead). When another program already holds `Alt+Space` (PowerToys Run, for example), the app uses `Ctrl+Alt+Space` for that session and shows it on the tray's Open item and in Settings; `config.json` keeps `Alt+Space`, which is tried again at the next start. Choose another one in Settings to keep it.
 
+### Computer control
+
+Computer control runs on Windows too (see [design.md, S24.10](design.md#computer-control-macos-and-windows-s24)). Windows asks for no permission for computer control; Connectors → Computer shows yolo controls without a permission list. The grant asks to control "this PC", and **Alt+Shift+Esc** is the emergency stop. Native task dialogs refuse by default; Enter without changing the selection, Escape, or closing refuses.
+
+Elevated apps cannot be driven under Windows UIPI. Apps Windows cannot identify, including Store apps without a core window, are refused. UI Automation uses a 0.5 s timeout, not a hard deadline for the whole action; unreadable elements can require more confirmations, and read-only documents count as text areas. The glow and working top-edge line run on Windows; after a call, the Dot and panel return without taking keyboard focus.
+
 ### Voice input
 
 On the `feat/windows-voice` feature branch, Windows local voice uses WASAPI recording and Parakeet transcription on this computer. Download the optional **487 MB** local voice model on demand in Settings before using local voice; Windows has no built-in Apple Speech fallback. The Windows port still needs live microphone and installed-app acceptance before release.
