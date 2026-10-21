@@ -23,6 +23,10 @@ pub mod server;
 pub mod session;
 pub mod windows;
 #[cfg(any(windows, test))]
+pub mod winaccess;
+#[cfg(any(windows, test))]
+pub mod winapps;
+#[cfg(any(windows, test))]
 pub mod winput;
 pub mod working;
 
