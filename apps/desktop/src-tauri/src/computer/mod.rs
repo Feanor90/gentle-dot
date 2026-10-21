@@ -28,6 +28,7 @@ pub mod winaccess;
 pub mod winapps;
 #[cfg(any(windows, test))]
 pub mod winput;
+// The Windows desktop (S24 on Windows).
 #[cfg(windows)]
 pub mod win;
 pub mod working;

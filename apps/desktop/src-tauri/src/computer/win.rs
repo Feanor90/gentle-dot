@@ -11,6 +11,7 @@ use super::blocklist::{blocked_name, blocked_reason, AppIdentity, UNIDENTIFIED};
 use super::coords::{fit_long_edge, Point, ScreenshotGeometry, MAX_LONG_EDGE};
 use super::encode::{bgra_to_jpeg, JPEG_QUALITY};
 use super::risk::{AxElement, Focus};
+use super::glow::Frame;
 use super::winaccess::{element, is_default, unreadable, UIA_BUTTON, UIA_WINDOW};
 use super::winapps::{answers_to, app_pids, executable_target, hosted_page, request, shortcut_named, strip_ci, Request, TopWindow};
 use super::winput::{releases, steps, Step, VirtualScreen};
@@ -50,7 +51,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     ICONINFO, SM_CXCURSOR, SM_CXVIRTUALSCREEN, SM_CYCURSOR, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
     SM_YVIRTUALSCREEN, SW_RESTORE, SW_SHOWNORMAL, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
     WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    SetWindowLongPtrW, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE,
+    SetWindowPos,
 };
+use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 
 /// Pause between the events of one action, so apps see distinct presses (as on macOS).
 const EVENT_GAP: Duration = Duration::from_millis(15);
@@ -1225,6 +1229,129 @@ fn focused_pid() -> Option<i32> {
     // SAFETY: calls on live COM objects.
     let pid = unsafe { automation.client.GetFocusedElement().ok()?.CurrentProcessId().ok()? };
     (pid > 0).then_some(pid)
+}
+
+/// The frame of the display showing `at`, in physical pixels (S28).
+pub fn display_frame_at(at: Point) -> Option<Frame> {
+    monitor_at(at).map(|m| Frame { x: f64::from(m.x), y: f64::from(m.y), width: f64::from(m.width), height: f64::from(m.height) })
+}
+
+/// The display's physical pixels per CSS pixel (its scale, 1.5 at 150 %).
+pub fn display_scale(display: Frame) -> f64 {
+    let center = POINT { x: (display.x + display.width / 2.0) as i32, y: (display.y + display.height / 2.0) as i32 };
+    let (mut dpi_x, mut dpi_y) = (0u32, 0u32);
+    // SAFETY: plain queries with valid out-pointers.
+    let read = unsafe { GetDpiForMonitor(MonitorFromPoint(center, MONITOR_DEFAULTTONEAREST), MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
+    if read == 0 && dpi_x > 0 { f64::from(dpi_x) / 96.0 } else { 1.0 }
+}
+
+/// The focused element's frame in physical pixels, when it reports one (S28).
+pub fn focused_frame() -> Option<Frame> {
+    let automation = Automation::new()?;
+    // SAFETY: calls on live COM objects.
+    let rect = unsafe { automation.client.GetFocusedElement().ok()?.CurrentBoundingRectangle().ok()? };
+    let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
+    (width > 0 && height > 0).then(|| Frame { x: f64::from(rect.left), y: f64::from(rect.top), width: f64::from(width), height: f64::from(height) })
+}
+
+/// Readies the glow's window: never activated, off the taskbar and Alt+Tab, never captured.
+/// Clicks already pass through it (set by Tauri).
+/// Clippy: the handle reaches Win32 as an opaque value; this function never dereferences it.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn prepare_overlay(hwnd: *mut c_void) {
+    // SAFETY: plain calls on a window of this process.
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) as isize);
+    }
+    if let Err(error) = exclude_from_capture(hwnd) {
+        eprintln!("gentle-dot: the glow may show in computer-control screenshots: {error}");
+    }
+}
+
+/// Shows the glow above everything without taking the focus from the app being controlled, or
+/// hides it.
+/// Clippy: the handle reaches Win32 as an opaque value; this function never dereferences it.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn show_overlay(hwnd: *mut c_void, visible: bool) {
+    // SAFETY: plain calls on a window of this process.
+    unsafe {
+        if visible {
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        } else {
+            ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+}
+
+/// Moves the glow over a display, without activating it.
+/// Clippy: the handle reaches Win32 as an opaque value; this function never dereferences it.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn cover(hwnd: *mut c_void, display: Frame) {
+    // SAFETY: a plain call on a window of this process.
+    unsafe {
+        SetWindowPos(
+            hwnd, HWND_TOPMOST, display.x as i32, display.y as i32, display.width as i32, display.height as i32,
+            SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// The Windows desktop, as the helper sees it. Windows asks for no permission: the helper sees
+/// and drives the desktop of the signed-in user, except windows of higher integrity (elevated
+/// apps), which Windows itself does not let it drive.
+pub struct WinDesktop;
+
+impl super::Desktop for WinDesktop {
+    fn permissions(&self) -> super::Permissions {
+        super::Permissions { accessibility: true, screen_recording: true, screenshots_supported: true }
+    }
+
+    fn capture(&self) -> Result<Capture, String> {
+        capture()
+    }
+
+    fn post(&self, event: &InputEvent) -> Result<(), String> {
+        post(event)
+    }
+
+    fn list_apps(&self) -> Result<Vec<AppInfo>, String> {
+        Ok(list_apps())
+    }
+
+    fn open_app(&self, name: &str) -> Result<(), String> {
+        open_app(name)
+    }
+
+    #[cfg(windows)]
+    fn open_app_identified(&self, name: &str) -> Result<Option<AppIdentity>, String> {
+        open_app_identified(name)
+    }
+
+    fn element_at(&self, at: Point) -> Vec<AxElement> {
+        element_at(at)
+    }
+
+    fn focused_element(&self) -> Option<Focus> {
+        focused_element()
+    }
+
+    fn frontmost_app(&self) -> Option<AppIdentity> {
+        frontmost_app()
+    }
+
+    fn focused_app(&self) -> Option<AppIdentity> {
+        focused_app()
+    }
+
+    fn window_owner_at(&self, at: Point) -> Option<AppIdentity> {
+        window_owner_at(at)
+    }
+
+    fn activate(&self, pid: i32) {
+        activate(pid)
+    }
 }
 
 /// These need the user's interactive desktop (not an SSH or service session): they take a real
