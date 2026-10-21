@@ -66,6 +66,7 @@ dbus = "0.9"
 # The app's private channel on Windows (S25.1): an owner-only named pipe (`win_pipe`), and the
 # daemon spawned with exactly the handles it needs (`win_spawn`); connector secrets in the
 # Credential Manager (`secure_store::windows`, S25.5). Already linked through tauri.
+# Computer control (S24 on Windows): GDI screenshots with own windows excluded (`win`).
 [target.'cfg(windows)'.dependencies]
 # Local voice: generated COM bindings, with only the WASAPI/event APIs enabled.
 windows = { version = "=0.62.2", default-features = false, features = [
@@ -91,6 +92,9 @@ windows-sys = { version = "0.61", features = [
   "Win32_System_SystemInformation",
   "Win32_System_Threading",
   "Win32_UI_Controls",
+  "Win32_Graphics_Dwm",
+  "Win32_Graphics_Gdi",
+  "Win32_UI_HiDpi",
   "Win32_UI_WindowsAndMessaging",
 ] }
 

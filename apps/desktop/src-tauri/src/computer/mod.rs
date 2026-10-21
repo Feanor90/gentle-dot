@@ -28,6 +28,8 @@ pub mod winaccess;
 pub mod winapps;
 #[cfg(any(windows, test))]
 pub mod winput;
+#[cfg(windows)]
+pub mod win;
 pub mod working;
 
 use blocklist::AppIdentity;
