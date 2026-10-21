@@ -341,29 +341,86 @@ pub struct LaunchSpec {
     pub envs: Vec<(String, String)>,
 }
 
+/// A `PATH` value from absolute entries: `;`-joined on Windows and `:`-joined elsewhere. A root
+/// containing that separator cannot be spelled in `PATH` at all, so it is joined anyway rather than
+/// panicking inside the app's launch path.
+fn path_env(entries: &[PathBuf]) -> String {
+	std::env::join_paths(entries)
+		.map(|joined| joined.to_string_lossy().into_owned())
+		.unwrap_or_else(|_| {
+			let separator = if cfg!(windows) { ";" } else { ":" };
+			entries.iter().map(|entry| entry.display().to_string()).collect::<Vec<_>>().join(separator)
+		})
+}
+
+/// The Windows directories the engine needs to reach the machine's own tools (`curl`, `cmd`,
+/// `powershell`, `tar`). The runtime's entries come first, so the packaged Node still wins; `git`
+/// lives outside these on Windows and stays a known gap.
+fn windows_system_dirs() -> Vec<PathBuf> {
+	let root = std::env::var("SystemRoot")
+		.ok()
+		.filter(|value| !value.is_empty())
+		.unwrap_or_else(|| "C:\\Windows".to_string());
+	vec![Path::new(&root).join("system32"), PathBuf::from(&root)]
+}
+
 /// `<node> <daemon script>` (S29.5). With a bundled runtime (`<runtime>/daemon/cli.mjs`
 /// exists) that is the runtime's own Node and daemon, a PATH of the runtime plus the
 /// system folders, and `GENTLE_DOT_RUNTIME`; otherwise the build-time paths and PATH.
+/// A Windows canonical root arrives in the **verbatim** form (`\\?\C:\…`, or
+/// `\\?\UNC\server\share`). Win32 accepts it; Node does not. Handed a verbatim entry, Node's
+/// module resolver collapses it to a bare drive (`C:`) and dies with `EISDIR`, so the installed app
+/// never got a daemon at all and its panel sat in `starting` (W30). Every path here is an ordinary
+/// absolute one, so the prefix is dropped before anything is handed over.
+fn without_verbatim(path: &Path) -> PathBuf {
+    let text = path.display().to_string();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => PathBuf::from(rest),
+        None => path.to_path_buf(),
+    }
+}
+
 /// `GENTLE_DOT_NODE` and `GENTLE_DOT_DAEMON_SCRIPT` override the program and script in both.
 pub fn launch_spec(env: impl Fn(&str) -> Option<String>, dev: bool, runtime: Option<&Path>) -> LaunchSpec {
     let pick = |key: &str, fallback: String| env(key).filter(|v| !v.is_empty()).unwrap_or(fallback);
     let bundled = runtime.filter(|dir| dir.join("daemon/cli.mjs").is_file());
     let (node, script, mut envs) = match bundled {
         Some(dir) => {
-            let root = dir.display().to_string();
-            // Windows stages Node at `node/node.exe` beside its npm, and joins PATH with `;`.
+            // The pieces are joined, never formatted: the root comes from Tauri's `resource_dir()`,
+            // which is canonicalized — on Windows that is the verbatim form (`\\?\C:\…`), where a `/`
+            // is not a separator but an invalid name character (an installed copy failed this way
+            // with `os error 123`). The prefix is also what Node cannot take as an entry (W30), so
+            // it is dropped here and the components are joined with the platform's own separator.
+            // See `launch_spec_runs_a_canonicalized_runtime_root` and `a_verbatim_runtime_root_never_reaches_node`.
+            let dir = without_verbatim(dir);
+            let dir = dir.as_path();
             let (node, path) = if cfg!(windows) {
-                (format!("{root}/node/node.exe"), format!("{root}/bin;{root}/node"))
+                (
+                    dir.join("node").join("node.exe"),
+                    vec![dir.join("bin"), dir.join("node")]
+                        .into_iter()
+                        .chain(windows_system_dirs())
+                        .collect::<Vec<PathBuf>>(),
+                )
             } else {
                 (
-                    format!("{root}/node/bin/node"),
-                    format!("{root}/bin:{root}/node/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
+                    dir.join("node").join("bin").join("node"),
+                    vec![dir.join("bin"), dir.join("node").join("bin")]
+                        .into_iter()
+                        .chain(["/usr/bin", "/bin", "/usr/sbin", "/sbin"].map(PathBuf::from))
+                        .collect::<Vec<PathBuf>>(),
                 )
             };
             (
-                node,
-                format!("{root}/daemon/cli.mjs"),
-                vec![("PATH".to_string(), path), ("GENTLE_DOT_RUNTIME".to_string(), root)],
+                node.display().to_string(),
+                dir.join("daemon").join("cli.mjs").display().to_string(),
+                vec![
+                    ("PATH".to_string(), path_env(&path)),
+                    ("GENTLE_DOT_RUNTIME".to_string(), dir.display().to_string()),
+                ],
             )
         }
         None => (
@@ -1069,23 +1126,93 @@ mod tests {
         runtime
     }
 
+    /// The runtime root the app hands in comes from Tauri's `resource_dir()`, which is
+    /// canonicalized — on Windows that is the verbatim form (`\\?\C:\…`). A verbatim path
+    /// switches path normalization off, so appending `/` to it names a file the OS refuses;
+    /// that is how an installed copy failed to start its daemon (`os error 123`). This asserts
+    /// the spec names real files instead of comparing the strings the builder just produced.
+    #[cfg(windows)]
+    #[test]
+    fn launch_spec_runs_a_canonicalized_runtime_root() {
+        let runtime = fake_runtime("runtime-canonical", true);
+        fs::create_dir_all(runtime.join("bin")).unwrap();
+        fs::write(runtime.join("node/node.exe"), "").unwrap();
+        let canonical = fs::canonicalize(&runtime).unwrap();
+        assert!(
+            canonical.to_string_lossy().starts_with(r"\\?"),
+            "the defect's input is a canonicalized root, got {}",
+            canonical.display()
+        );
+        let spec = launch_spec(env_of(&[]), false, Some(&canonical));
+        assert!(Path::new(&spec.program).is_file(), "program is not a file: {}", spec.program);
+        assert!(
+            Path::new(&spec.args[0]).is_file(),
+            "the daemon script is not a file: {}",
+            spec.args[0]
+        );
+        let path = env_value(&spec, "PATH").unwrap().to_string();
+        for entry in path.split(';').take(2) {
+            assert!(Path::new(entry).is_dir(), "a PATH entry is not a directory: {entry}");
+        }
+    }
+
+    /// W30: the verbatim root is the one form Node cannot take as an entry — handed it, Node's
+    /// resolver collapses it to a bare drive and dies with `EISDIR`, so the installed daemon never
+    /// started. Nothing the app hands over may carry the prefix: not the program, not the script,
+    /// not `GENTLE_DOT_RUNTIME`, not a `PATH` entry.
+    #[test]
+    #[cfg(windows)]
+    fn a_verbatim_runtime_root_never_reaches_node() {
+        let runtime = fake_runtime("runtime-verbatim", true);
+        fs::create_dir_all(runtime.join("bin")).unwrap();
+        fs::write(runtime.join("node/node.exe"), "").unwrap();
+        let canonical = fs::canonicalize(&runtime).unwrap();
+        assert!(
+            canonical.to_string_lossy().starts_with(r"\\?"),
+            "the defect's input is a canonicalized root, got {}",
+            canonical.display()
+        );
+        let spec = launch_spec(env_of(&[]), false, Some(&canonical));
+        assert!(!spec.program.contains(r"\\?"), "the program carries the prefix: {}", spec.program);
+        assert!(!spec.args[0].contains(r"\\?"), "the daemon script carries it: {}", spec.args[0]);
+        for key in ["GENTLE_DOT_RUNTIME", "PATH"] {
+            let value = env_value(&spec, key).unwrap();
+            assert!(!value.contains(r"\\?"), "{key} carries the prefix: {value}");
+        }
+    }
+
+    /// The bundled runtime is selected by *which* Node and script it names and by the root it hands
+    /// the daemon. Asserted as path structure rather than the exact spelling the builder produced:
+    /// that spelling is what hid the verbatim-path defect (the property itself is asserted in
+    /// `launch_spec_runs_a_canonicalized_runtime_root`).
+    /// The runtime is isolated on purpose, but the engine still needs the machine's own tools:
+    /// without the system directories on `PATH` an installed copy reports them missing.
+    #[cfg(windows)]
+    #[test]
+    fn launch_spec_puts_the_system_directories_on_the_runtimes_path() {
+        let runtime = fake_runtime("runtime-system-path", true);
+        let spec = launch_spec(env_of(&[]), false, Some(&runtime));
+        let path = env_value(&spec, "PATH").unwrap();
+        let root = std::env::var("SystemRoot").unwrap();
+        let system = Path::new(&root).join("system32");
+        let entries: Vec<PathBuf> = path.split(';').map(PathBuf::from).collect();
+        assert!(entries.contains(&system), "PATH has no {}: {path}", system.display());
+        assert!(system.is_dir(), "the system directory named on PATH does not exist");
+    }
+
     #[test]
     fn launch_spec_runs_the_bundled_runtime_when_present() {
         let runtime = fake_runtime("runtime-bundled", true);
         let spec = launch_spec(env_of(&[]), false, Some(&runtime));
-        let root = runtime.display().to_string();
-        let (program, path) = if cfg!(windows) {
-            (format!("{root}/node/node.exe"), format!("{root}/bin;{root}/node"))
-        } else {
-            (
-                format!("{root}/node/bin/node"),
-                format!("{root}/bin:{root}/node/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
-            )
-        };
-        assert_eq!(spec.program, program);
-        assert_eq!(spec.args, vec![format!("{root}/daemon/cli.mjs")]);
-        assert_eq!(env_value(&spec, "PATH"), Some(path.as_str()));
-        assert_eq!(env_value(&spec, "GENTLE_DOT_RUNTIME"), Some(root.as_str()));
+        let node = if cfg!(windows) { "node/node.exe" } else { "node/bin/node" };
+        assert!(Path::new(&spec.program).ends_with(node), "program: {}", spec.program);
+        assert!(Path::new(&spec.args[0]).ends_with("daemon/cli.mjs"), "script: {}", spec.args[0]);
+        assert_eq!(env_value(&spec, "GENTLE_DOT_RUNTIME"), Some(runtime.display().to_string().as_str()));
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        let entries: Vec<PathBuf> =
+            env_value(&spec, "PATH").unwrap().split(separator).map(PathBuf::from).collect();
+        assert_eq!(entries[0], runtime.join("bin"));
+        assert_eq!(entries[1], runtime.join(if cfg!(windows) { "node" } else { "node/bin" }));
         assert_eq!(env_value(&spec, "GENTLE_DOT_ALLOWED_ORIGINS"), None);
         let spec = launch_spec(env_of(&[]), true, Some(&runtime));
         assert_eq!(env_value(&spec, "GENTLE_DOT_ALLOWED_ORIGINS"), Some(DEV_ALLOWED_ORIGINS));
