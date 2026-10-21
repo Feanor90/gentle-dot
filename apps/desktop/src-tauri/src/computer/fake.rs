@@ -22,7 +22,12 @@ pub struct FakeDesktop {
     pub elements: Mutex<Vec<AxElement>>,
     pub focus: Mutex<Option<Focus>>,
     pub opened: Mutex<Vec<String>>,
+    /// Native launch result, independent of any later foreground changes.
+    pub opened_identity: Mutex<Option<AppIdentity>>,
     pub activated: Mutex<Vec<i32>>,
+    /// What activation eventually brings forward; by default activation only records the pid.
+    pub activates_to: Mutex<Option<AppIdentity>>,
+    pub activations_needed: Mutex<usize>,
     pub captures: AtomicUsize,
     /// A 2560 × 1600 pt display at the origin, captured at 1280 × 800 (scale 0.5).
     pub geometry: ScreenshotGeometry,
@@ -41,7 +46,10 @@ impl Default for FakeDesktop {
             elements: Mutex::new(Vec::new()),
             focus: Mutex::new(None),
             opened: Mutex::new(Vec::new()),
+            opened_identity: Mutex::new(None),
             activated: Mutex::new(Vec::new()),
+            activates_to: Mutex::new(None),
+            activations_needed: Mutex::new(1),
             captures: AtomicUsize::new(0),
             geometry: ScreenshotGeometry::for_display(Point { x: 0.0, y: 0.0 }, 2560.0, 1280, 800),
         }
@@ -76,9 +84,9 @@ impl Desktop for FakeDesktop {
         ])
     }
 
-    fn open_app(&self, name: &str) -> Result<(), String> {
+    fn open_app(&self, name: &str) -> Result<Option<AppIdentity>, String> {
         self.opened.lock().unwrap().push(name.into());
-        Ok(())
+        Ok(self.opened_identity.lock().unwrap().clone())
     }
 
     fn element_at(&self, _at: Point) -> Vec<AxElement> {
@@ -102,7 +110,17 @@ impl Desktop for FakeDesktop {
     }
 
     fn activate(&self, pid: i32) {
-        self.activated.lock().unwrap().push(pid);
+        let count = {
+            let mut activated = self.activated.lock().unwrap();
+            activated.push(pid);
+            activated.len()
+        };
+        if count < *self.activations_needed.lock().unwrap() {
+            return;
+        }
+        if let Some(app) = self.activates_to.lock().unwrap().clone() {
+            *self.frontmost.lock().unwrap() = Some(app);
+        }
     }
 }
 

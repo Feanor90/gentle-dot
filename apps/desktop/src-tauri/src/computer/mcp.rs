@@ -34,6 +34,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 /// Time for the screen to settle before the screenshot that follows an action.
 const SETTLE_MS: u64 = 150;
+/// Bounded focus restoration after a native confirmation.
+const RESTORE_TRIES: u32 = 10;
+const RESTORE_STEP_MS: u64 = 50;
 const OPEN_APP_SETTLE_MS: u64 = 1500;
 const MAX_BATCH_STEPS: usize = 20;
 /// The tools a batch step may use: actions only (a batch returns its own screenshot).
@@ -57,7 +60,8 @@ const INSTRUCTIONS: &str = "Controls this Mac. Take a screenshot first; x and y 
 screenshot. Every action returns a fresh screenshot. Use `batch` for a predictable sequence (click a field, \
 type, press tab, type, press return) so it runs in one call; end the batch whenever you must see the screen \
 before deciding the next step. The user must allow a session, risky actions ask the user to confirm, and \
-some apps (System Settings, password managers) are off limits.";
+some apps (System Settings, password managers) are off limits. Keys and text require the app of the latest \
+screenshot, or a validated click/drag target or the natively identified app requested by open_app; if its identity is unavailable or another app is in front, take a new screenshot.";
 
 pub struct HttpRequest<'a> {
     pub method: &'a str,
@@ -175,7 +179,7 @@ fn tools() -> Value {
          "inputSchema": schema(json!({"text": {"type": "string"}}), &["text"])},
         {"name": "key", "description": "Press a key combo in the frontmost app, for example `cmd+shift+t`, `return`, or `esc`.",
          "inputSchema": schema(json!({"combo": {"type": "string"}}), &["combo"])},
-        {"name": "open_app", "description": "Open or bring forward an app by name or bundle id.",
+        {"name": "open_app", "description": "Open or bring forward an app by name or bundle id. In a batch, following keys require native identity of that app; otherwise take a screenshot first.",
          "inputSchema": schema(json!({"name": {"type": "string"}}), &["name"])},
         {"name": "list_apps", "description": "List the running apps.",
          "inputSchema": schema(json!({}), &[])},
@@ -330,6 +334,12 @@ pub struct Helper {
     limiter: Mutex<RateLimiter>,
     /// Serializes actions and holds the geometry of the latest screenshot.
     actions: Mutex<Option<ScreenshotGeometry>>,
+    /// Keys and text may target only the app of the latest screenshot.
+    seen_front: Mutex<Option<i32>>,
+    /// A validated click/drag target, or the natively identified requested app.
+    accepted_front: Mutex<Option<i32>>,
+    /// Requested app identity from the native launch, consumed after the settle wait.
+    pending_open: Mutex<Option<AppIdentity>>,
     /// Where an action that went through acted (S28); must return at once.
     glow: Box<dyn Fn(Mark) + Send + Sync>,
     /// The working rings around each call that captures or acts (S1, S5).
@@ -354,6 +364,9 @@ impl Helper {
             own_pid,
             limiter: Mutex::new(RateLimiter::new(MAX_ACTIONS_PER_SECOND, 1000)),
             actions: Mutex::new(None),
+            seen_front: Mutex::new(None),
+            accepted_front: Mutex::new(None),
+            pending_open: Mutex::new(None),
             glow: Box::new(|_| {}),
             working: Arc::new(NoPreparation),
         }
@@ -452,6 +465,9 @@ impl Helper {
         if !self.control.is_active(self.clock.now_ms()) {
             // The screenshot of an ended session no longer describes the screen.
             *latest = None;
+            *lock(&self.seen_front) = None;
+            *lock(&self.accepted_front) = None;
+            *lock(&self.pending_open) = None;
             if !self.with_dialog(|| self.dialogs.ask_grant()) {
                 return Err(NOT_ALLOWED.into());
             }
@@ -535,10 +551,11 @@ impl Helper {
         }
     }
 
-    /// The app owning the window under `at`, refused when blocked or unknown. Its name, for messages.
-    fn pointer_target(&self, at: Point) -> Result<String, String> {
+    /// The app owning the window under `at`, refused when blocked or unknown.
+    fn pointer_target(&self, at: Point) -> Result<AppIdentity, String> {
         let app = self.desktop.window_owner_at(at).ok_or(UNKNOWN_TARGET)?;
-        self.refuse_blocked(&app).map(|()| app.name)
+        self.refuse_blocked(&app)?;
+        Ok(app)
     }
 
     /// The frontmost app and the app owning the focused element (they differ for a
@@ -546,10 +563,17 @@ impl Helper {
     fn keyboard_target(&self) -> Result<String, String> {
         let front = self.desktop.frontmost_app().ok_or("Cannot tell which app is in front.")?;
         self.refuse_blocked(&front)?;
-        match self.desktop.focused_app().filter(|focused| focused.pid != front.pid) {
-            Some(focused) => self.refuse_blocked(&focused).map(|()| focused.name),
-            None => Ok(front.name),
+        let focused = self.desktop.focused_app().filter(|focused| focused.pid != front.pid);
+        if let Some(focused) = &focused {
+            self.refuse_blocked(focused)?;
         }
+        if *lock(&self.seen_front) != Some(front.pid) && *lock(&self.accepted_front) != Some(front.pid) {
+            return Err(format!(
+                "{} is in front now, not the app of the latest screenshot, so nothing was sent. Take a screenshot first.",
+                front.name
+            ));
+        }
+        Ok(focused.map_or(front.name, |app| app.name))
     }
 
     fn confirm_if_risky(&self, risk: Option<String>, action: &str, target: &str) -> Result<(), String> {
@@ -561,18 +585,39 @@ impl Helper {
             return Ok(());
         }
         let message = format!("{action} in {target}.\n\nThis needs your OK because of {reason}.");
-        if self.with_dialog(|| self.dialogs.confirm(&message)) {
-            Ok(())
-        } else {
-            Err(format!("The user declined: {action} in {target}. Nothing was done."))
+        let before = self.desktop.frontmost_app();
+        if !self.with_dialog(|| self.dialogs.confirm(&message)) {
+            return Err(format!("The user declined: {action} in {target}. Nothing was done."));
         }
+        let Some(before) = before else {
+            return Err(format!(
+                "The user allowed {action} in {target}, but Gentle Dot cannot tell which app was in front before it asked, so nothing was done."
+            ));
+        };
+        for _ in 0..RESTORE_TRIES {
+            if self.desktop.frontmost_app().map(|app| app.pid) == Some(before.pid) {
+                return Ok(());
+            }
+            self.desktop.activate(before.pid);
+            self.clock.sleep_ms(RESTORE_STEP_MS);
+        }
+        if self.desktop.frontmost_app().map(|app| app.pid) == Some(before.pid) {
+            return Ok(());
+        }
+        Err(format!(
+            "The user allowed {action} in {target}, but {} could not be brought back to the front, so nothing was done.",
+            before.name
+        ))
     }
 
     fn screenshot(&self, latest: &mut Option<ScreenshotGeometry>) -> Result<Content, String> {
         let capture = self.desktop.capture()?;
         let geometry = capture.geometry;
         *latest = Some(geometry);
-        let front = self.desktop.frontmost_app().map(|app| app.name);
+        let front = self.desktop.frontmost_app();
+        *lock(&self.seen_front) = front.as_ref().map(|app| app.pid);
+        *lock(&self.accepted_front) = None;
+        let front = front.map(|app| app.name);
         let meta = json!({
             "imageWidth": geometry.image_width,
             "imageHeight": geometry.image_height,
@@ -583,9 +628,21 @@ impl Helper {
         Ok(vec![json!({"type": "image", "data": data, "mimeType": capture.mime_type}), text(meta.to_string())])
     }
 
+    /// A foreground observation can confirm a native launch identity, never create one.
+    fn settle(&self, ms: u64) {
+        self.clock.sleep_ms(ms);
+        if let Some(requested) = lock(&self.pending_open).take() {
+            if let Some(front) = self.desktop.frontmost_app() {
+                if requested.pid > 0 && front == requested && self.refuse_blocked(&front).is_ok() {
+                    *lock(&self.accepted_front) = Some(requested.pid);
+                }
+            }
+        }
+    }
+
     /// What was done, then a fresh screenshot once the screen settled.
     fn after(&self, latest: &mut Option<ScreenshotGeometry>, done: String, settle_ms: u64) -> Result<Content, String> {
-        self.clock.sleep_ms(settle_ms);
+        self.settle(settle_ms);
         let mut content = vec![text(done)];
         match self.screenshot(latest) {
             Ok(blocks) => content.extend(blocks),
@@ -624,7 +681,7 @@ impl Helper {
         for (i, (name, step)) in steps.into_iter().enumerate() {
             if i > 0 {
                 // An app that is opening needs its full wait before anything targets it.
-                self.clock.sleep_ms(if settle_ms == OPEN_APP_SETTLE_MS { settle_ms } else { STEP_PAUSE_MS });
+                self.settle(if settle_ms == OPEN_APP_SETTLE_MS { settle_ms } else { STEP_PAUSE_MS });
             }
             // The batch's intent applies to every step, on top of the step's own.
             let intents: Vec<&str> = [intent, step.intent.as_deref()].into_iter().flatten().collect();
@@ -686,6 +743,8 @@ impl Helper {
             Tool::Click { x, y, button, count } => {
                 let at = map(latest, (x, y))?;
                 let target = self.pointer_target(at)?;
+                let target_pid = target.pid;
+                let target = target.name;
                 let chain = self.desktop.element_at(at);
                 let action = match (button, count) {
                     (MouseButton::Right, _) => format!("Right-click at ({x}, {y})"),
@@ -695,12 +754,13 @@ impl Helper {
                 };
                 self.confirm_if_risky(assess(Act::Click(&chain), intent), &action, &target)?;
                 self.post(epoch, InputEvent::Click { at, button, count })?;
+                *lock(&self.accepted_front) = Some(target_pid);
                 (self.glow)(Mark::Click(at));
                 Ok((format!("{action} in {target}: done."), SETTLE_MS))
             }
             Tool::Move { x, y } => {
                 let at = map(latest, (x, y))?;
-                let target = self.pointer_target(at)?;
+                let target = self.pointer_target(at)?.name;
                 let action = format!("Move the pointer to ({x}, {y})");
                 self.confirm_if_risky(assess(Act::Other, intent), &action, &target)?;
                 self.post(epoch, InputEvent::Move(at))?;
@@ -712,16 +772,18 @@ impl Helper {
                 let source = self.pointer_target(start)?;
                 let destination = self.pointer_target(end)?;
                 let action = format!("Drag from ({}, {}) to ({}, {})", from.0, from.1, to.0, to.1);
-                let target = if source == destination { source } else { format!("{source} and {destination}") };
+                let target = if source.name == destination.name { source.name.clone() } else { format!("{} and {}", source.name, destination.name) };
                 let (from_chain, to_chain) = (self.desktop.element_at(start), self.desktop.element_at(end));
                 self.confirm_if_risky(assess(Act::Drag(&from_chain, &to_chain), intent), &action, &target)?;
                 self.post(epoch, InputEvent::Drag { from: start, to: end })?;
+                // Mouse-down activates the source window; dropping elsewhere is not a click there.
+                *lock(&self.accepted_front) = Some(source.pid);
                 (self.glow)(Mark::Drag { from: start, to: end });
                 Ok((format!("{action}: done."), SETTLE_MS))
             }
             Tool::Scroll { x, y, dx, dy } => {
                 let at = map(latest, (x, y))?;
-                let target = self.pointer_target(at)?;
+                let target = self.pointer_target(at)?.name;
                 let action = format!("Scroll by ({dx}, {dy}) at ({x}, {y})");
                 self.confirm_if_risky(assess(Act::Other, intent), &action, &target)?;
                 self.post(epoch, InputEvent::Scroll { at, dx, dy })?;
@@ -772,7 +834,13 @@ impl Helper {
                 let action = format!("Open {name}");
                 self.confirm_if_risky(assess(Act::Other, intent), &action, "macOS")?;
                 self.still_running(epoch)?;
-                self.desktop.open_app(&name)?;
+                let requested = self.desktop.open_app(&name)?;
+                // Opening changes the intended keyboard target even if activation fails or
+                // identity is unavailable. Only the requested app, a new screenshot, or a
+                // subsequent validated click/drag may authorize keys from here.
+                *lock(&self.seen_front) = None;
+                *lock(&self.accepted_front) = None;
+                *lock(&self.pending_open) = requested;
                 Ok((format!("{action}: done."), OPEN_APP_SETTLE_MS))
             }
             Tool::Wait { ms } => {
@@ -1440,12 +1508,371 @@ mod tests {
         let rig = rig();
         rig.ready();
         *rig.desktop.elements.lock().unwrap() = send_button();
+        *rig.desktop.activates_to.lock().unwrap() = rig.desktop.frontmost_app();
         let frontmost = rig.desktop.clone();
         *rig.dialogs.during.lock().unwrap() = Some(Box::new(move || {
             *frontmost.frontmost.lock().unwrap() = Some(app(OWN_PID, "dev.gentleman.gentle-dot", "Gentle Dot"));
         }));
         rig.call("click", json!({"x": 10, "y": 10}));
         assert_eq!(*rig.desktop.activated.lock().unwrap(), vec![200]);
+    }
+
+    #[test]
+    fn an_approved_action_is_dropped_when_the_previous_app_cannot_be_brought_back() {
+        let rig = rig();
+        rig.ready();
+        *rig.desktop.elements.lock().unwrap() = send_button();
+        let desktop = rig.desktop.clone();
+        *rig.dialogs.during.lock().unwrap() = Some(Box::new(move || {
+            *desktop.frontmost.lock().unwrap() = Some(app(OWN_PID, "dev.gentleman.gentle-dot", "Gentle Dot"));
+        }));
+        let result = rig.call("click", json!({"x": 10, "y": 10}));
+        assert!(is_error(&result), "{result}");
+        assert!(first_text(&result).contains("could not be brought back"), "{result}");
+        assert_eq!(*rig.desktop.activated.lock().unwrap(), vec![200; 1 + RESTORE_TRIES as usize]);
+        assert!(rig.desktop.events().is_empty());
+    }
+
+    #[test]
+    fn an_approved_action_is_dropped_when_no_app_was_known_to_be_in_front() {
+        let rig = rig();
+        rig.ready();
+        *rig.desktop.elements.lock().unwrap() = send_button();
+        *rig.desktop.frontmost.lock().unwrap() = None;
+        let result = rig.call("click", json!({"x": 10, "y": 10}));
+        assert!(is_error(&result), "{result}");
+        assert!(first_text(&result).contains("cannot tell which app was in front"), "{result}");
+        assert_eq!(rig.dialogs.confirmations.lock().unwrap().len(), 1);
+        assert!(rig.desktop.events().is_empty());
+    }
+
+    #[test]
+    fn keys_and_text_wait_for_a_screenshot_once_the_front_app_changed() {
+        let rig = rig();
+        rig.ready();
+        *rig.desktop.frontmost.lock().unwrap() = Some(app(300, "com.example.terminal", "Terminal"));
+        for (tool, args) in [("key", json!({"combo": "alt+f4"})), ("type", json!({"text": "hola"}))] {
+            let result = rig.call(tool, args);
+            assert!(is_error(&result), "{result}");
+            assert_eq!(first_text(&result), "Terminal is in front now, not the app of the latest screenshot, so nothing was sent. Take a screenshot first.");
+        }
+        assert!(rig.desktop.events().is_empty());
+        rig.ready();
+        assert!(!is_error(&rig.call("key", json!({"combo": "alt+f4"}))));
+        assert_eq!(rig.desktop.events().len(), 1);
+    }
+
+    #[test]
+    fn an_approved_action_waits_a_moment_for_the_previous_app_to_come_back() {
+        let elapsed = |needed: usize| {
+            let rig = rig();
+            rig.ready();
+            *rig.desktop.elements.lock().unwrap() = send_button();
+            *rig.desktop.activates_to.lock().unwrap() = rig.desktop.frontmost_app();
+            *rig.desktop.activations_needed.lock().unwrap() = needed;
+            let desktop = rig.desktop.clone();
+            *rig.dialogs.during.lock().unwrap() = Some(Box::new(move || {
+                *desktop.frontmost.lock().unwrap() = Some(app(OWN_PID, "dev.gentleman.gentle-dot", "Gentle Dot"));
+            }));
+            let start = rig.clock.now_ms();
+            let result = rig.call("click", json!({"x": 10, "y": 10}));
+            assert!(!is_error(&result), "{result}");
+            assert_eq!(rig.desktop.activated.lock().unwrap().len(), needed);
+            assert_eq!(rig.desktop.events().len(), 1);
+            rig.clock.now_ms() - start
+        };
+        assert_eq!(elapsed(3) - elapsed(1), 2 * RESTORE_STEP_MS);
+    }
+
+    #[test]
+    fn an_approved_action_runs_once_the_previous_app_is_back() {
+        let rig = rig();
+        rig.ready();
+        *rig.desktop.elements.lock().unwrap() = send_button();
+        *rig.desktop.activates_to.lock().unwrap() = rig.desktop.frontmost_app();
+        let desktop = rig.desktop.clone();
+        *rig.dialogs.during.lock().unwrap() = Some(Box::new(move || {
+            *desktop.frontmost.lock().unwrap() = Some(app(OWN_PID, "dev.gentleman.gentle-dot", "Gentle Dot"));
+        }));
+        let result = rig.call("click", json!({"x": 10, "y": 10}));
+        assert!(!is_error(&result), "{result}");
+        assert_eq!(rig.desktop.events().len(), 1);
+    }
+
+    fn mail() -> AppIdentity {
+        app(300, "com.apple.mail", "Mail")
+    }
+
+    /// Simulates the OS delivering an agent-caused activation during the inter-step wait.
+    fn bring_mail_after_step(rig: &Rig) {
+        let desktop = rig.desktop.clone();
+        *rig.clock.on_sleep.lock().unwrap() = Some(Box::new(move || {
+            *desktop.frontmost.lock().unwrap() = Some(mail());
+        }));
+    }
+
+    #[test]
+    fn batch_click_in_another_app_then_type_goes_through() {
+        let rig = rig();
+        rig.ready();
+        *rig.desktop.owner_at.lock().unwrap() = Box::new(|_| Some(mail()));
+        bring_mail_after_step(&rig);
+        let result = rig.call("batch", batch(json!([
+            {"tool": "click", "x": 10, "y": 10},
+            {"tool": "type", "text": "hello"},
+            {"tool": "key", "combo": "tab"}
+        ])));
+        assert!(!is_error(&result), "{result}");
+        assert_eq!(first_text(&result), "Ran 3 of 3 steps:\n1. Click at (10, 10) in Mail: done.\n2. Type 5 characters in Mail: done.\n3. Press tab in Mail: done.");
+        assert_eq!(rig.desktop.events(), vec![
+            InputEvent::Click { at: Point { x: 20.0, y: 20.0 }, button: MouseButton::Left, count: 1 },
+            InputEvent::Text("hello".into()), InputEvent::Key(parse_combo("tab").unwrap())
+        ]);
+        assert_eq!(image_count(&result), 1);
+    }
+
+    fn open_app_refuses_prior_screenshot_app(tool: &str, step: Value) {
+        for resolved in [Some(mail()), None] {
+            for returns_from_mail in [false, true] {
+                let rig = rig();
+                rig.ready();
+                *rig.desktop.opened_identity.lock().unwrap() = resolved.clone();
+                if returns_from_mail {
+                    *rig.desktop.frontmost.lock().unwrap() = Some(mail());
+                }
+                let desktop = rig.desktop.clone();
+                *rig.clock.on_sleep.lock().unwrap() = Some(Box::new(move || {
+                    *desktop.frontmost.lock().unwrap() = Some(safari());
+                }));
+                let result = rig.call("batch", batch(json!([
+                    {"tool": "open_app", "name": "Mail"}, step.clone()
+                ])));
+                assert!(is_error(&result), "resolved={resolved:?}, returns={returns_from_mail}: {result}");
+                assert_eq!(first_text(&result), format!("Stopped at step 2 of 2 ({tool}): Safari is in front now, not the app of the latest screenshot, so nothing was sent. Take a screenshot first.\nRan 1 of 2 steps:\n1. Open Mail: done."));
+                assert_eq!(*rig.desktop.opened.lock().unwrap(), vec!["Mail"]);
+                assert!(rig.desktop.events().is_empty());
+                assert!(marks(&rig).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn open_app_prior_screenshot_safari_refuses_type() {
+        open_app_refuses_prior_screenshot_app("type", json!({"tool": "type", "text": "hello"}));
+    }
+
+    #[test]
+    fn open_app_prior_screenshot_safari_refuses_key() {
+        open_app_refuses_prior_screenshot_app("key", json!({"tool": "key", "combo": "tab"}));
+    }
+
+    #[test]
+    fn batch_open_app_unrelated_user_foreground_refuses_key_and_type() {
+        for (tool, step) in [
+            ("type", json!({"tool": "type", "text": "hello"})),
+            ("key", json!({"tool": "key", "combo": "tab"})),
+        ] {
+            let rig = rig();
+            rig.ready();
+            *rig.desktop.opened_identity.lock().unwrap() = Some(mail());
+            let desktop = rig.desktop.clone();
+            *rig.clock.on_sleep.lock().unwrap() = Some(Box::new(move || {
+                *desktop.frontmost.lock().unwrap() = Some(app(400, "com.example.terminal", "Terminal"));
+            }));
+            let result = rig.call("batch", batch(json!([
+                {"tool": "open_app", "name": "Mail"}, step
+            ])));
+            assert!(is_error(&result), "{result}");
+            assert_eq!(first_text(&result), format!("Stopped at step 2 of 2 ({tool}): Terminal is in front now, not the app of the latest screenshot, so nothing was sent. Take a screenshot first.\nRan 1 of 2 steps:\n1. Open Mail: done."));
+            assert_eq!(*rig.desktop.opened.lock().unwrap(), vec!["Mail"]);
+            assert!(rig.desktop.events().is_empty());
+        }
+    }
+
+    #[test]
+    fn batch_open_app_then_type_goes_through() {
+        let rig = rig();
+        rig.ready();
+        *rig.desktop.opened_identity.lock().unwrap() = Some(mail());
+        bring_mail_after_step(&rig);
+        let before = rig.clock.now_ms();
+        let result = rig.call("batch", batch(json!([
+            {"tool": "open_app", "name": "Mail"}, {"tool": "type", "text": "hello"}
+        ])));
+        assert!(!is_error(&result), "{result}");
+        assert_eq!(first_text(&result), "Ran 2 of 2 steps:\n1. Open Mail: done.\n2. Type 5 characters in Mail: done.");
+        assert_eq!(*rig.desktop.opened.lock().unwrap(), vec!["Mail"]);
+        assert_eq!(rig.desktop.events(), vec![InputEvent::Text("hello".into())]);
+        assert_eq!(rig.clock.now_ms() - before, OPEN_APP_SETTLE_MS + SETTLE_MS);
+        assert_eq!(image_count(&result), 1);
+    }
+
+    #[test]
+    fn open_app_verified_identity_only_accepts_requested_app_including_already_foreground() {
+        for (resolved, front, succeeds) in [
+            (Some(mail()), Some(mail()), true),
+            (None, Some(mail()), false),
+            (Some(mail()), Some(app(400, "com.example.terminal", "Terminal")), false),
+            (Some(app(301, SETTINGS.0, SETTINGS.1)), Some(app(301, SETTINGS.0, SETTINGS.1)), false),
+        ] {
+            for (tool, args) in [("key", json!({"combo": "tab"})), ("type", json!({"text": "hello"}))] {
+                let rig = rig();
+                rig.ready();
+                // A verified open of an already foreground app is allowed, but must not
+                // acquire acceptance for any unrelated foreground observed later.
+                *rig.desktop.frontmost.lock().unwrap() = Some(mail());
+                *rig.desktop.opened_identity.lock().unwrap() = resolved.clone();
+                let desktop = rig.desktop.clone();
+                let front = front.clone();
+                *rig.clock.on_sleep.lock().unwrap() = Some(Box::new(move || {
+                    *desktop.frontmost.lock().unwrap() = front.clone();
+                }));
+                let mut step = args;
+                step["tool"] = json!(tool);
+                let result = rig.call("batch", batch(json!([{"tool": "open_app", "name": "Mail"}, step])));
+                assert_eq!(!is_error(&result), succeeds, "{result}");
+                assert_eq!(*rig.desktop.opened.lock().unwrap(), vec!["Mail"]);
+                assert_eq!(rig.desktop.events().len(), usize::from(succeeds));
+                if succeeds {
+                    assert_eq!(rig.desktop.events(), if tool == "key" {
+                        vec![InputEvent::Key(parse_combo("tab").unwrap())]
+                    } else { vec![InputEvent::Text("hello".into())] });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn open_app_preserves_prior_click_acceptance_only_until_successful_open() {
+        let rig = rig();
+        rig.ready();
+        *rig.desktop.owner_at.lock().unwrap() = Box::new(|_| Some(mail()));
+        bring_mail_after_step(&rig);
+        let result = rig.call("batch", batch(json!([
+            {"tool": "click", "x": 10, "y": 10},
+            {"tool": "wait", "ms": 0},
+            {"tool": "key", "combo": "tab"}
+        ])));
+        assert!(!is_error(&result), "{result}");
+        assert_eq!(rig.desktop.events().len(), 2);
+    }
+
+    #[test]
+    fn batch_user_switch_to_a_third_app_is_still_refused() {
+        let rig = rig();
+        rig.ready();
+        *rig.desktop.owner_at.lock().unwrap() = Box::new(|_| Some(mail()));
+        let desktop = rig.desktop.clone();
+        *rig.clock.on_sleep.lock().unwrap() = Some(Box::new(move || {
+            *desktop.frontmost.lock().unwrap() = Some(app(400, "com.example.terminal", "Terminal"));
+        }));
+        let result = rig.call("batch", batch(json!([
+            {"tool": "click", "x": 10, "y": 10}, {"tool": "type", "text": "never"}
+        ])));
+        assert!(is_error(&result), "{result}");
+        assert_eq!(first_text(&result), "Stopped at step 2 of 2 (type): Terminal is in front now, not the app of the latest screenshot, so nothing was sent. Take a screenshot first.\nRan 1 of 2 steps:\n1. Click at (10, 10) in Mail: done.");
+        assert_eq!(rig.desktop.events().len(), 1);
+        assert_eq!(image_count(&result), 1);
+    }
+
+    #[test]
+    fn a_click_on_a_blocked_app_accepts_nothing_and_keys_stay_refused() {
+        let rig = rig();
+        rig.ready();
+        *rig.desktop.owner_at.lock().unwrap() = Box::new(|_| Some(app(300, SETTINGS.0, SETTINGS.1)));
+        let result = rig.call("batch", batch(json!([
+            {"tool": "click", "x": 10, "y": 10}, {"tool": "type", "text": "never"}
+        ])));
+        assert!(is_error(&result), "{result}");
+        assert!(first_text(&result).contains("Ran 0 of 2 steps."), "{result}");
+        // No action activated Mail: a later user switch to the same pid is not accepted.
+        *rig.desktop.frontmost.lock().unwrap() = Some(mail());
+        let result = rig.call("key", json!({"combo": "tab"}));
+        assert!(is_error(&result), "{result}");
+        assert_eq!(first_text(&result), "Mail is in front now, not the app of the latest screenshot, so nothing was sent. Take a screenshot first.");
+        assert!(rig.desktop.events().is_empty());
+        assert!(marks(&rig).is_empty());
+    }
+
+    #[test]
+    fn only_click_and_drag_accept_a_validated_pointer_target() {
+        for (step, accepts) in [
+            (json!({"tool": "drag", "fromX": 10, "fromY": 10, "toX": 20, "toY": 20}), true),
+            (json!({"tool": "move", "x": 10, "y": 10}), false),
+            (json!({"tool": "scroll", "x": 10, "y": 10, "dx": 0, "dy": 1}), false),
+        ] {
+            let rig = rig();
+            rig.ready();
+            *rig.desktop.owner_at.lock().unwrap() = Box::new(|_| Some(mail()));
+            bring_mail_after_step(&rig);
+            let result = rig.call("batch", batch(json!([step, {"tool": "type", "text": "hello"}])));
+            assert_eq!(!is_error(&result), accepts, "{result}");
+            assert_eq!(rig.desktop.events().len(), if accepts { 2 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn open_app_unknown_native_identity_refuses_unchanged_blocked_and_unknown_front() {
+        for front in [Some(mail()), Some(app(301, SETTINGS.0, SETTINGS.1)), None] {
+            let rig = rig();
+            rig.ready();
+            // Without native identity, even an unchanged Mail is not accepted.
+            *rig.desktop.frontmost.lock().unwrap() = Some(mail());
+            let desktop = rig.desktop.clone();
+            *rig.clock.on_sleep.lock().unwrap() = Some(Box::new(move || {
+                *desktop.frontmost.lock().unwrap() = front.clone();
+            }));
+            let result = rig.call("batch", batch(json!([
+                {"tool": "open_app", "name": "Mail"}, {"tool": "type", "text": "never"}
+            ])));
+            assert!(is_error(&result), "{result}");
+            assert!(first_text(&result).contains("Ran 1 of 2 steps:"), "{result}");
+            assert!(rig.desktop.events().is_empty());
+            assert_eq!(*rig.desktop.opened.lock().unwrap(), vec!["Mail"]);
+        }
+    }
+
+    #[test]
+    fn accepted_targets_still_check_both_blocklists_before_keys_and_text() {
+        for focused in [false, true] {
+            let rig = rig();
+            rig.ready();
+            *rig.desktop.owner_at.lock().unwrap() = Box::new(|_| Some(mail()));
+            let desktop = rig.desktop.clone();
+            *rig.clock.on_sleep.lock().unwrap() = Some(Box::new(move || {
+                *desktop.frontmost.lock().unwrap() = Some(if focused { mail() } else { app(300, SETTINGS.0, SETTINGS.1) });
+                if focused {
+                    *desktop.focused_app.lock().unwrap() = Some(app(301, PASSWORDS.0, PASSWORDS.1));
+                }
+            }));
+            let result = rig.call("batch", batch(json!([
+                {"tool": "click", "x": 10, "y": 10}, {"tool": "type", "text": "never"}
+            ])));
+            assert!(is_error(&result), "{result}");
+            assert!(first_text(&result).contains(if focused { PASSWORDS.1 } else { SETTINGS.1 }), "{result}");
+            assert_eq!(rig.desktop.events().len(), 1);
+            assert!(is_error(&rig.call("key", json!({"combo": "tab"}))));
+            assert_eq!(rig.desktop.events().len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_new_session_clears_keyboard_acceptance_and_the_seen_app() {
+        for timeout in [false, true] {
+            let rig = rig();
+            rig.ready();
+            *rig.desktop.owner_at.lock().unwrap() = Box::new(|_| Some(mail()));
+            bring_mail_after_step(&rig);
+            assert!(!is_error(&rig.call("batch", batch(json!([
+                {"tool": "click", "x": 10, "y": 10}, {"tool": "type", "text": "hello"}
+            ])))));
+            if timeout { rig.clock.advance(SESSION_MS); } else { rig.control.end(Reason::Stopped); }
+            let result = rig.call("key", json!({"combo": "tab"}));
+            assert!(is_error(&result), "{result}");
+            assert_eq!(first_text(&result), "Mail is in front now, not the app of the latest screenshot, so nothing was sent. Take a screenshot first.");
+            assert_eq!(rig.desktop.events().len(), 2);
+            assert_eq!(rig.dialogs.grants.load(Ordering::SeqCst), 2);
+        }
     }
 
     // --- Typing ---
