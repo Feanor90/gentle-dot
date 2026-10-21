@@ -29,6 +29,10 @@ pub const REFUSE_RESPONSE: isize = 1000;
 /// The `NSAlert` response of the allowing button, added second (`NSAlertSecondButtonReturn`).
 pub const ALLOW_RESPONSE: isize = 1001;
 
+/// The Windows task dialog's button ids: the refusing one is the default.
+pub const TASK_REFUSE_ID: i32 = 2000;
+pub const TASK_ALLOW_ID: i32 = 2001;
+
 /// The two buttons of a yes/no alert.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Choice {
@@ -45,6 +49,11 @@ impl Choice {
     /// True only for the allowing button's response; `None` is an alert that never ran.
     pub fn allows_response(&self, response: Option<isize>) -> bool {
         self.allow != self.refuse && response == Some(ALLOW_RESPONSE)
+    }
+
+    /// True only for the allowing button's id (Windows); `None` is a dialog that never ran.
+    pub fn allows_task_button(&self, button: Option<i32>) -> bool {
+        self.allow != self.refuse && button == Some(TASK_ALLOW_ID)
     }
 
     /// The plugin's buttons (off macOS): the refusing label takes the cancel slot, where rfd puts

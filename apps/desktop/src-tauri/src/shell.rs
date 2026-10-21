@@ -43,7 +43,7 @@ use tauri::{LogicalPosition, LogicalSize};
 #[cfg(windows)]
 use tauri::{PhysicalPosition, PhysicalSize};
 
-const DOT: &str = "dot";
+pub(crate) const DOT: &str = "dot";
 pub(crate) const PANEL: &str = "panel";
 const TRAY: &str = "main";
 /// The Dot window, in points: a 66 pt black disc with the rose, plus a 3 pt
