@@ -7,10 +7,10 @@
 //! Points are physical pixels of the virtual screen: the app is per-monitor DPI aware, so the
 //! pointer, the monitors, and `SendInput` all use them.
 
-use super::blocklist::{AppIdentity, UNIDENTIFIED};
+use super::blocklist::{blocked_name, blocked_reason, AppIdentity, UNIDENTIFIED};
 use super::coords::{fit_long_edge, Point, ScreenshotGeometry, MAX_LONG_EDGE};
 use super::encode::{bgra_to_jpeg, JPEG_QUALITY};
-use super::winapps::{app_pids, hosted_page, TopWindow};
+use super::winapps::{answers_to, app_pids, executable_target, hosted_page, request, shortcut_named, strip_ci, Request, TopWindow};
 use super::winput::{releases, steps, Step, VirtualScreen};
 use super::{AppInfo, Capture, InputEvent, MouseButton};
 use std::ffi::c_void;
@@ -20,9 +20,13 @@ use std::time::Duration;
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetLastError, HWND, LPARAM, POINT, RECT};
 use windows_sys::Win32::Graphics::Dwm::{DwmFlush, DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
+use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
+use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    AttachThreadInput, GetCurrentThreadId, GetProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
+use windows_sys::Win32::UI::Shell::{ShellExecuteExW, ShellExecuteW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GdiFlush, GetDC, GetMonitorInfoW, MonitorFromPoint,
     ReleaseDC, SelectObject, SetBrushOrgEx, SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
@@ -35,12 +39,13 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEINPUT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DrawIconEx, EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetCursorInfo, GetCursorPos,
-    GetForegroundWindow, GetIconInfo, GetSystemMetrics, GetWindow, GetWindowDisplayAffinity, GetWindowLongPtrW,
-    GetWindowThreadProcessId, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible, SetWindowDisplayAffinity,
-    WindowFromPoint, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, GA_ROOT, GWL_EXSTYLE, GW_OWNER, ICONINFO, SM_CXCURSOR,
-    SM_CXVIRTUALSCREEN, SM_CYCURSOR, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    BringWindowToTop, DrawIconEx, EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW,
+    GetCursorInfo, GetCursorPos, GetForegroundWindow, GetIconInfo, GetSystemMetrics, GetWindow, GetWindowDisplayAffinity,
+    GetWindowLongPtrW, GetWindowThreadProcessId, GetWindowTextLengthW, GetWindowTextW, IsIconic, IsWindowVisible,
+    SetForegroundWindow, SetWindowDisplayAffinity, ShowWindow, WindowFromPoint, CURSORINFO, CURSOR_SHOWING, DI_NORMAL,
+    GA_ROOT, GA_ROOTOWNER, GWL_EXSTYLE, GW_OWNER, ICONINFO, SM_CXCURSOR, SM_CXVIRTUALSCREEN, SM_CYCURSOR,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_RESTORE, SW_SHOWNORMAL, WDA_EXCLUDEFROMCAPTURE,
+    WDA_NONE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 
 /// Pause between the events of one action, so apps see distinct presses (as on macOS).
@@ -350,6 +355,8 @@ pub fn set_capture_excluded(hwnd: *mut c_void, excluded: bool) -> Result<(), Str
 /// The Store apps' frame window and the window of the app it hosts.
 const FRAME_CLASS: &str = "ApplicationFrameWindow";
 const CORE_CLASS: &str = "Windows.UI.Core.CoreWindow";
+/// How deep the Start menu folders are searched for shortcuts.
+const SHORTCUT_DEPTH: usize = 4;
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
@@ -582,6 +589,356 @@ pub fn list_apps() -> Vec<AppInfo> {
         .collect()
 }
 
+/// Brings a window to the front. Windows lets only the process that received the last input
+/// take the foreground: after a click on Gentle Dot's own dialog it may; for `open_app`, while
+/// the user works in another app, `nudge` first sends an input that changes nothing (a mouse
+/// move by zero), which gives it that right.
+fn bring_to_front(hwnd: HWND, nudge: bool) {
+    let zero_move = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: windows_sys::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
+            mi: MOUSEINPUT { dx: 0, dy: 0, mouseData: 0, dwFlags: MOUSEEVENTF_MOVE, time: 0, dwExtraInfo: 0 },
+        },
+    };
+    // SAFETY: plain window calls and one valid INPUT record; the input threads are detached
+    // again before returning.
+    unsafe {
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
+        if nudge {
+            SendInput(1, &zero_move, size_of::<INPUT>() as i32);
+        }
+        if SetForegroundWindow(hwnd) == 0 {
+            let foreground = GetWindowThreadProcessId(GetForegroundWindow(), null_mut());
+            let own = GetCurrentThreadId();
+            let attached = foreground != 0 && foreground != own && AttachThreadInput(own, foreground, 1) != 0;
+            BringWindowToTop(hwnd);
+            SetForegroundWindow(hwnd);
+            if attached {
+                AttachThreadInput(own, foreground, 0);
+            }
+        }
+    }
+}
+
+/// Whether `hwnd`, or another window of its process under the same owner (its own dialog), is
+/// in front within half a second.
+fn comes_to_front(hwnd: HWND) -> bool {
+    let in_front = || {
+        // SAFETY: plain queries (a vanished window just reads as not in front).
+        unsafe {
+            let front = GetAncestor(GetForegroundWindow(), GA_ROOT);
+            front == hwnd
+                || (!front.is_null()
+                    && window_pid(front) == window_pid(hwnd)
+                    && GetAncestor(front, GA_ROOTOWNER) == GetAncestor(hwnd, GA_ROOTOWNER))
+        }
+    };
+    for _ in 0..10 {
+        if in_front() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    in_front()
+}
+
+/// The frontmost app window of `pid`.
+fn app_window_of(pid: i32) -> Option<HWND> {
+    top_windows().into_iter().find(|(_, window)| window.pid == pid && window.is_app()).map(|(hwnd, _)| hwnd)
+}
+
+/// Brings an app back to the front (after a dialog took the focus).
+pub fn activate(pid: i32) {
+    // No input is sent (the user's click on the dialog allows it), and the helper checks the
+    // front app itself afterwards.
+    if let Some(hwnd) = app_window_of(pid) {
+        bring_to_front(hwnd, false);
+    }
+}
+
+/// The `.lnk` files of the user's and everyone's Start menu.
+fn start_menu_shortcuts() -> Vec<String> {
+    fn walk(dir: &std::path::Path, depth: usize, found: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            // Links are not followed: only folders and files the Start menu itself holds.
+            let Ok(kind) = entry.file_type() else { continue };
+            let path = entry.path();
+            if kind.is_dir() && depth > 0 {
+                walk(&path, depth - 1, found);
+            } else if kind.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk")) {
+                found.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    let mut found = Vec::new();
+    for root in ["APPDATA", "ProgramData"] {
+        if let Some(base) = std::env::var_os(root) {
+            let programs = std::path::Path::new(&base).join(r"Microsoft\Windows\Start Menu\Programs");
+            walk(&programs, SHORTCUT_DEPTH, &mut found);
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Asks the shell to start a program.
+fn shell_open(program: &str) -> Result<(), String> {
+    let (verb, file) = (wide("open"), wide(program));
+    // SAFETY: valid wide strings; COM is initialized for the call (the shell may need it) and
+    // uninitialized only when this call initialized it.
+    unsafe {
+        let initialized = CoInitializeEx(null_mut(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32);
+        let result = ShellExecuteW(null_mut(), verb.as_ptr(), file.as_ptr(), null_mut(), null_mut(), SW_SHOWNORMAL);
+        if initialized >= 0 {
+            CoUninitialize();
+        }
+        if result as isize > 32 {
+            Ok(())
+        } else {
+            Err(format!("cannot open `{program}`: Windows could not start it"))
+        }
+    }
+}
+
+/// `name` with `.exe`, as Windows names programs.
+fn with_exe(name: &str) -> String {
+    if strip_ci(name, ".exe").is_some() { name.to_string() } else { format!("{name}.exe") }
+}
+
+mod uia {
+    pub use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+}
+
+struct Apartment(bool);
+
+impl Apartment {
+    /// Joins the thread's COM apartment; a thread already in another apartment keeps it.
+    fn join() -> Apartment {
+        // SAFETY: COM initialization on this thread, balanced by Drop when it succeeded.
+        Apartment(unsafe { uia::CoInitializeEx(None, uia::COINIT_MULTITHREADED) }.is_ok())
+    }
+}
+
+impl Drop for Apartment {
+    fn drop(&mut self) {
+        if self.0 {
+            // SAFETY: balances the successful CoInitializeEx on this thread.
+            unsafe { uia::CoUninitialize() };
+        }
+    }
+}
+
+/// The program a shortcut starts, when it is a local program started with no arguments.
+fn shortcut_target(path: &str) -> Result<String, String> {
+    use windows::core::{Interface, PCWSTR};
+    use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER, STGM_READ};
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    let unreadable = || format!("cannot tell what `{path}` opens, so it was not opened.");
+    let utf16 = |units: &[u16]| String::from_utf16_lossy(&units[..units.iter().position(|&u| u == 0).unwrap_or(units.len())]);
+    // Declared first so the shell link is released before COM is left.
+    let _apartment = Apartment::join();
+    let file = wide(path);
+    // SAFETY: calls on live COM objects with buffers of the lengths passed.
+    unsafe {
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).map_err(|_| unreadable())?;
+        link.cast::<IPersistFile>().map_err(|_| unreadable())?.Load(PCWSTR(file.as_ptr()), STGM_READ).map_err(|_| unreadable())?;
+        let mut target = vec![0u16; 32768];
+        link.GetPath(&mut target, null_mut(), 0).map_err(|_| unreadable())?;
+        let mut arguments = vec![0u16; 32768];
+        link.GetArguments(&mut arguments).map_err(|_| unreadable())?;
+        let target = utf16(&target);
+        if target.trim().is_empty() {
+            return Err(unreadable());
+        }
+        executable_target(&target, &utf16(&arguments))
+    }
+}
+
+/// The program registered for `name` under App Paths (the user's entry first).
+fn app_path(name: &str) -> Option<String> {
+    let key = wide(&format!(r"Software\Microsoft\Windows\CurrentVersion\App Paths\{}", with_exe(name)));
+    for root in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+        let mut buffer = vec![0u16; 32768];
+        let mut bytes = (buffer.len() * 2) as u32;
+        // SAFETY: the buffer's size in bytes is passed and updated; REG_EXPAND_SZ is expanded.
+        let status = unsafe {
+            RegGetValueW(root, key.as_ptr(), std::ptr::null(), RRF_RT_REG_SZ, null_mut(), buffer.as_mut_ptr() as *mut c_void, &mut bytes)
+        };
+        if status == 0 {
+            let units = &buffer[..(bytes as usize / 2).min(buffer.len())];
+            return Some(String::from_utf16_lossy(units).trim_end_matches('\0').to_string());
+        }
+    }
+    None
+}
+
+/// The program `name` in an absolute folder of PATH (never the current folder).
+fn search_exe(name: &str) -> Option<String> {
+    let file = with_exe(name);
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(&file))
+        .find(|candidate| candidate.is_file())
+        .map(|found| found.to_string_lossy().into_owned())
+}
+
+fn off_limits(label: &str) -> String {
+    format!("{label} is off limits, so it was not opened.")
+}
+
+/// Opens an app, or brings it forward when it already runs, the way `open -a` does on macOS: by a
+/// running app's name or executable, else a Start menu shortcut with that name, else the program
+/// App Paths or PATH names. Whatever the route, only a program on a local drive is started, with
+/// no arguments, and never one the blocklist names.
+pub fn open_app(name: &str) -> Result<(), String> {
+    let request = request(name)?;
+    let own = std::process::id() as i32;
+    if let Request::Name(wanted) = &request {
+        for (hwnd, _) in top_windows().into_iter().filter(|(_, window)| window.is_app()) {
+            // The same identity an action aimed at the window would get (hosted pages, Store apps).
+            let id = target_of(hwnd);
+            if answers_to(wanted, &id.name, id.bundle_id.as_deref()) {
+                if let Some(label) = blocked_reason(&id, own) {
+                    return Err(off_limits(label));
+                }
+                // Only inside a session: the helper checked it just before.
+                bring_to_front(hwnd, true);
+                return if comes_to_front(hwnd) {
+                    Ok(())
+                } else {
+                    Err(format!("{} is open, but Windows kept another app in front, so it is not in front.", id.name))
+                };
+            }
+        }
+    }
+    let program = match &request {
+        Request::Path(path) if strip_ci(path, ".lnk").is_some() => shortcut_target(path)?,
+        Request::Path(path) => executable_target(path, "")?,
+        Request::Name(wanted) => match shortcut_named(wanted, &start_menu_shortcuts()) {
+            Some(shortcut) => shortcut_target(shortcut)?,
+            None => {
+                let found = app_path(wanted).or_else(|| search_exe(wanted));
+                executable_target(&found.ok_or_else(|| format!("cannot find an app named `{wanted}`"))?, "")?
+            }
+        },
+    };
+    if !std::path::Path::new(&program).is_file() {
+        return Err(format!("`{program}` does not exist, so it was not opened."));
+    }
+    if let Some(label) = blocked_name(&program) {
+        return Err(off_limits(label));
+    }
+    shell_open(&program)
+}
+
+/// Starts `program` through the shell and answers the process it started, when Windows hands
+/// its handle over and its image is the program asked for.
+fn launch_process(program: &str) -> Result<Option<i32>, String> {
+    let (verb, file) = (wide("open"), wide(program));
+    // SAFETY: valid wide strings whose vectors outlive the call; the struct is zeroed within,
+    // and the handle the shell reports is closed once.
+    unsafe {
+        let mut info = SHELLEXECUTEINFOW {
+            cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_NOCLOSEPROCESS,
+            lpVerb: verb.as_ptr(),
+            lpFile: file.as_ptr(),
+            nShow: SW_SHOWNORMAL,
+            ..zeroed()
+        };
+        if ShellExecuteExW(&mut info) == 0 {
+            return Err(format!("cannot open `{program}`: Windows could not start it"));
+        }
+        if info.hProcess.is_null() {
+            return Ok(None);
+        }
+        // A plain query on the handle the shell just reported.
+        let pid = GetProcessId(info.hProcess) as i32;
+        CloseHandle(info.hProcess);
+        let proven = process_path(pid).is_some_and(|path| path.eq_ignore_ascii_case(program));
+        Ok(proven.then_some(pid))
+    }
+}
+
+/// The identity of an app window that appeared after `before` and answers `wanted`, within
+/// three seconds: the fallback when the shell does not hand over the process it started (a
+/// Store app started through an alias, say).
+fn new_app_identity(before: &[i32], wanted: &dyn Fn(&AppIdentity) -> bool) -> Option<AppIdentity> {
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        for (hwnd, window) in top_windows().into_iter().filter(|(_, window)| window.is_app()) {
+            if before.contains(&window.pid) {
+                continue;
+            }
+            let id = target_of(hwnd);
+            if wanted(&id) {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+/// Opens an app like `open_app`, and answers which app that is: the identity of the process
+/// Windows started when the shell hands it over and its image is the program asked for, or of
+/// the app window that appeared for it. `None` when neither is proven, so nothing is accepted
+/// on the answer (S5: the identity is never inferred from whatever window happens to be front).
+pub fn open_app_identified(name: &str) -> Result<Option<AppIdentity>, String> {
+    let request = request(name)?;
+    let own = std::process::id() as i32;
+    if let Request::Name(wanted) = &request {
+        for (hwnd, _) in top_windows().into_iter().filter(|(_, window)| window.is_app()) {
+            let id = target_of(hwnd);
+            if answers_to(wanted, &id.name, id.bundle_id.as_deref()) {
+                if let Some(label) = blocked_reason(&id, own) {
+                    return Err(off_limits(label));
+                }
+                bring_to_front(hwnd, true);
+                return if comes_to_front(hwnd) {
+                    Ok(Some(target_of(hwnd)))
+                } else {
+                    Err(format!("{} is open, but Windows kept another app in front, so it is not in front.", id.name))
+                };
+            }
+        }
+    }
+    let program = match &request {
+        Request::Path(path) if strip_ci(path, ".lnk").is_some() => shortcut_target(path)?,
+        Request::Path(path) => executable_target(path, "")?,
+        Request::Name(wanted) => match shortcut_named(wanted, &start_menu_shortcuts()) {
+            Some(shortcut) => shortcut_target(shortcut)?,
+            None => {
+                let found = app_path(wanted).or_else(|| search_exe(wanted));
+                executable_target(&found.ok_or_else(|| format!("cannot find an app named `{wanted}`"))?, "")?
+            }
+        },
+    };
+    if !std::path::Path::new(&program).is_file() {
+        return Err(format!("`{program}` does not exist, so it was not opened."));
+    }
+    if let Some(label) = blocked_name(&program) {
+        return Err(off_limits(label));
+    }
+    let before: Vec<i32> = top_windows().into_iter().filter(|(_, window)| window.is_app()).map(|(_, window)| window.pid).collect();
+    let expected = |id: &AppIdentity| match &request {
+        // A window of the app asked for by name: the same predicate as the running branch.
+        Request::Name(wanted) => answers_to(wanted, &id.name, id.bundle_id.as_deref()),
+        // The program asked for by path: its executable's file name.
+        Request::Path(_) => {
+            let exe = program.rsplit('\\').next().unwrap_or(&program);
+            id.bundle_id.as_deref().is_some_and(|found| found.eq_ignore_ascii_case(exe))
+        }
+    };
+    match launch_process(&program)? {
+        Some(pid) => Ok(Some(identity(pid))),
+        None => Ok(new_app_identity(&before, &expected).filter(|id| blocked_reason(id, own).is_none())),
+    }
+}
+
 /// These need the user's interactive desktop (not an SSH or service session): they take a real
 /// screenshot and move the real pointer, then put it back.
 #[cfg(test)]
@@ -592,6 +949,90 @@ mod tests {
         use windows_sys::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
         // SAFETY: plain call; the app itself is already per-monitor aware.
         unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    }
+
+    /// Opens Notepad, then asks for it again: the open window comes to the front, no second one
+    /// opens. Needs no Notepad open before; closes the windows it opened (an unsaved one asks).
+    #[test]
+    #[ignore = "interactive Windows desktop: run in the user's own session"]
+    fn opening_a_running_app_brings_its_window_to_the_front() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+        let notepads = || -> Vec<usize> {
+            top_windows()
+                .into_iter()
+                .filter(|(hwnd, window)| {
+                    window.is_app() && target_of(*hwnd).bundle_id.as_deref().is_some_and(|exe| exe.eq_ignore_ascii_case("Notepad.exe"))
+                })
+                .map(|(hwnd, _)| hwnd as usize)
+                .collect()
+        };
+        let before = notepads();
+        // It closes the windows it opens: with another Notepad open, which ones are its own is
+        // unknown, so it does not run.
+        assert!(before.is_empty(), "close every Notepad window first");
+        let close_new = |now: &[usize]| {
+            for hwnd in now.iter().filter(|hwnd| !before.contains(hwnd)) {
+                // SAFETY: a plain message to a window this test opened.
+                unsafe { PostMessageW(*hwnd as HWND, WM_CLOSE, 0, 0) };
+            }
+        };
+        open_app("notepad.exe").expect("Notepad opens");
+        let mut first = notepads();
+        for _ in 0..50 {
+            if first.len() > before.len() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            first = notepads();
+        }
+        eprintln!("before {before:x?}, after the first open {first:x?}, front {:?}", frontmost_app());
+        open_app("notepad.exe").expect("Notepad is found");
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let second = notepads();
+        let front = frontmost_app();
+        eprintln!("after the second open {second:x?}, front {front:?}");
+        close_new(&second);
+        assert_eq!(first.len(), before.len() + 1, "the first open_app opens one window");
+        assert_eq!(second, first, "the second open_app opens no other window");
+        assert_eq!(front.and_then(|app| app.bundle_id).as_deref(), Some("Notepad.exe"), "Notepad is in front");
+    }
+
+    /// `open_app_identified` answers the app Windows started for the request, proven by the
+    /// process image or by the app window that appeared; a proven identity is the requested
+    /// app's, never whatever else is front. Closes the windows it opened.
+    #[test]
+    #[ignore = "interactive Windows desktop: run in the user's own session"]
+    fn an_opened_app_is_identified_by_the_program_windows_started() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+        let notepads = || -> Vec<usize> {
+            top_windows()
+                .into_iter()
+                .filter(|(hwnd, window)| {
+                    window.is_app() && target_of(*hwnd).bundle_id.as_deref().is_some_and(|exe| exe.eq_ignore_ascii_case("Notepad.exe"))
+                })
+                .map(|(hwnd, _)| hwnd as usize)
+                .collect()
+        };
+        let before = notepads();
+        assert!(before.is_empty(), "close every Notepad window first");
+        let identified = open_app_identified("notepad").expect("Notepad opens");
+        let mut opened = notepads();
+        for _ in 0..50 {
+            if opened.len() > before.len() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            opened = notepads();
+        }
+        for hwnd in opened.iter().filter(|hwnd| !before.contains(hwnd)) {
+            // SAFETY: a plain message to a window this test opened.
+            unsafe { PostMessageW(*hwnd as HWND, WM_CLOSE, 0, 0) };
+        }
+        let id = identified.expect("the opened app is identified");
+        assert!(
+            id.bundle_id.as_deref().is_some_and(|exe| exe.eq_ignore_ascii_case("Notepad.exe")),
+            "the identity is Notepad's, not whatever is front: {id:?}"
+        );
     }
 
     #[test]
