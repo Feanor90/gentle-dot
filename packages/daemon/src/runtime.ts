@@ -4,12 +4,24 @@ import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
 /**
+ * A root Win32 canonicalized keeps its verbatim prefix (`\\?\C:\…`, or `\\?\UNC\server\share`).
+ * Win32 wants it; Node does not. Handed to `spawn` as the engine's entry, a verbatim path is taken
+ * by Node's module resolver as a bare drive (`C:`) and fails with `EISDIR`, which is exactly what an
+ * installed copy did (W30): the app's `resource_dir()` is canonicalized, so the root arrives that way.
+ */
+function withoutVerbatim(root: string): string {
+	if (root.startsWith("\\\\?\\UNC\\")) return `\\\\${root.slice(8)}`;
+	if (root.startsWith("\\\\?\\")) return root.slice(4);
+	return root;
+}
+
+/**
  * The installed app's runtime folder (`GENTLE_DOT_RUNTIME`), or undefined in a
  * source checkout. It holds `node/`, `bin/` (`engram`, `pi`),
  * `daemon/` (this bundle and its `node_modules/`) and `ui/`.
  */
 export function runtimeDir(env: NodeJS.ProcessEnv = process.env): string | undefined {
-	return env.GENTLE_DOT_RUNTIME ? resolve(env.GENTLE_DOT_RUNTIME) : undefined;
+	return env.GENTLE_DOT_RUNTIME ? resolve(withoutVerbatim(env.GENTLE_DOT_RUNTIME)) : undefined;
 }
 
 /** The runtime's flat install of the daemon's external dependencies. */

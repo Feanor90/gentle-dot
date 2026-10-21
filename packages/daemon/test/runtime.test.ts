@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.ts";
 import { bundledMcpCli } from "../src/connectors.ts";
 import { isolatedAgentEnv } from "../src/isolation.ts";
-import { engramBinaryName, resolveEngramBin } from "../src/runtime.ts";
+import { engramBinaryName, resolveEngramBin, runtimeDir } from "../src/runtime.ts";
 import { tempDir } from "./helpers.ts";
 
 const PACKAGE = fileURLToPath(new URL("..", import.meta.url));
@@ -105,6 +105,30 @@ describe("installed runtime (GENTLE_DOT_RUNTIME)", () => {
 			return;
 		}
 		expect(env.ENGRAM_BIN).toBe(userEngram);
+	});
+});
+
+describe("runtimeDir", () => {
+	// Tauri hands the runtime root over canonicalized, and on Windows that is the verbatim form
+	// (`\\?\C:\…`). Node's module resolver cannot take it: handed to `spawn` as the engine's
+	// entry it collapses to a bare drive (`C:`) and dies with EISDIR, which is what an installed
+	// copy did (W30). Win32 needs the prefix; Node does not.
+	it.runIf(process.platform === "win32")("drops the verbatim prefix Windows canonical paths carry", () => {
+		expect(runtimeDir({ GENTLE_DOT_RUNTIME: "\\\\?\\C:\\Users\\me\\Gentle Dot\\runtime" })).toBe(
+			"C:\\Users\\me\\Gentle Dot\\runtime",
+		);
+	});
+
+	it.runIf(process.platform === "win32")("turns a verbatim UNC root back into a UNC path", () => {
+		expect(runtimeDir({ GENTLE_DOT_RUNTIME: "\\\\?\\UNC\\server\\share\\runtime" })).toBe(
+			"\\\\server\\share\\runtime",
+		);
+	});
+
+	it("leaves an ordinary root alone, and reports no runtime without one", () => {
+		const root = join(process.cwd(), "runtime-stub");
+		expect(runtimeDir({ GENTLE_DOT_RUNTIME: root })).toBe(root);
+		expect(runtimeDir({})).toBeUndefined();
 	});
 });
 
