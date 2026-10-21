@@ -22,6 +22,8 @@ pub mod risk;
 pub mod server;
 pub mod session;
 pub mod windows;
+#[cfg(any(windows, test))]
+pub mod winput;
 pub mod working;
 
 use blocklist::AppIdentity;
