@@ -263,4 +263,11 @@ mod tests {
             Err("`control.exe /name Microsoft.CredentialManager` is not an app name: command lines cannot be run.".into())
         );
     }
+
+    #[test]
+    fn control_exe_style_paths_and_protocols_never_become_a_launch() {
+        assert!(request(r"C:\Windows\System32\control.exe /name Microsoft.CredentialManager").is_err());
+        assert!(request("ms-settings:privacy").is_err());
+        assert!(executable_target(r"C:\Windows\System32\control.exe", "/name x").is_err());
+    }
 }

@@ -6,6 +6,16 @@
 //!
 //! Points are physical pixels of the virtual screen: the app is per-monitor DPI aware, so the
 //! pointer, the monitors, and `SendInput` all use them.
+//!
+//! Apps are processes with a taskbar window (`winapps`). An app's identity is its process:
+//! the executable's file name stands for the macOS bundle id, and its file description for the
+//! app name. Store apps draw inside a frame window owned by `ApplicationFrameHost.exe`; their
+//! identity is the process of the frame's core window, so Settings is Settings, not its host.
+//! An app Windows will not identify (a process that cannot be queried, a frame whose app is
+//! not found) is the blocked `UNIDENTIFIED` app, so an action aimed at it is refused.
+//!
+//! Elements come from UI Automation (`winaccess` maps them), with a 0.5 s timeout so a hung app
+//! cannot stall the helper, as the Accessibility timeout does on macOS.
 
 use super::blocklist::{blocked_name, blocked_reason, AppIdentity, UNIDENTIFIED};
 use super::coords::{fit_long_edge, Point, ScreenshotGeometry, MAX_LONG_EDGE};
@@ -1448,6 +1458,14 @@ mod tests {
             id.bundle_id.as_deref().is_some_and(|exe| exe.eq_ignore_ascii_case("Notepad.exe")),
             "the identity is Notepad's, not whatever is front: {id:?}"
         );
+    }
+
+    #[test]
+    fn open_paths_refuse_protocols_and_command_lines_before_any_launch() {
+        let err = |r: Result<(), String>| r.unwrap_err();
+        assert!(err(open_app("ms-settings:")).contains("protocols"));
+        assert!(err(open_app("control.exe /name Microsoft.CredentialManager")).contains("command lines"));
+        assert!(open_app_identified("ms-settings:").is_err());
     }
 
     #[test]
