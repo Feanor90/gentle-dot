@@ -9,11 +9,12 @@
 
 use super::coords::{fit_long_edge, Point, ScreenshotGeometry, MAX_LONG_EDGE};
 use super::encode::{bgra_to_jpeg, JPEG_QUALITY};
-use super::winput::VirtualScreen;
-use super::Capture;
+use super::winput::{releases, steps, Step, VirtualScreen};
+use super::{Capture, InputEvent, MouseButton};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
+use std::time::Duration;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows_sys::Win32::Graphics::Dwm::DwmFlush;
 use windows_sys::Win32::Graphics::Gdi::{
@@ -21,12 +22,21 @@ use windows_sys::Win32::Graphics::Gdi::{
     ReleaseDC, SelectObject, SetBrushOrgEx, SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
     CAPTUREBLT, DIB_RGB_COLORS, HALFTONE, HBITMAP, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, SRCCOPY,
 };
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    SendInput, INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
+    KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+    MOUSEINPUT,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DrawIconEx, EnumWindows, GetCursorInfo, GetCursorPos, GetIconInfo, GetSystemMetrics, GetWindowDisplayAffinity,
     GetWindowThreadProcessId, IsWindowVisible, SetWindowDisplayAffinity, CURSORINFO, CURSOR_SHOWING, DI_NORMAL,
     ICONINFO, SM_CXCURSOR, SM_CXVIRTUALSCREEN, SM_CYCURSOR, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
 };
+
+/// Pause between the events of one action, so apps see distinct presses (as on macOS).
+const EVENT_GAP: Duration = Duration::from_millis(15);
 
 /// A monitor's rectangle in physical pixels of the virtual screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +82,72 @@ pub fn monitor_at(at: Point) -> Option<MonitorFrame> {
         let RECT { left, top, right, bottom } = info.rcMonitor;
         Some(MonitorFrame { x: left, y: top, width: right - left, height: bottom - top })
     }
+}
+
+fn input(step: Step) -> INPUT {
+    let mouse = |dx, dy, data: i32, flags| INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: windows_sys::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
+            mi: MOUSEINPUT { dx, dy, mouseData: data as _, dwFlags: flags, time: 0, dwExtraInfo: 0 },
+        },
+    };
+    let keyboard = |vk: u16, scan: u16, flags| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: windows_sys::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
+            ki: KEYBDINPUT { wVk: vk, wScan: scan, dwFlags: flags, time: 0, dwExtraInfo: 0 },
+        },
+    };
+    match step {
+        Step::Move { x, y } => mouse(x, y, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK),
+        Step::Button { button, down } => {
+            let flags = match (button, down) {
+                (MouseButton::Left, true) => MOUSEEVENTF_LEFTDOWN,
+                (MouseButton::Left, false) => MOUSEEVENTF_LEFTUP,
+                (MouseButton::Right, true) => MOUSEEVENTF_RIGHTDOWN,
+                (MouseButton::Right, false) => MOUSEEVENTF_RIGHTUP,
+            };
+            mouse(0, 0, 0, flags)
+        }
+        Step::Wheel { horizontal, delta } => {
+            mouse(0, 0, delta, if horizontal { MOUSEEVENTF_HWHEEL } else { MOUSEEVENTF_WHEEL })
+        }
+        Step::Key { vk, down, extended } => {
+            let mut flags = if down { 0 } else { KEYEVENTF_KEYUP };
+            if extended {
+                flags |= KEYEVENTF_EXTENDEDKEY;
+            }
+            keyboard(vk, 0, flags)
+        }
+        Step::Unicode { unit, down } => {
+            keyboard(0, unit, KEYEVENTF_UNICODE | if down { 0 } else { KEYEVENTF_KEYUP })
+        }
+    }
+}
+
+fn send(step: Step) -> Result<(), String> {
+    let record = input(step);
+    // SAFETY: one valid INPUT record of the size passed.
+    if unsafe { SendInput(1, &record, size_of::<INPUT>() as i32) } == 1 {
+        Ok(())
+    } else {
+        Err(format!("Windows refused the input: {}", std::io::Error::last_os_error()))
+    }
+}
+
+/// Posts `event`, one input at a time with a short gap, like the macOS helper. When an input
+/// fails halfway, whatever it left pressed is released before the error is reported.
+pub fn post(event: &InputEvent) -> Result<(), String> {
+    let plan = steps(event, &virtual_screen())?;
+    for (done, step) in plan.iter().enumerate() {
+        if let Err(error) = send(*step) {
+            for release in releases(&plan[..done]) {
+                let _ = send(release);
+            }
+            return Err(error);
+        }
+        std::thread::sleep(EVENT_GAP);
+    }
+    Ok(())
 }
 
 /// The process that created `hwnd`, or 0.
@@ -287,5 +363,19 @@ mod tests {
         assert_eq!(capture.geometry.origin, Point { x: f64::from(frame.x), y: f64::from(frame.y) });
         let first = *image.get_pixel(0, 0);
         assert!(image.pixels().any(|p| *p != first), "a real desktop is not one flat color");
+    }
+
+    #[test]
+    #[ignore = "interactive Windows desktop: run in the user's own session"]
+    fn a_move_lands_on_the_pixel_asked_for_and_the_pointer_is_put_back() {
+        per_monitor_aware();
+        let start = pointer_location().unwrap();
+        let frame = monitor_at(start).unwrap();
+        let target = Point { x: f64::from(frame.x + frame.width / 3), y: f64::from(frame.y + frame.height / 3) };
+        post(&InputEvent::Move(target)).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let landed = pointer_location().unwrap();
+        post(&InputEvent::Move(start)).unwrap();
+        assert!((landed.x - target.x).abs() <= 1.0 && (landed.y - target.y).abs() <= 1.0, "{landed:?} != {target:?}");
     }
 }
