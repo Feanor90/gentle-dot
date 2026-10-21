@@ -8,12 +8,12 @@
 //! - `Recognizer` turns that PCM into partial and final text. Apple's Speech framework
 //!   (`macos::AppleSpeech`) is the default on macOS; the optional local model (S30.5,
 //!   `parakeet::Parakeet`, NVIDIA Parakeet through sherpa-onnx) is preferred once the user has
-//!   downloaded it (`model`), and it is the only engine on Linux (`engine::Preferred`).
+//!   downloaded it (`model`), and it is the only engine on Linux and Windows (`engine::Preferred`).
 //!
 //! `Voice` is the pure state machine between them (idle → starting → recording → stopping,
 //! single flight, cancel, error mapping, level throttling, locale fallback), tested on every OS
 //! with fakes. The objc2 bindings live in `macos`; Linux records through a command-line recorder
-//! (`pipe`); elsewhere the commands answer "unavailable".
+//! (`pipe`); Windows uses shared/event-driven WASAPI (`win_mic`).
 //!
 //! SpeechAnalyzer/SpeechTranscriber (macOS 26) are Swift-only, with no Objective-C interface to
 //! bind from Rust, and the app supports macOS 12.3, so `SFSpeechRecognizer` is the recognizer.
@@ -21,6 +21,10 @@
 pub mod app;
 pub mod audio;
 pub mod engine;
+#[cfg(target_os = "windows")]
+mod win_audio;
+#[cfg(target_os = "windows")]
+mod win_mic;
 #[cfg(test)]
 mod fake;
 pub mod locale;
@@ -47,7 +51,7 @@ pub const PARTIAL_EVENT: &str = "voice://partial";
 pub const LEVEL_EVENT: &str = "voice://level";
 /// A failure while recording (permission, recognizer, interruption): `{message}`.
 pub const ERROR_EVENT: &str = "voice://error";
-pub const UNSUPPORTED: &str = "Voice input is available on macOS and Linux.";
+pub const UNSUPPORTED: &str = "Voice input is available on macOS, Linux and Windows.";
 
 /// The `voice_status` reply: `{available, reason?}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -102,7 +106,7 @@ impl VoiceEvent {
 /// Delivers events to the webview that started the recording; called from any thread.
 pub type Events = Arc<dyn Fn(VoiceEvent) + Send + Sync>;
 
-/// A macOS privacy permission, as the system reports it.
+/// A privacy permission, as the system reports it (macOS; the Windows microphone switches).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Authorization {
     NotDetermined,
@@ -123,7 +127,7 @@ pub enum VoiceError {
     MicrophoneDenied,
     MicrophoneRestricted,
     NoRecognizer(String),
-    /// The local model is the only engine here (Linux) and it is not downloaded.
+    /// The local model is the only engine here (Linux/Windows) and it is not downloaded.
     NoModel,
     NoMicrophone,
     /// Linux: neither `parec` nor `arecord` is installed.
@@ -131,6 +135,17 @@ pub enum VoiceError {
     Interrupted,
     Failed(String),
 }
+
+#[cfg(not(target_os = "windows"))]
+const MICROPHONE_DENIED: &str =
+    "Microphone access is off for Gentle Dot. Turn it on in System Settings → Privacy & Security → Microphone.";
+#[cfg(not(target_os = "windows"))]
+const MICROPHONE_RESTRICTED: &str = "Microphone access is restricted on this Mac.";
+#[cfg(target_os = "windows")]
+const MICROPHONE_DENIED: &str = "Microphone access is off for Gentle Dot. Turn on Microphone access and Let desktop apps access your microphone in Windows Settings → Privacy & security → Microphone.";
+#[cfg(target_os = "windows")]
+const MICROPHONE_RESTRICTED: &str =
+    "Microphone access for desktop apps is turned off by a Windows policy on this PC. Ask your administrator to allow it.";
 
 impl fmt::Display for VoiceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -144,10 +159,8 @@ impl fmt::Display for VoiceError {
                 "Speech Recognition is off for Gentle Dot. Turn it on in System Settings → Privacy & Security → Speech Recognition.",
             ),
             VoiceError::SpeechRestricted => f.write_str("Speech Recognition is restricted on this Mac."),
-            VoiceError::MicrophoneDenied => f.write_str(
-                "Microphone access is off for Gentle Dot. Turn it on in System Settings → Privacy & Security → Microphone.",
-            ),
-            VoiceError::MicrophoneRestricted => f.write_str("Microphone access is restricted on this Mac."),
+            VoiceError::MicrophoneDenied => f.write_str(MICROPHONE_DENIED),
+            VoiceError::MicrophoneRestricted => f.write_str(MICROPHONE_RESTRICTED),
             VoiceError::NoRecognizer(locale) => write!(f, "Speech recognition is not available for {locale}."),
             VoiceError::NoModel => f.write_str("Download the local voice model to use voice input."),
             VoiceError::NoMicrophone => f.write_str("No microphone is available."),
@@ -261,7 +274,7 @@ mod tests {
         assert_eq!(serde_json::to_value(VoiceStatus::available()).unwrap(), serde_json::json!({"available": true}));
         assert_eq!(
             serde_json::to_value(VoiceStatus::unavailable(UNSUPPORTED)).unwrap(),
-            serde_json::json!({"available": false, "reason": "Voice input is available on macOS and Linux."})
+            serde_json::json!({"available": false, "reason": "Voice input is available on macOS, Linux and Windows."})
         );
     }
 

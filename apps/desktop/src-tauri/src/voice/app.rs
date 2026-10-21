@@ -1,13 +1,13 @@
 //! The app side of voice input (S30.1, L88) and of the optional local model (S30.5): the
 //! `voice_*` commands and the `voice://*` events. Recording events go only to the webview that
 //! started the recording; `voice://model` events go to the panel. On macOS, Apple Speech records
-//! until the local model is installed; on Linux, the local model is the only engine; elsewhere
+//! until the local model is installed; on Linux and Windows, the local model is the only engine; elsewhere
 //! `voice_status` answers "unavailable" and the other recording commands fail. Every command
 //! runs on a blocking thread: starting may wait on a permission prompt, stopping waits for the
 //! final transcript, and removing the model deletes files.
 
 use super::engine::fallback_engine;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use super::engine::Preferred;
 use super::model::{HttpFetcher, ModelError, ModelEvent, ModelEvents, ModelManager, ModelSpec, ModelStatus, MODEL_EVENT};
 use super::parakeet::{self, Loader, Locate, Parakeet};
@@ -120,7 +120,7 @@ pub fn start(app: &AppHandle) -> (VoiceInput, VoiceModel) {
 }
 
 /// macOS: the native microphone, Parakeet when installed, else Apple Speech. Linux: a
-/// command-line recorder and Parakeet. Elsewhere: nothing.
+/// command-line recorder and Parakeet. Windows: WASAPI and Parakeet, no Apple fallback.
 fn platform_input(local: Arc<Parakeet>) -> VoiceInput {
     #[cfg(target_os = "macos")]
     return VoiceInput::new(Voice::new(
@@ -134,7 +134,13 @@ fn platform_input(local: Arc<Parakeet>) -> VoiceInput {
         Arc::new(Preferred::new(local, None)),
         Arc::new(SystemClock),
     ));
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    return VoiceInput::new(Voice::new(
+        Arc::new(super::win_mic::WinMicrophone),
+        Arc::new(Preferred::new(local, None)),
+        Arc::new(SystemClock),
+    ));
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = local;
         VoiceInput::unsupported()
@@ -230,7 +236,17 @@ mod tests {
         assert_eq!(input.start(None, Arc::new(|_| {})), Err(VoiceError::Unsupported));
         assert_eq!(input.stop(), Err(VoiceError::Unsupported));
         assert_eq!(input.cancel(), Err(VoiceError::Unsupported));
-        assert_eq!(String::from(VoiceError::Unsupported), "Voice input is available on macOS and Linux.");
+        assert_eq!(String::from(VoiceError::Unsupported), "Voice input is available on macOS, Linux and Windows.");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_requires_the_local_model_without_an_apple_fallback() {
+        let local = Arc::new(Parakeet::new(Arc::new(|| None), Arc::new(|_| panic!("no model or device access"))));
+        let input = platform_input(local);
+        assert_eq!(input.status(), VoiceStatus::unavailable(VoiceError::NoModel.to_string()));
+        assert_eq!(input.start(None, Arc::new(|_| {})), Err(VoiceError::NoModel));
+        assert_eq!(input.cancel(), Ok(()));
     }
 
     #[test]
