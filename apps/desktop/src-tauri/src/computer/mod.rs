@@ -94,10 +94,15 @@ pub trait Desktop: Send + Sync {
     fn capture(&self) -> Result<Capture, String>;
     fn post(&self, event: &InputEvent) -> Result<(), String>;
     fn list_apps(&self) -> Result<Vec<AppInfo>, String>;
-    /// Opens (or activates) an app by name or bundle id. Returns native identity of the
-    /// requested app, never inferred from the foreground. None means opening succeeded but
-    /// identity is unavailable: it must not authorize keyboard input without a screenshot.
-    fn open_app(&self, name: &str) -> Result<Option<AppIdentity>, String>;
+    /// Opens (or activates) an app by name or bundle id.
+    fn open_app(&self, name: &str) -> Result<(), String>;
+    /// Native identity of the requested app, never inferred from the foreground.
+    /// Backends without verified identity cannot authorize a keyboard target.
+    #[cfg(windows)]
+    fn open_app_identified(&self, name: &str) -> Result<Option<AppIdentity>, String> {
+        self.open_app(name)?;
+        Ok(None)
+    }
     /// The Accessibility element at a point, then its ancestors; empty when unknown.
     fn element_at(&self, at: Point) -> Vec<AxElement>;
     fn focused_element(&self) -> Option<Focus>;

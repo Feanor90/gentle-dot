@@ -15,7 +15,7 @@ use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{available, msg_send, AnyThread};
-use objc2_app_kit::{NSApplicationActivationOptions, NSApplicationActivationPolicy, NSRunningApplication, NSWorkspace, NSWorkspaceOpenConfiguration};
+use objc2_app_kit::{NSApplicationActivationOptions, NSApplicationActivationPolicy, NSRunningApplication, NSWorkspace};
 use objc2_application_services::{
     AXError, AXIsProcessTrusted, AXIsProcessTrustedWithOptions, AXUIElement, AXValue, AXValueType,
 };
@@ -27,7 +27,7 @@ use objc2_core_graphics::{
     CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess, CGScrollEventUnit, CGWindowListCopyWindowInfo,
     CGWindowListOption,
 };
-use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSString, NSURL};
+use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSString};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration, SCWindow,
 };
@@ -526,38 +526,19 @@ impl Desktop for MacDesktop {
             .collect())
     }
 
-    fn open_app(&self, name: &str) -> Result<Option<AppIdentity>, String> {
-        let workspace = NSWorkspace::sharedWorkspace();
-        let requested = NSString::from_str(name);
+    fn open_app(&self, name: &str) -> Result<(), String> {
+        // A bundle id has dots and no spaces; anything else is an app name.
         let by_bundle = name.contains('.') && !name.contains(' ') && !name.ends_with(".app");
-        let url = if by_bundle {
-            workspace.URLForApplicationWithBundleIdentifier(&requested)
+        let output = std::process::Command::new("/usr/bin/open")
+            .arg(if by_bundle { "-b" } else { "-a" })
+            .arg(name)
+            .output()
+            .map_err(|e| format!("cannot run `open`: {e}"))?;
+        if output.status.success() {
+            Ok(())
         } else {
-            // The replacement resolves bundle identifiers only. Keep native name/path lookup
-            // for the existing name-based tool, but launch only its concrete resolved URL.
-            #[allow(deprecated)]
-            let path = workspace.fullPathForApplication(&requested);
-            path.map(|path| NSURL::fileURLWithPath(&path))
-        };
-        let url = url.ok_or_else(|| format!("cannot open `{name}`: macOS could not resolve the requested application"))?;
-        let (tx, rx) = mpsc::channel();
-        let handler = RcBlock::new(move |app: *mut NSRunningApplication, error: *mut NSError| {
-            // SAFETY: NSWorkspace supplies live nullable objects during this callback. Only
-            // owned Rust data crosses threads; no borrowed object or stack pointer escapes.
-            let result = unsafe { error.as_ref() }
-                .map(|error| Err(error.localizedDescription().to_string()))
-                .unwrap_or_else(|| Ok(unsafe { app.as_ref() }.map(identity).filter(|app| app.pid > 0)));
-            let _ = tx.send(result);
-        });
-        let config = NSWorkspaceOpenConfiguration::new();
-        // Do not substitute a running copy from a different installation for this URL.
-        config.setAllowsRunningApplicationSubstitution(false);
-        workspace.openApplicationAtURL_configuration_completionHandler(&url, &config, Some(&handler));
-        // NSWorkspace copies the completion block for asynchronous delivery. The block owns
-        // its sender, so a late callback after this bounded wait safely finds a closed receiver.
-        rx.recv_timeout(CAPTURE_TIMEOUT)
-            .map_err(|_| format!("cannot verify opening `{name}`: macOS launch timed out; take a screenshot before typing"))?
-            .map_err(|error| format!("cannot open `{name}`: {error}"))
+            Err(format!("cannot open `{name}`: {}", String::from_utf8_lossy(&output.stderr).trim()))
+        }
     }
 
     fn element_at(&self, at: Point) -> Vec<AxElement> {

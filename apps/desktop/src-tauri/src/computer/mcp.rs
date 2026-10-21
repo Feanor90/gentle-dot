@@ -35,7 +35,9 @@ const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 /// Time for the screen to settle before the screenshot that follows an action.
 const SETTLE_MS: u64 = 150;
 /// Bounded focus restoration after a native confirmation.
+#[cfg(windows)]
 const RESTORE_TRIES: u32 = 10;
+#[cfg(windows)]
 const RESTORE_STEP_MS: u64 = 50;
 const OPEN_APP_SETTLE_MS: u64 = 1500;
 const MAX_BATCH_STEPS: usize = 20;
@@ -56,7 +58,15 @@ const NEEDS_SCREENSHOT: &str = "Take a screenshot first: coordinates are pixels 
 const UNKNOWN_TARGET: &str = "Cannot tell which app is under that point, so the action was refused. \
 Take a new screenshot and try again.";
 
+#[cfg(not(windows))]
 const INSTRUCTIONS: &str = "Controls this Mac. Take a screenshot first; x and y are pixels of the latest \
+screenshot. Every action returns a fresh screenshot. Use `batch` for a predictable sequence (click a field, \
+type, press tab, type, press return) so it runs in one call; end the batch whenever you must see the screen \
+before deciding the next step. The user must allow a session, risky actions ask the user to confirm, and \
+some apps (System Settings, password managers) are off limits.";
+
+#[cfg(windows)]
+const INSTRUCTIONS: &str = "Controls this PC. Take a screenshot first; x and y are pixels of the latest \
 screenshot. Every action returns a fresh screenshot. Use `batch` for a predictable sequence (click a field, \
 type, press tab, type, press return) so it runs in one call; end the batch whenever you must see the screen \
 before deciding the next step. The user must allow a session, risky actions ask the user to confirm, and \
@@ -162,6 +172,10 @@ fn coordinate(description: &str) -> Value {
 fn tools() -> Value {
     let x = coordinate("Pixels from the left edge of the latest screenshot.");
     let y = coordinate("Pixels from the top edge of the latest screenshot.");
+    #[cfg(not(windows))]
+    let open_description = "Open or bring forward an app by name or bundle id.";
+    #[cfg(windows)]
+    let open_description = "Open or bring forward an app by name or bundle id. In a batch, following keys require native identity of that app; otherwise take a screenshot first.";
     json!([
         {"name": "screenshot", "description": "Take a screenshot of the display under the pointer. Returns the image and its size.",
          "inputSchema": schema(json!({}), &[])},
@@ -179,7 +193,7 @@ fn tools() -> Value {
          "inputSchema": schema(json!({"text": {"type": "string"}}), &["text"])},
         {"name": "key", "description": "Press a key combo in the frontmost app, for example `cmd+shift+t`, `return`, or `esc`.",
          "inputSchema": schema(json!({"combo": {"type": "string"}}), &["combo"])},
-        {"name": "open_app", "description": "Open or bring forward an app by name or bundle id. In a batch, following keys require native identity of that app; otherwise take a screenshot first.",
+        {"name": "open_app", "description": open_description,
          "inputSchema": schema(json!({"name": {"type": "string"}}), &["name"])},
         {"name": "list_apps", "description": "List the running apps.",
          "inputSchema": schema(json!({}), &[])},
@@ -335,10 +349,13 @@ pub struct Helper {
     /// Serializes actions and holds the geometry of the latest screenshot.
     actions: Mutex<Option<ScreenshotGeometry>>,
     /// Keys and text may target only the app of the latest screenshot.
+    #[cfg(windows)]
     seen_front: Mutex<Option<i32>>,
     /// A validated click/drag target, or the natively identified requested app.
+    #[cfg(windows)]
     accepted_front: Mutex<Option<i32>>,
     /// Requested app identity from the native launch, consumed after the settle wait.
+    #[cfg(windows)]
     pending_open: Mutex<Option<AppIdentity>>,
     /// Where an action that went through acted (S28); must return at once.
     glow: Box<dyn Fn(Mark) + Send + Sync>,
@@ -364,8 +381,11 @@ impl Helper {
             own_pid,
             limiter: Mutex::new(RateLimiter::new(MAX_ACTIONS_PER_SECOND, 1000)),
             actions: Mutex::new(None),
+            #[cfg(windows)]
             seen_front: Mutex::new(None),
+            #[cfg(windows)]
             accepted_front: Mutex::new(None),
+            #[cfg(windows)]
             pending_open: Mutex::new(None),
             glow: Box::new(|_| {}),
             working: Arc::new(NoPreparation),
@@ -465,9 +485,12 @@ impl Helper {
         if !self.control.is_active(self.clock.now_ms()) {
             // The screenshot of an ended session no longer describes the screen.
             *latest = None;
-            *lock(&self.seen_front) = None;
-            *lock(&self.accepted_front) = None;
-            *lock(&self.pending_open) = None;
+            #[cfg(windows)]
+            { *lock(&self.seen_front) = None; }
+            #[cfg(windows)]
+            { *lock(&self.accepted_front) = None; }
+            #[cfg(windows)]
+            { *lock(&self.pending_open) = None; }
             if !self.with_dialog(|| self.dialogs.ask_grant()) {
                 return Err(NOT_ALLOWED.into());
             }
@@ -552,6 +575,14 @@ impl Helper {
     }
 
     /// The app owning the window under `at`, refused when blocked or unknown.
+    #[cfg(not(windows))]
+    fn pointer_target(&self, at: Point) -> Result<String, String> {
+        let app = self.desktop.window_owner_at(at).ok_or(UNKNOWN_TARGET)?;
+        self.refuse_blocked(&app).map(|()| app.name)
+    }
+
+
+    #[cfg(windows)]
     fn pointer_target(&self, at: Point) -> Result<AppIdentity, String> {
         let app = self.desktop.window_owner_at(at).ok_or(UNKNOWN_TARGET)?;
         self.refuse_blocked(&app)?;
@@ -560,6 +591,18 @@ impl Helper {
 
     /// The frontmost app and the app owning the focused element (they differ for a
     /// non-activating panel), each refused when blocked. The one receiving the keys, for messages.
+    #[cfg(not(windows))]
+    fn keyboard_target(&self) -> Result<String, String> {
+        let front = self.desktop.frontmost_app().ok_or("Cannot tell which app is in front.")?;
+        self.refuse_blocked(&front)?;
+        match self.desktop.focused_app().filter(|focused| focused.pid != front.pid) {
+            Some(focused) => self.refuse_blocked(&focused).map(|()| focused.name),
+            None => Ok(front.name),
+        }
+    }
+
+
+    #[cfg(windows)]
     fn keyboard_target(&self) -> Result<String, String> {
         let front = self.desktop.frontmost_app().ok_or("Cannot tell which app is in front.")?;
         self.refuse_blocked(&front)?;
@@ -576,6 +619,25 @@ impl Helper {
         Ok(focused.map_or(front.name, |app| app.name))
     }
 
+    #[cfg(not(windows))]
+    fn confirm_if_risky(&self, risk: Option<String>, action: &str, target: &str) -> Result<(), String> {
+        let Some(reason) = risk else {
+            return Ok(());
+        };
+        // Yolo mode (S24.9), switched on by the user in the app, skips only this confirmation.
+        if self.control.yolo(self.clock.now_ms()) {
+            return Ok(());
+        }
+        let message = format!("{action} in {target}.\n\nThis needs your OK because of {reason}.");
+        if self.with_dialog(|| self.dialogs.confirm(&message)) {
+            Ok(())
+        } else {
+            Err(format!("The user declined: {action} in {target}. Nothing was done."))
+        }
+    }
+
+
+    #[cfg(windows)]
     fn confirm_if_risky(&self, risk: Option<String>, action: &str, target: &str) -> Result<(), String> {
         let Some(reason) = risk else {
             return Ok(());
@@ -610,6 +672,24 @@ impl Helper {
         ))
     }
 
+    #[cfg(not(windows))]
+    fn screenshot(&self, latest: &mut Option<ScreenshotGeometry>) -> Result<Content, String> {
+        let capture = self.desktop.capture()?;
+        let geometry = capture.geometry;
+        *latest = Some(geometry);
+        let front = self.desktop.frontmost_app().map(|app| app.name);
+        let meta = json!({
+            "imageWidth": geometry.image_width,
+            "imageHeight": geometry.image_height,
+            "scale": geometry.scale,
+            "frontApp": front,
+        });
+        let data = base64::engine::general_purpose::STANDARD.encode(&capture.data);
+        Ok(vec![json!({"type": "image", "data": data, "mimeType": capture.mime_type}), text(meta.to_string())])
+    }
+
+
+    #[cfg(windows)]
     fn screenshot(&self, latest: &mut Option<ScreenshotGeometry>) -> Result<Content, String> {
         let capture = self.desktop.capture()?;
         let geometry = capture.geometry;
@@ -631,6 +711,7 @@ impl Helper {
     /// A foreground observation can confirm a native launch identity, never create one.
     fn settle(&self, ms: u64) {
         self.clock.sleep_ms(ms);
+        #[cfg(windows)]
         if let Some(requested) = lock(&self.pending_open).take() {
             if let Some(front) = self.desktop.frontmost_app() {
                 if requested.pid > 0 && front == requested && self.refuse_blocked(&front).is_ok() {
@@ -728,6 +809,125 @@ impl Helper {
 
     /// One action through every guard, then posted: what was done and how long the screen
     /// needs to settle before a screenshot. A single call and a batch step both come here.
+    #[cfg(not(windows))]
+    fn perform(
+        &self,
+        epoch: u64,
+        latest: &Option<ScreenshotGeometry>,
+        tool: Tool,
+        intent: Option<&str>,
+    ) -> Result<(String, u64), String> {
+        let map = |latest: &Option<ScreenshotGeometry>, (x, y): (f64, f64)| -> Result<Point, String> {
+            latest.ok_or(NEEDS_SCREENSHOT)?.to_point(x, y).map_err(|e| e.to_string())
+        };
+        match tool {
+            Tool::Screenshot | Tool::ListApps | Tool::Batch { .. } => Err("Not an action.".into()),
+            Tool::Click { x, y, button, count } => {
+                let at = map(latest, (x, y))?;
+                let target = self.pointer_target(at)?;
+                let chain = self.desktop.element_at(at);
+                let action = match (button, count) {
+                    (MouseButton::Right, _) => format!("Right-click at ({x}, {y})"),
+                    (_, 2) => format!("Double-click at ({x}, {y})"),
+                    (_, 3) => format!("Triple-click at ({x}, {y})"),
+                    _ => format!("Click at ({x}, {y})"),
+                };
+                self.confirm_if_risky(assess(Act::Click(&chain), intent), &action, &target)?;
+                self.post(epoch, InputEvent::Click { at, button, count })?;
+                (self.glow)(Mark::Click(at));
+                Ok((format!("{action} in {target}: done."), SETTLE_MS))
+            }
+            Tool::Move { x, y } => {
+                let at = map(latest, (x, y))?;
+                let target = self.pointer_target(at)?;
+                let action = format!("Move the pointer to ({x}, {y})");
+                self.confirm_if_risky(assess(Act::Other, intent), &action, &target)?;
+                self.post(epoch, InputEvent::Move(at))?;
+                (self.glow)(Mark::Move(at));
+                Ok((format!("{action}: done."), SETTLE_MS))
+            }
+            Tool::Drag { from, to } => {
+                let (start, end) = (map(latest, from)?, map(latest, to)?);
+                let source = self.pointer_target(start)?;
+                let destination = self.pointer_target(end)?;
+                let action = format!("Drag from ({}, {}) to ({}, {})", from.0, from.1, to.0, to.1);
+                let target = if source == destination { source } else { format!("{source} and {destination}") };
+                let (from_chain, to_chain) = (self.desktop.element_at(start), self.desktop.element_at(end));
+                self.confirm_if_risky(assess(Act::Drag(&from_chain, &to_chain), intent), &action, &target)?;
+                self.post(epoch, InputEvent::Drag { from: start, to: end })?;
+                (self.glow)(Mark::Drag { from: start, to: end });
+                Ok((format!("{action}: done."), SETTLE_MS))
+            }
+            Tool::Scroll { x, y, dx, dy } => {
+                let at = map(latest, (x, y))?;
+                let target = self.pointer_target(at)?;
+                let action = format!("Scroll by ({dx}, {dy}) at ({x}, {y})");
+                self.confirm_if_risky(assess(Act::Other, intent), &action, &target)?;
+                self.post(epoch, InputEvent::Scroll { at, dx, dy })?;
+                (self.glow)(Mark::Scroll(at));
+                Ok((format!("{action}: done."), SETTLE_MS))
+            }
+            Tool::Type { text: typed } => {
+                let target = self.keyboard_target()?;
+                let typed = typed.replace("\r\n", "\n").replace('\r', "\n");
+                let focus = self.desktop.focused_element();
+                let action = format!("Type {} characters", typed.chars().count());
+                self.confirm_if_risky(assess(Act::Type(&typed, focus.as_ref()), intent), &action, &target)?;
+                let return_key = parse_combo("return")?;
+                for (i, line) in typed.split('\n').enumerate() {
+                    if i > 0 {
+                        self.post(epoch, InputEvent::Key(return_key))?;
+                    }
+                    for chunk in chunks(line) {
+                        self.post(epoch, InputEvent::Text(chunk))?;
+                    }
+                }
+                // The glow marks posted input only; an empty text posts none.
+                if !typed.is_empty() {
+                    (self.glow)(Mark::Key);
+                }
+                Ok((format!("{action} in {target}: done."), SETTLE_MS))
+            }
+            Tool::Key { combo } => {
+                let target = self.keyboard_target()?;
+                let focus = self.desktop.focused_element();
+                let act = if combo.is_return() {
+                    Act::Return(focus.as_ref())
+                } else if combo.is_space() {
+                    Act::Space(focus.as_ref())
+                } else {
+                    Act::Other
+                };
+                let action = format!("Press {}", combo.key);
+                self.confirm_if_risky(assess(act, intent), &action, &target)?;
+                self.post(epoch, InputEvent::Key(combo))?;
+                (self.glow)(Mark::Key);
+                Ok((format!("{action} in {target}: done."), SETTLE_MS))
+            }
+            Tool::OpenApp { name } => {
+                if let Some(label) = blocked_name(&name) {
+                    return Err(format!("Gentle Dot does not control {label}. The app was not opened."));
+                }
+                let action = format!("Open {name}");
+                self.confirm_if_risky(assess(Act::Other, intent), &action, "macOS")?;
+                self.still_running(epoch)?;
+                self.desktop.open_app(&name)?;
+                Ok((format!("{action}: done."), OPEN_APP_SETTLE_MS))
+            }
+            Tool::Wait { ms } => {
+                let mut left = ms;
+                while left > 0 {
+                    let slice = left.min(WAIT_SLICE_MS);
+                    self.clock.sleep_ms(slice);
+                    left -= slice;
+                    self.still_running(epoch)?;
+                }
+                Ok((format!("Waited {ms} ms."), 0))
+            }
+        }
+    }
+
+    #[cfg(windows)]
     fn perform(
         &self,
         epoch: u64,
@@ -834,7 +1034,7 @@ impl Helper {
                 let action = format!("Open {name}");
                 self.confirm_if_risky(assess(Act::Other, intent), &action, "macOS")?;
                 self.still_running(epoch)?;
-                let requested = self.desktop.open_app(&name)?;
+                let requested = self.desktop.open_app_identified(&name)?;
                 // Opening changes the intended keyboard target even if activation fails or
                 // identity is unavailable. Only the requested app, a new screenshot, or a
                 // subsequent validated click/drag may authorize keys from here.
@@ -1508,7 +1708,8 @@ mod tests {
         let rig = rig();
         rig.ready();
         *rig.desktop.elements.lock().unwrap() = send_button();
-        *rig.desktop.activates_to.lock().unwrap() = rig.desktop.frontmost_app();
+        #[cfg(windows)]
+        { *rig.desktop.activates_to.lock().unwrap() = rig.desktop.frontmost_app(); }
         let frontmost = rig.desktop.clone();
         *rig.dialogs.during.lock().unwrap() = Some(Box::new(move || {
             *frontmost.frontmost.lock().unwrap() = Some(app(OWN_PID, "dev.gentleman.gentle-dot", "Gentle Dot"));
@@ -1517,6 +1718,7 @@ mod tests {
         assert_eq!(*rig.desktop.activated.lock().unwrap(), vec![200]);
     }
 
+    #[cfg(windows)]
     #[test]
     fn an_approved_action_is_dropped_when_the_previous_app_cannot_be_brought_back() {
         let rig = rig();
@@ -1533,6 +1735,7 @@ mod tests {
         assert!(rig.desktop.events().is_empty());
     }
 
+    #[cfg(windows)]
     #[test]
     fn an_approved_action_is_dropped_when_no_app_was_known_to_be_in_front() {
         let rig = rig();
@@ -1546,6 +1749,7 @@ mod tests {
         assert!(rig.desktop.events().is_empty());
     }
 
+    #[cfg(windows)]
     #[test]
     fn keys_and_text_wait_for_a_screenshot_once_the_front_app_changed() {
         let rig = rig();
@@ -1562,13 +1766,15 @@ mod tests {
         assert_eq!(rig.desktop.events().len(), 1);
     }
 
+    #[cfg(windows)]
     #[test]
     fn an_approved_action_waits_a_moment_for_the_previous_app_to_come_back() {
         let elapsed = |needed: usize| {
             let rig = rig();
             rig.ready();
             *rig.desktop.elements.lock().unwrap() = send_button();
-            *rig.desktop.activates_to.lock().unwrap() = rig.desktop.frontmost_app();
+            #[cfg(windows)]
+        { *rig.desktop.activates_to.lock().unwrap() = rig.desktop.frontmost_app(); }
             *rig.desktop.activations_needed.lock().unwrap() = needed;
             let desktop = rig.desktop.clone();
             *rig.dialogs.during.lock().unwrap() = Some(Box::new(move || {
@@ -1584,12 +1790,14 @@ mod tests {
         assert_eq!(elapsed(3) - elapsed(1), 2 * RESTORE_STEP_MS);
     }
 
+    #[cfg(windows)]
     #[test]
     fn an_approved_action_runs_once_the_previous_app_is_back() {
         let rig = rig();
         rig.ready();
         *rig.desktop.elements.lock().unwrap() = send_button();
-        *rig.desktop.activates_to.lock().unwrap() = rig.desktop.frontmost_app();
+        #[cfg(windows)]
+        { *rig.desktop.activates_to.lock().unwrap() = rig.desktop.frontmost_app(); }
         let desktop = rig.desktop.clone();
         *rig.dialogs.during.lock().unwrap() = Some(Box::new(move || {
             *desktop.frontmost.lock().unwrap() = Some(app(OWN_PID, "dev.gentleman.gentle-dot", "Gentle Dot"));
@@ -1599,11 +1807,13 @@ mod tests {
         assert_eq!(rig.desktop.events().len(), 1);
     }
 
+    #[cfg(windows)]
     fn mail() -> AppIdentity {
         app(300, "com.apple.mail", "Mail")
     }
 
     /// Simulates the OS delivering an agent-caused activation during the inter-step wait.
+    #[cfg(windows)]
     fn bring_mail_after_step(rig: &Rig) {
         let desktop = rig.desktop.clone();
         *rig.clock.on_sleep.lock().unwrap() = Some(Box::new(move || {
@@ -1611,6 +1821,7 @@ mod tests {
         }));
     }
 
+    #[cfg(windows)]
     #[test]
     fn batch_click_in_another_app_then_type_goes_through() {
         let rig = rig();
@@ -1631,6 +1842,7 @@ mod tests {
         assert_eq!(image_count(&result), 1);
     }
 
+    #[cfg(windows)]
     fn open_app_refuses_prior_screenshot_app(tool: &str, step: Value) {
         for resolved in [Some(mail()), None] {
             for returns_from_mail in [false, true] {
@@ -1656,16 +1868,19 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn open_app_prior_screenshot_safari_refuses_type() {
         open_app_refuses_prior_screenshot_app("type", json!({"tool": "type", "text": "hello"}));
     }
 
+    #[cfg(windows)]
     #[test]
     fn open_app_prior_screenshot_safari_refuses_key() {
         open_app_refuses_prior_screenshot_app("key", json!({"tool": "key", "combo": "tab"}));
     }
 
+    #[cfg(windows)]
     #[test]
     fn batch_open_app_unrelated_user_foreground_refuses_key_and_type() {
         for (tool, step) in [
@@ -1689,6 +1904,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn batch_open_app_then_type_goes_through() {
         let rig = rig();
@@ -1707,6 +1923,7 @@ mod tests {
         assert_eq!(image_count(&result), 1);
     }
 
+    #[cfg(windows)]
     #[test]
     fn open_app_verified_identity_only_accepts_requested_app_including_already_foreground() {
         for (resolved, front, succeeds) in [
@@ -1742,6 +1959,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn open_app_preserves_prior_click_acceptance_only_until_successful_open() {
         let rig = rig();
@@ -1757,6 +1975,7 @@ mod tests {
         assert_eq!(rig.desktop.events().len(), 2);
     }
 
+    #[cfg(windows)]
     #[test]
     fn batch_user_switch_to_a_third_app_is_still_refused() {
         let rig = rig();
@@ -1775,6 +1994,7 @@ mod tests {
         assert_eq!(image_count(&result), 1);
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_click_on_a_blocked_app_accepts_nothing_and_keys_stay_refused() {
         let rig = rig();
@@ -1794,6 +2014,7 @@ mod tests {
         assert!(marks(&rig).is_empty());
     }
 
+    #[cfg(windows)]
     #[test]
     fn only_click_and_drag_accept_a_validated_pointer_target() {
         for (step, accepts) in [
@@ -1811,6 +2032,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn open_app_unknown_native_identity_refuses_unchanged_blocked_and_unknown_front() {
         for front in [Some(mail()), Some(app(301, SETTINGS.0, SETTINGS.1)), None] {
@@ -1832,6 +2054,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn accepted_targets_still_check_both_blocklists_before_keys_and_text() {
         for focused in [false, true] {
@@ -1856,6 +2079,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_new_session_clears_keyboard_acceptance_and_the_seen_app() {
         for timeout in [false, true] {
@@ -1873,6 +2097,40 @@ mod tests {
             assert_eq!(rig.desktop.events().len(), 2);
             assert_eq!(rig.dialogs.grants.load(Ordering::SeqCst), 2);
         }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_keyboard_keeps_following_the_unblocked_foreground() {
+        for step in [json!({"tool": "key", "combo": "tab"}), json!({"tool": "type", "text": "hello"})] {
+            let rig = rig();
+            rig.ready();
+            *rig.desktop.frontmost.lock().unwrap() = Some(app(400, "com.example.terminal", "Terminal"));
+            let result = rig.call("batch", batch(json!([
+                {"tool": "open_app", "name": "Mail"}, step
+            ])));
+            assert!(!is_error(&result), "{result}");
+            assert_eq!(*rig.desktop.opened.lock().unwrap(), vec!["Mail"]);
+            assert_eq!(rig.desktop.events().len(), 1);
+            assert_eq!(image_count(&result), 1);
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_confirmation_keeps_original_best_effort_restoration() {
+        let rig = rig();
+        rig.ready();
+        *rig.desktop.elements.lock().unwrap() = send_button();
+        let desktop = rig.desktop.clone();
+        *rig.dialogs.during.lock().unwrap() = Some(Box::new(move || {
+            *desktop.frontmost.lock().unwrap() = Some(app(400, "com.example.terminal", "Terminal"));
+        }));
+        let result = rig.call("click", json!({"x": 10, "y": 10}));
+        assert!(!is_error(&result), "{result}");
+        assert_eq!(*rig.desktop.activated.lock().unwrap(), vec![200]);
+        assert_eq!(rig.desktop.events().len(), 1);
+        assert_eq!(image_count(&result), 1);
     }
 
     // --- Typing ---

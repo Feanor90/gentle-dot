@@ -23,10 +23,13 @@ pub struct FakeDesktop {
     pub focus: Mutex<Option<Focus>>,
     pub opened: Mutex<Vec<String>>,
     /// Native launch result, independent of any later foreground changes.
+    #[cfg(windows)]
     pub opened_identity: Mutex<Option<AppIdentity>>,
     pub activated: Mutex<Vec<i32>>,
     /// What activation eventually brings forward; by default activation only records the pid.
+    #[cfg(windows)]
     pub activates_to: Mutex<Option<AppIdentity>>,
+    #[cfg(windows)]
     pub activations_needed: Mutex<usize>,
     pub captures: AtomicUsize,
     /// A 2560 × 1600 pt display at the origin, captured at 1280 × 800 (scale 0.5).
@@ -46,9 +49,12 @@ impl Default for FakeDesktop {
             elements: Mutex::new(Vec::new()),
             focus: Mutex::new(None),
             opened: Mutex::new(Vec::new()),
+            #[cfg(windows)]
             opened_identity: Mutex::new(None),
             activated: Mutex::new(Vec::new()),
+            #[cfg(windows)]
             activates_to: Mutex::new(None),
+            #[cfg(windows)]
             activations_needed: Mutex::new(1),
             captures: AtomicUsize::new(0),
             geometry: ScreenshotGeometry::for_display(Point { x: 0.0, y: 0.0 }, 2560.0, 1280, 800),
@@ -84,8 +90,14 @@ impl Desktop for FakeDesktop {
         ])
     }
 
-    fn open_app(&self, name: &str) -> Result<Option<AppIdentity>, String> {
+    fn open_app(&self, name: &str) -> Result<(), String> {
         self.opened.lock().unwrap().push(name.into());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn open_app_identified(&self, name: &str) -> Result<Option<AppIdentity>, String> {
+        self.open_app(name)?;
         Ok(self.opened_identity.lock().unwrap().clone())
     }
 
@@ -110,6 +122,10 @@ impl Desktop for FakeDesktop {
     }
 
     fn activate(&self, pid: i32) {
+        #[cfg(not(windows))]
+        self.activated.lock().unwrap().push(pid);
+        #[cfg(windows)]
+        {
         let count = {
             let mut activated = self.activated.lock().unwrap();
             activated.push(pid);
@@ -120,6 +136,7 @@ impl Desktop for FakeDesktop {
         }
         if let Some(app) = self.activates_to.lock().unwrap().clone() {
             *self.frontmost.lock().unwrap() = Some(app);
+        }
         }
     }
 }
