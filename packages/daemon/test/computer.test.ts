@@ -11,6 +11,11 @@ import { FAKE_AGENT, tempDir, waitFor } from "./helpers.ts";
 
 const HELPER = "http://127.0.0.1:51234/mcp";
 const KEY = "s3cr3t-Computer-Key-0123456789abcdef";
+/** What the Computer connector says it does, naming the system it runs on. */
+const SENDS =
+	process.platform === "win32"
+		? "Click, type, and open apps on this PC during that session. The app asks you again before risky actions."
+		: "Click, type, and open apps on this Mac during that session. The app asks you again before risky actions.";
 
 const daemons: DotDaemon[] = [];
 afterEach(async () => {
@@ -172,8 +177,8 @@ describe("computer control registration (S24.7)", () => {
 		expect(computerOf(listed.connectors)).toEqual({
 			id: "computer",
 			name: "Computer",
-			reads: expect.any(String),
-			sends: expect.any(String),
+			reads: "See your screen during a session you allow in the app.",
+			sends: SENDS,
 			added: true,
 			enabled: true,
 			mode: "read_write",

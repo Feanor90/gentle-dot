@@ -356,8 +356,7 @@ const COMPUTER_INFO = {
 	id: COMPUTER_ID,
 	name: "Computer",
 	reads: "See your screen during a session you allow in the app.",
-	sends:
-		"Click, type, and open apps on this Mac during that session. The app asks you again before risky actions.",
+	sends: `Click, type, and open apps on this ${process.platform === "win32" ? "PC" : "Mac"} during that session. The app asks you again before risky actions.`,
 } as const;
 
 /** A server the user added from the assistant's draft or an import. */

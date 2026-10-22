@@ -1,9 +1,10 @@
 //! Computer control (S24): a native helper inside the app that serves MCP on loopback so the
-//! agent can see and drive the Mac. Every rule (session grant, blocklist, rate limit, risky
-//! action confirmation, panic stop) lives here, outside the agent's reach.
+//! agent can see and drive the Mac or the PC. Every rule (session grant, blocklist, rate limit,
+//! risky action confirmation, panic stop) lives here, outside the agent's reach.
 //!
-//! The rules are pure modules tested on every OS. `Desktop` is the seam to the real Mac
-//! (`macos`), and `fake` records events for the tests. Off macOS the helper does not start.
+//! The rules are pure modules tested on every OS. `Desktop` is the seam to the real desktop
+//! (`macos` on macOS, `win` on Windows), and `fake` records events for the tests. On other
+//! systems the helper does not start.
 
 pub mod app;
 pub mod blocklist;
