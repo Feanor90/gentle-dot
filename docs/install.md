@@ -130,7 +130,9 @@ A Windows installer can be built from source (below), but it is not released yet
 
 ### Computer control
 
-Computer control runs on Windows too (see [design.md, S24.10](design.md#computer-control-macos-and-windows-s24)). Windows asks for no permission for computer control; Connectors → Computer shows yolo controls without a permission list. The grant asks to control "this PC", and **Alt+Shift+Esc** is the emergency stop. Native task dialogs refuse by default; Enter without changing the selection, Escape, or closing refuses.
+Computer control runs on Windows too (see [design.md, S24.10](design.md#computer-control-macos-and-windows-s24)). Windows asks for no permission for computer control; Connectors → Computer shows yolo controls without a permission list. The grant asks to control "this PC", and **Alt+Shift+Esc** is registered at startup as the emergency stop (registration failures are logged). Native task dialogs refuse by default; Enter without changing the selection, Escape, or closing refuses.
+
+Typing requires an app deliberately clicked or opened by the assistant. Before each text chunk and Return, the helper checks that app is still in front and neither the frontmost nor focused app is blocked. A mid-type change stops further input and reports how many characters were already sent; screenshots never authorize typing. A tiny check-to-`SendInput` race remains because Windows input cannot target a window.
 
 Elevated apps cannot be driven under Windows UIPI. Apps Windows cannot identify, including Store apps without a core window, are refused. UI Automation uses a 0.5 s timeout, not a hard deadline for the whole action; unreadable elements can require more confirmations, and read-only documents count as text areas. The glow and working top-edge line run on Windows; after a call, the Dot and panel return without taking keyboard focus.
 

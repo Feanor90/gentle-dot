@@ -72,7 +72,9 @@ type, press tab, type, press return) so it runs in one call; end the batch whene
 before deciding the next step. The user must allow a session, risky actions ask the user to confirm, and \
 some apps (System Settings, password managers) are off limits. Keys and text require the app of the latest \
 validated click/drag source or the verified native identity requested by open_app. Screenshots never authorize \
-or clear that app. If another app is in front, nothing is sent. Click in the app you want to type in first.";
+or clear that app. Before every text chunk and Return, the frontmost app and both blocklists are checked again. \
+If another app comes to the front mid-type, typing stops and reports how many characters were already sent. \
+If another app is in front before typing, nothing is sent. Click in the app you want to type in first.";
 
 /// The `open_app` tool description, and the system an `open_app` confirmation names.
 #[cfg(not(windows))]
@@ -620,6 +622,22 @@ impl Helper {
         Ok(focused.map_or(front.name, |app| app.name))
     }
 
+    /// SendInput cannot target a window: a short race between this check (including its
+    /// focused-app query) and the post remains. Reuse the keyboard guard, including both blocklists.
+    #[cfg(windows)]
+    fn post_typed(&self, epoch: u64, event: InputEvent, sent: usize, total: usize) -> Result<(), String> {
+        self.still_running(epoch)?;
+        self.keyboard_target().map_err(|error| {
+            if sent == 0 {
+                error
+            } else {
+                let front = self.desktop.frontmost_app().map_or_else(|| "An unknown app".into(), |app| app.name);
+                format!("{front} came to the front while typing, so typing stopped after {sent} of {total} characters. Nothing more was sent. Click in the app you want to type in first.")
+            }
+        })?;
+        self.post(epoch, event)
+    }
+
     #[cfg(not(windows))]
     fn confirm_if_risky(&self, risk: Option<String>, action: &str, target: &str) -> Result<(), String> {
         let Some(reason) = risk else {
@@ -996,18 +1014,27 @@ impl Helper {
                 let action = format!("Type {} characters", typed.chars().count());
                 self.confirm_if_risky(assess(Act::Type(&typed, focus.as_ref()), intent), &action, &target)?;
                 let return_key = parse_combo("return")?;
-                for (i, line) in typed.split('\n').enumerate() {
-                    if i > 0 {
-                        self.post(epoch, InputEvent::Key(return_key))?;
+                let total = typed.chars().count();
+                let mut sent = 0;
+                let outcome = (|| -> Result<(), String> {
+                    for (i, line) in typed.split('\n').enumerate() {
+                        if i > 0 {
+                            self.post_typed(epoch, InputEvent::Key(return_key), sent, total)?;
+                            sent += 1;
+                        }
+                        for chunk in chunks(line) {
+                            let count = chunk.chars().count();
+                            self.post_typed(epoch, InputEvent::Text(chunk), sent, total)?;
+                            sent += count;
+                        }
                     }
-                    for chunk in chunks(line) {
-                        self.post(epoch, InputEvent::Text(chunk))?;
-                    }
-                }
-                // The glow marks posted input only; an empty text posts none.
-                if !typed.is_empty() {
+                    Ok(())
+                })();
+                // Partial input still happened, even when a later event was refused.
+                if sent > 0 {
                     (self.glow)(Mark::Key);
                 }
+                outcome?;
                 Ok((format!("{action} in {target}: done."), SETTLE_MS))
             }
             Tool::Key { combo } => {
@@ -2311,6 +2338,110 @@ mod tests {
     }
 
     // --- Typing ---
+
+    #[cfg(windows)]
+    fn mid_type_switch(after: usize, front: Option<AppIdentity>, focused: Option<AppIdentity>, as_batch: bool) {
+        let rig = rig();
+        rig.ready();
+        *rig.desktop.frontmost.lock().unwrap() = Some(mail());
+        choose_keyboard_app(&rig);
+        let desktop = Arc::downgrade(&rig.desktop);
+        *rig.desktop.after_post.lock().unwrap() = Some(Box::new(move |count| {
+            // The setup click is event 1; only count this type's events.
+            if count == after + 1 {
+                let desktop = desktop.upgrade().unwrap();
+                if let Some(front) = &front {
+                    *desktop.frontmost.lock().unwrap() = Some(front.clone());
+                }
+                *desktop.focused_app.lock().unwrap() = focused.clone();
+            }
+        }));
+        // First two chunks: 19 scalar values, then one surrogate-pair emoji.
+        // CRLF normalizes to one Return; total is 25 Unicode scalar values.
+        let typed = "a".repeat(19) + "😀\r\nlast";
+        let result = if as_batch {
+            rig.call("batch", batch(json!([
+                {"tool": "type", "text": typed}, {"tool": "key", "combo": "tab"}
+            ])))
+        } else {
+            rig.call("type", json!({"text": typed}))
+        };
+        let sent = [19, 20, 21][after - 1];
+        let front = rig.desktop.frontmost_app().unwrap().name;
+        let message = format!("{front} came to the front while typing, so typing stopped after {sent} of 25 characters. Nothing more was sent. Click in the app you want to type in first.");
+        assert!(is_error(&result), "{result}");
+        assert_eq!(first_text(&result), if as_batch {
+            format!("Stopped at step 1 of 2 (type): {message}\nRan 0 of 2 steps.")
+        } else { message });
+        let expected = [
+            InputEvent::Text("a".repeat(19)), InputEvent::Text("😀".into()),
+            InputEvent::Key(parse_combo("return").unwrap()),
+        ];
+        assert_eq!(keyboard_events(&rig), expected[..after]);
+        assert_eq!(marks(&rig), vec![
+            (Mark::Click(Point { x: 20.0, y: 20.0 }), 1), (Mark::Key, after + 1)
+        ]);
+        assert_eq!(rig.dialogs.grants.load(Ordering::SeqCst), 1);
+        assert!(rig.dialogs.confirmations.lock().unwrap().is_empty());
+        assert_eq!(image_count(&result), usize::from(as_batch));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mid_type_switch_stops_single_after_two_chunks() {
+        mid_type_switch(2, Some(app(400, "terminal.exe", "Terminal")), None, false);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mid_type_switch_stops_batch_before_return_and_later_steps() {
+        mid_type_switch(2, Some(app(400, "terminal.exe", "Terminal")), None, true);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mid_type_switch_checks_each_chunk() {
+        mid_type_switch(1, Some(app(400, "terminal.exe", "Terminal")), None, false);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mid_type_switch_counts_posted_returns() {
+        mid_type_switch(3, Some(app(400, "terminal.exe", "Terminal")), None, false);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mid_type_switch_rechecks_front_blocklist() {
+        mid_type_switch(2, Some(app(500, SETTINGS.0, SETTINGS.1)), None, false);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mid_type_switch_rechecks_focused_blocklist() {
+        mid_type_switch(2, None, Some(app(501, PASSWORDS.0, PASSWORDS.1)), false);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mid_type_no_switch_preserves_chunks_returns_count_and_mark() {
+        let rig = rig();
+        rig.ready();
+        *rig.desktop.frontmost.lock().unwrap() = Some(mail());
+        choose_keyboard_app(&rig);
+        let result = rig.call("type", json!({"text": "a".repeat(19) + "😀\r\nlast"}));
+        assert!(!is_error(&result), "{result}");
+        assert_eq!(first_text(&result), "Type 25 characters in Mail: done.");
+        assert_eq!(keyboard_events(&rig), vec![
+            InputEvent::Text("a".repeat(19)), InputEvent::Text("😀".into()),
+            InputEvent::Key(parse_combo("return").unwrap()), InputEvent::Text("last".into())
+        ]);
+        assert_eq!(marks(&rig), vec![
+            (Mark::Click(Point { x: 20.0, y: 20.0 }), 1), (Mark::Key, 5)
+        ]);
+        assert_eq!(image_count(&result), 1);
+        assert!(rig.dialogs.confirmations.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn typing_sends_newlines_as_return_and_checks_them() {

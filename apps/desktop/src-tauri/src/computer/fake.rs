@@ -12,9 +12,14 @@ pub fn app(pid: i32, bundle: &str, name: &str) -> AppIdentity {
 }
 
 type OwnerAt = Box<dyn Fn(Point) -> Option<AppIdentity> + Send + Sync>;
+#[cfg(windows)]
+type PostHook = Box<dyn Fn(usize) + Send + Sync>;
 
 pub struct FakeDesktop {
     pub events: Mutex<Vec<InputEvent>>,
+    /// Runs after a successful post, with the total number of recorded events.
+    #[cfg(windows)]
+    pub after_post: Mutex<Option<PostHook>>,
     pub permissions: Mutex<Permissions>,
     pub frontmost: Mutex<Option<AppIdentity>>,
     pub focused_app: Mutex<Option<AppIdentity>>,
@@ -42,6 +47,8 @@ impl Default for FakeDesktop {
         let owner = safari.clone();
         FakeDesktop {
             events: Mutex::new(Vec::new()),
+            #[cfg(windows)]
+            after_post: Mutex::new(None),
             permissions: Mutex::new(Permissions { accessibility: true, screen_recording: true, screenshots_supported: true }),
             frontmost: Mutex::new(Some(safari)),
             focused_app: Mutex::new(None),
@@ -80,6 +87,10 @@ impl Desktop for FakeDesktop {
 
     fn post(&self, event: &InputEvent) -> Result<(), String> {
         self.events.lock().unwrap().push(event.clone());
+        #[cfg(windows)]
+        if let Some(hook) = self.after_post.lock().unwrap().as_ref() {
+            hook(self.events().len());
+        }
         Ok(())
     }
 

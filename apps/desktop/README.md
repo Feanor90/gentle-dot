@@ -49,7 +49,9 @@ Runtime overrides:
 
 ## Windows computer control
 
-Computer control runs on Windows too ([design.md, S24.10](../../docs/design.md#computer-control-macos-and-windows-s24)): `SendInput` and GDI capture, UI Automation for the risk check, a Windows blocklist, task dialogs that refuse by default, **Alt+Shift+Esc** to stop, and the glow. Windows asks for no permission for computer control. The working ring shows the same top-edge line as on macOS; the Dot and panel return without taking keyboard focus (`ShowWindow` with `SW_SHOWNA`).
+Computer control runs on Windows too ([design.md, S24.10](../../docs/design.md#computer-control-macos-and-windows-s24)): `SendInput` and GDI capture, UI Automation for the risk check, a Windows blocklist, task dialogs that refuse by default, **Alt+Shift+Esc** registered at startup to stop (registration failures are logged), and the glow. Windows asks for no permission for computer control. The working ring shows the same top-edge line as on macOS; the Dot and panel return without taking keyboard focus (`ShowWindow` with `SW_SHOWNA`).
+
+Typing re-checks the deliberately clicked/opened app's foreground PID and both frontmost/focused blocklists before every text chunk and Return. A mid-type change stops further input and reports the count already sent; partial input still gets a key glow mark. Screenshots never authorize typing. `SendInput` cannot target a window, so a tiny check-to-post race remains.
 
 Elevated apps cannot be driven under Windows UIPI. Store apps without a core window stay Unidentified (refused). UI Automation uses a 0.5 s timeout, not a hard deadline for the whole action; read-only documents count as text areas and unreadable elements can require more confirmations. Real input, capture, dialogs, and glow require the user's own interactive desktop session for validation.
 
