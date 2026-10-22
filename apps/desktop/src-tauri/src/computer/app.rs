@@ -119,6 +119,41 @@ pub fn show_without_focus(window: &tauri::WebviewWindow) -> Result<(), String> {
     Ok(())
 }
 
+/// Native restoration bypasses Tao's cached VISIBLE flag. Its next hide can otherwise be
+/// a no-op (old=false, new=false) even though ShowWindow(SW_SHOWNA) made the panel visible.
+/// Keep both preparation directions native on Windows; never activate either window.
+#[cfg(windows)]
+struct WorkingWindows {
+    app: AppHandle,
+    inner: Arc<dyn Windows>,
+}
+
+#[cfg(windows)]
+impl Windows for WorkingWindows {
+    fn is_visible(&self, part: super::working::Part) -> bool { self.inner.is_visible(part) }
+
+    fn hide(&self, part: super::working::Part) -> Result<(), String> {
+        let label = match part {
+            super::working::Part::Dot => crate::shell::DOT,
+            super::working::Part::Panel => crate::shell::PANEL,
+        };
+        let window = self.app.get_webview_window(label).ok_or_else(|| format!("window {part:?} is missing"))?;
+        // Also update the framework's flag; its native hide alone may be a cached no-op.
+        let hwnd = window.hwnd().map_err(|error| error.to_string())?.0;
+        hide_working_window(hwnd, self.inner.hide(part))
+    }
+
+    fn show(&self, part: super::working::Part) { self.inner.show(part); }
+    fn rose_hidden(&self) -> bool { self.inner.rose_hidden() }
+}
+
+#[cfg(windows)]
+fn hide_working_window(hwnd: *mut std::ffi::c_void, framework_hide: Result<(), String>) -> Result<(), String> {
+    framework_hide?;
+    super::win::show_overlay(hwnd, false);
+    Ok(())
+}
+
 impl Computer {
     /// The helper's address and key for this launch, registered with the daemon over the app's
     /// channel (S24.7, L61); `None` off macOS and Windows, or when the helper did not start.
@@ -132,6 +167,8 @@ impl Computer {
 /// Windows (S1). Runs in the app's setup, on the main thread.
 pub fn start(app: &AppHandle, windows: Arc<dyn Windows>) -> Computer {
     let (overlay, marks) = std::sync::mpsc::channel::<Overlay>();
+    #[cfg(windows)]
+    let windows: Arc<dyn Windows> = Arc::new(WorkingWindows { app: app.clone(), inner: windows });
     #[cfg(any(target_os = "macos", windows))]
     let working = Arc::new(Working::new(
         windows,
@@ -669,6 +706,34 @@ impl super::Dialogs for NativeDialogs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn repeated_native_restore_and_cached_hide_really_hides_the_window() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, IsWindowVisible, ShowWindow, SW_HIDE, SW_SHOWNA, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP};
+        let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+        // A tiny offscreen tool window: no activation, input, or user app involved.
+        let hwnd = unsafe { CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, class.as_ptr(), class.as_ptr(), WS_POPUP, -30000, -30000, 1, 1, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null()) };
+        assert!(!hwnd.is_null());
+        struct OwnedWindow(*mut std::ffi::c_void);
+        impl Drop for OwnedWindow {
+            fn drop(&mut self) { unsafe { DestroyWindow(self.0); } }
+        }
+        let _window = OwnedWindow(hwnd);
+        let foreground = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+        let mut cached_visible = true;
+        for _ in 0..3 {
+            // Exactly the SW_SHOWNA restoration in show_without_focus, outside Tao's cache.
+            unsafe { ShowWindow(hwnd, SW_SHOWNA); }
+            assert_ne!(unsafe { IsWindowVisible(hwnd) }, 0);
+            // Tao applies a native hide only when its cached VISIBLE bit changes.
+            if cached_visible { unsafe { ShowWindow(hwnd, SW_HIDE); } }
+            cached_visible = false;
+            hide_working_window(hwnd, Ok(())).unwrap();
+            assert_eq!(unsafe { IsWindowVisible(hwnd) }, 0, "every preparation must hide the native window, even after restoration");
+            assert_eq!(unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }, foreground);
+        }
+    }
 
     #[test]
     #[cfg(not(windows))]

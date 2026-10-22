@@ -105,6 +105,27 @@ pub fn packaged_named<'a>(name: &str, apps: &'a [(String, String)]) -> Result<&'
     Ok(first)
 }
 
+/// Known OS launcher stubs only, not an unrelated executable with the same basename.
+/// Windows 10/11 System32 (and the WOW64 system directory) calc.exe delegates to Store Calculator.
+pub fn launcher_package_family(program: &str, windows_dir: &str) -> Option<&'static str> {
+    let bare = program.eq_ignore_ascii_case("calc") || program.eq_ignore_ascii_case("calc.exe");
+    let system = ["System32", "SysWOW64"].iter().any(|directory| {
+        program.eq_ignore_ascii_case(&format!(r"{}\{}\calc.exe", windows_dir.trim_end_matches('\\'), directory))
+    });
+    (bare || system).then_some("Microsoft.WindowsCalculator_")
+}
+
+/// Select only from system-enumerated AUMIDs; localized display names do not identify a stub.
+pub fn packaged_launcher<'a>(program: &str, windows_dir: &str, apps: &'a [(String, String)]) -> Result<Option<&'a (String, String)>, String> {
+    let Some(prefix) = launcher_package_family(program, windows_dir) else { return Ok(None) };
+    let mut matches = apps.iter().filter(|(_, aumid)| aumid.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase()));
+    let Some(first) = matches.next() else { return Ok(None) };
+    if matches.any(|(_, aumid)| aumid != &first.1) {
+        return Err(format!("cannot tell which app named `{program}` to open, so nothing was opened."));
+    }
+    Ok(Some(first))
+}
+
 /// The Start menu shortcut named `name` (its file name without `.lnk`, any case).
 pub fn shortcut_named<'a>(name: &str, shortcuts: &'a [String]) -> Option<&'a String> {
     let wanted = strip_ci(name, ".lnk").unwrap_or(name);
@@ -160,6 +181,36 @@ mod tests {
         vec![("Calculator".into(), "Microsoft.WindowsCalculator_pub!App".into()),
              ("Calculadora".into(), "Microsoft.WindowsCalculator_pub!App".into()),
              ("Éditeur".into(), "Vendor.Editor_pub!App".into())]
+    }
+
+    #[test]
+    fn calculator_launcher_mapping_accepts_only_known_os_stubs() {
+        for name in ["calc", "CALC.EXE", r"C:\Windows\System32\calc.exe", r"c:\WINDOWS\syswow64\CALC.EXE"] {
+            assert_eq!(launcher_package_family(name, r"C:\Windows"), Some("Microsoft.WindowsCalculator_"), "{name}");
+        }
+        assert_eq!(launcher_package_family(r"D:\Win\System32\calc.exe", r"D:\Win"), Some("Microsoft.WindowsCalculator_"));
+        for name in ["notepad", "notepad.exe", "Calculator", "calc.exe args", r"C:\Tools\calc.exe", r"C:\Windows\System32\notepad.exe", r"C:\Windows\System32\..\calc.exe"] {
+            assert_eq!(launcher_package_family(name, r"C:\Windows"), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn calculator_launcher_selects_system_package_not_localized_display_or_user_id() {
+        let apps = vec![("Calculator".into(), "Other_pub!App".into()), ("算術".into(), "microsoft.windowscalculator_pub!App".into())];
+        assert_eq!(packaged_launcher(r"C:\Windows\System32\calc.exe", r"C:\Windows", &apps), Ok(Some(&apps[1])));
+        assert_eq!(packaged_launcher("notepad.exe", r"C:\Windows", &apps), Ok(None));
+        assert_eq!(packaged_launcher("Microsoft.WindowsCalculator_pub!App", r"C:\Windows", &apps), Ok(None));
+        assert_eq!(packaged_launcher("calc", r"C:\Windows", &apps[..1]), Ok(None));
+        assert_eq!(packaged_launcher("calc", r"C:\Windows", &[]), Ok(None));
+    }
+
+    #[test]
+    fn calculator_launcher_refuses_ambiguous_packages() {
+        let mut apps = vec![("One".into(), "Microsoft.WindowsCalculator_one!App".into()); 2];
+        // Duplicated shell entries are harmless; distinct targets are not.
+        assert_eq!(packaged_launcher("calc", r"C:\Windows", &apps), Ok(Some(&apps[0])));
+        apps.push(("Two".into(), "Microsoft.WindowsCalculator_two!App".into()));
+        assert_eq!(packaged_launcher("calc", r"C:\Windows", &apps), Err("cannot tell which app named `calc` to open, so nothing was opened.".into()));
     }
 
     #[test]

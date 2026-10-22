@@ -588,6 +588,9 @@ impl Helper {
     #[cfg(windows)]
     fn pointer_target(&self, at: Point) -> Result<AppIdentity, String> {
         let app = self.desktop.window_owner_at(at).ok_or(UNKNOWN_TARGET)?;
+        if app.pid == self.own_pid {
+            return Err("That point is covered by Gentle Dot's own window, which screenshots do not show. Choose a visible point elsewhere; nothing was sent.".into());
+        }
         self.refuse_blocked(&app)?;
         Ok(app)
     }
@@ -1500,6 +1503,31 @@ mod tests {
             assert!(rig.desktop.events().is_empty());
             rig.ready();
             assert!(!is_error(&rig.call("click", json!({"x": 10, "y": 10}))));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn own_window_covering_a_screenshot_point_explains_refusal_without_input_or_authority() {
+        for (tool, args) in [
+            ("click", json!({"x": 100, "y": 50})),
+            ("move", json!({"x": 100, "y": 50})),
+            ("scroll", json!({"x": 100, "y": 50, "dx": 0, "dy": 1})),
+            ("drag", json!({"fromX": 100, "fromY": 50, "toX": 110, "toY": 60})),
+        ] {
+            let rig = rig();
+            rig.ready();
+            *rig.desktop.owner_at.lock().unwrap() = Box::new(|_| Some(app(OWN_PID, "renamed.exe", "Gentle Dot")));
+            let result = rig.call(tool, args);
+            assert!(is_error(&result), "{result}");
+            assert_eq!(first_text(&result), "That point is covered by Gentle Dot's own window, which screenshots do not show. Choose a visible point elsewhere; nothing was sent.");
+            assert!(rig.desktop.events().is_empty());
+            assert!(marks(&rig).is_empty());
+            assert_eq!(rig.desktop.captures.load(Ordering::SeqCst), 1);
+            let key = rig.call("key", json!({"combo": "tab"}));
+            assert!(is_error(&key));
+            assert_eq!(first_text(&key), screenshot_authority_refusal("Safari"));
+            assert!(rig.desktop.events().is_empty());
         }
     }
 

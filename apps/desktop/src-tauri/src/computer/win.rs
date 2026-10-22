@@ -23,7 +23,7 @@ use super::encode::{bgra_to_jpeg, JPEG_QUALITY};
 use super::risk::{AxElement, Focus};
 use super::glow::Frame;
 use super::winaccess::{element, is_default, unreadable, UIA_BUTTON, UIA_WINDOW};
-use super::winapps::{answers_to, app_pids, executable_target, hosted_page, packaged_named, request, shortcut_named, strip_ci, Request, TopWindow};
+use super::winapps::{answers_to, app_pids, executable_target, hosted_page, launcher_package_family, packaged_launcher, packaged_named, request, shortcut_named, strip_ci, Request, TopWindow};
 use super::winput::{releases, steps, Step, VirtualScreen};
 use super::{AppInfo, Capture, InputEvent, MouseButton};
 use std::ffi::c_void;
@@ -913,7 +913,10 @@ fn packaged_apps() -> windows::core::Result<Vec<(String, String)>> {
 
 /// Guard the resolved display name and package before activation, including localized Settings.
 fn packaged_target<'a>(wanted: &str, apps: &'a [(String, String)]) -> Result<&'a (String, String), String> {
-    let app = packaged_named(wanted, apps)?;
+    guard_packaged_target(packaged_named(wanted, apps)?)
+}
+
+fn guard_packaged_target(app: &(String, String)) -> Result<&(String, String), String> {
     if let Some(label) = blocked_name(&app.0).or_else(|| blocked_aumid(&app.1)) {
         return Err(off_limits(label));
     }
@@ -922,11 +925,29 @@ fn packaged_target<'a>(wanted: &str, apps: &'a [(String, String)]) -> Result<&'a
 
 /// Only the system's enumeration supplies the activation id; no shell or user AUMID is run.
 fn open_packaged_app(wanted: &str) -> Result<Option<AppIdentity>, String> {
+    let apps = packaged_apps().map_err(|_| format!("cannot find an app named `{wanted}`"))?;
+    activate_packaged_app(wanted, packaged_target(wanted, &apps)?)
+}
+
+/// Classic stubs are redirected only if their package is installed. Unavailable enumeration
+/// keeps the existing executable route (which cannot authorize the packaged foreground).
+fn launcher_target(program: &str) -> Result<Option<(String, String)>, String> {
+    use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
+    let mut directory = [0u16; 32768];
+    // SAFETY: valid output buffer, system-owned Windows directory, not a user launch target.
+    let length = unsafe { GetWindowsDirectoryW(directory.as_mut_ptr(), directory.len() as u32) } as usize;
+    if length == 0 || length >= directory.len() { return Ok(None) }
+    let directory = String::from_utf16_lossy(&directory[..length]);
+    if launcher_package_family(program, &directory).is_none() { return Ok(None) }
+    let Ok(apps) = packaged_apps() else { return Ok(None) };
+    packaged_launcher(program, &directory, &apps)?.map(guard_packaged_target).transpose().map(|app| app.cloned())
+}
+
+fn activate_packaged_app(wanted: &str, app: &(String, String)) -> Result<Option<AppIdentity>, String> {
     use windows::core::PCWSTR;
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
     use windows::Win32::UI::Shell::{ApplicationActivationManager, IApplicationActivationManager, AO_NONE};
-    let apps = packaged_apps().map_err(|_| format!("cannot find an app named `{wanted}`"))?;
-    let (display, aumid) = packaged_target(wanted, &apps)?;
+    let (display, aumid) = guard_packaged_target(app)?;
     let _apartment = Apartment::join();
     let before: Vec<HWND> = top_windows().into_iter().map(|(hwnd, _)| hwnd).collect();
     let cannot_open = || format!("cannot open `{wanted}`: Windows could not start it");
@@ -999,6 +1020,9 @@ pub fn open_app(name: &str) -> Result<(), String> {
     }
     if let Some(label) = blocked_name(&program) {
         return Err(off_limits(label));
+    }
+    if let Some(app) = launcher_target(&program)? {
+        return activate_packaged_app(&program, &app).map(|_| ());
     }
     shell_open(&program)
 }
@@ -1093,6 +1117,9 @@ pub fn open_app_identified(name: &str) -> Result<Option<AppIdentity>, String> {
     }
     if let Some(label) = blocked_name(&program) {
         return Err(off_limits(label));
+    }
+    if let Some(app) = launcher_target(&program)? {
+        return activate_packaged_app(&program, &app);
     }
     let before: Vec<i32> = top_windows().into_iter().filter(|(_, window)| window.is_app()).map(|(_, window)| window.pid).collect();
     let expected = |id: &AppIdentity| match &request {
@@ -1560,8 +1587,8 @@ mod tests {
         assert_eq!(packaged_target("Missing", &apps), Err("cannot find an app named `Missing`".into()));
     }
 
-    /// Uses the localized AppsFolder name, bypassing the classic resolver to exercise activation
-    /// even if calc.exe is on PATH. Close Calculator first; no input is posted to any app.
+    /// A cold `calc` must redirect from the classic stub to packaged Calculator; subsequent
+    /// alias and localized opens must preserve that window identity. No input is posted.
     #[test]
     #[ignore = "interactive Windows desktop: Calculator installed; close Calculator first"]
     fn an_opened_packaged_calculator_has_its_window_identity_not_a_host_or_foreground() {
@@ -1577,14 +1604,22 @@ mod tests {
         let apps = packaged_apps().expect("AppsFolder is readable");
         let (name, aumid) = apps.iter().find(|(_, id)| id.to_ascii_lowercase().starts_with("microsoft.windowscalculator_")).expect("Calculator is installed");
         eprintln!("Calculator display name {name:?}, parsing name {aumid:?}");
-        let opened = open_packaged_app(name).expect("Calculator activates");
+        let opened = open_app_identified("calc");
+        let reopened = open_app_identified("calc.exe");
+        let plain = open_app("calc");
+        let plain_exe = open_app("calc.exe");
+        let localized = open_packaged_app(name);
         let windows = calculators();
         let identities: Vec<_> = windows.iter().map(|hwnd| target_of(*hwnd)).collect();
         for hwnd in windows {
             // SAFETY: these are Calculator windows opened by this test, never pre-existing ones.
             unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
         }
-        let id = opened.expect("Calculator's app window is identified, not the activation host");
+        let id = opened.expect("calc activates").expect("Calculator's app window is identified, not the activation host");
+        assert_eq!(reopened, Ok(Some(id.clone())), "calc.exe identifies the same app window");
+        assert_eq!(localized, Ok(Some(id.clone())), "localized packaged opening is preserved");
+        assert_eq!(plain, Ok(()));
+        assert_eq!(plain_exe, Ok(()));
         assert!(identities.contains(&id), "identity must equal target_of(Calculator window): {id:?}, windows {identities:?}");
         assert!(blocked_reason(&id, std::process::id() as i32).is_none());
     }
