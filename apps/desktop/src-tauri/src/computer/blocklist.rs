@@ -138,6 +138,38 @@ pub fn blocked_name(name_or_bundle: &str) -> Option<&'static str> {
     blocked_name_on(PLATFORM, name_or_bundle)
 }
 
+/// Language-independent pre-launch guard for AppsFolder's system-provided AUMID.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn blocked_aumid(aumid: &str) -> Option<&'static str> {
+    // A packaged AUMID is PackageFamilyName!ApplicationId. The family is
+    // PackageName_PublisherId: versions and the localized display name play no part.
+    // Unpackaged AppsFolder entries may instead carry an executable or registered id.
+    let app = aumid.split('!').next().unwrap_or(aumid);
+    let package = app.split('_').next().unwrap_or(app);
+    let lower = package.to_ascii_lowercase();
+    let alias = match lower.as_str() {
+        "windows.immersivecontrolpanel" => Some("Settings"),
+        "8bitsolutionsllc.bitwardendesktop" => Some("Bitwarden"),
+        "microsoft.windows.creddialoghost" => Some("CredentialUIBroker"),
+        "dominikreichl.keepasspasswordsafe" => Some("KeePass"),
+        _ => None,
+    };
+    alias.or_else(|| {
+        // Reuse the executable/name list, including its helper-prefix checks. Package
+        // vendors precede the product with a dot (Microsoft.SecHealthUI, AgileBits.1Password,
+        // Dashlane.Dashlane, LastPass.LastPass, DominikReichl.KeePass,
+        // KeePassXCTeam.KeePassXC, Microsoft.LockApp). Check each dot-delimited suffix,
+        // never a substring, so similarly named unrelated apps are not refused.
+        let mut suffix = package;
+        loop {
+            if let Some(label) = blocked_name_on(Platform::Windows, suffix) {
+                return Some(label);
+            }
+            suffix = suffix.split_once('.')?.1;
+        }
+    })
+}
+
 /// The app name in a name, bundle id, or path: its last component without the app suffix.
 fn app_name(platform: Platform, name_or_bundle: &str) -> &str {
     match platform {
@@ -192,6 +224,42 @@ mod tests {
 
     fn app(bundle: Option<&str>, name: &str) -> AppIdentity {
         AppIdentity { pid: 100, bundle_id: bundle.map(str::to_string), name: name.into() }
+    }
+
+    #[test]
+    fn packaged_settings_is_blocked_even_when_its_display_name_is_localized() {
+        assert_eq!(windows_name("Configuración"), None);
+        assert_eq!(blocked_aumid("windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"), Some("Settings"));
+        assert_eq!(blocked_aumid("WINDOWS.IMMERSIVECONTROLPANEL_other!App"), Some("Settings"));
+    }
+
+    #[test]
+    fn packaged_blocklist_covers_security_signin_and_password_managers() {
+        for (package, label) in [
+            ("Microsoft.SecHealthUI", "Windows Security"),
+            ("Microsoft.Windows.SecHealthUI", "Windows Security"),
+            ("Microsoft.LockApp", "LockApp"),
+            ("Microsoft.Windows.CredDialogHost", "CredentialUIBroker"),
+            ("AgileBits.1Password", "1Password"),
+            ("8bitSolutionsLLC.bitwardendesktop", "Bitwarden"),
+            ("Dashlane.Dashlane", "Dashlane"),
+            ("LastPass.LastPass", "LastPass"),
+            ("LastPass.LastPassFreePasswordManager", "LastPass"),
+            ("DominikReichl.KeePass", "KeePass"),
+            ("DominikReichl.KeePassPasswordSafe", "KeePass"),
+            ("KeePassXCTeam.KeePassXC", "KeePassXC"),
+            ("Vendor.gentle-dot", "Gentle Dot"),
+        ] {
+            assert_eq!(blocked_aumid(&format!("{package}_publisher!App")), Some(label), "{package}");
+        }
+    }
+
+    #[test]
+    fn unrelated_packaged_apps_and_similar_prefixes_pass() {
+        for aumid in ["Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", "windows.immersivecontrolpanelExtra_pub!App",
+            "Vendor.keepassword_pub!App", "Vendor.bitwardendesktopExtra_pub!App"] {
+            assert_eq!(blocked_aumid(aumid), None, "{aumid}");
+        }
     }
 
     #[test]

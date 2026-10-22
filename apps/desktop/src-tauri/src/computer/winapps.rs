@@ -94,6 +94,17 @@ pub fn request(name: &str) -> Result<Request, String> {
     Ok(Request::Name(name.to_string()))
 }
 
+/// Resolves only a localized display name from AppsFolder; parsing names are not user input.
+pub fn packaged_named<'a>(name: &str, apps: &'a [(String, String)]) -> Result<&'a (String, String), String> {
+    let wanted = name.trim().to_lowercase();
+    let mut matches = apps.iter().filter(|(display, _)| display.trim().to_lowercase() == wanted);
+    let first = matches.next().ok_or_else(|| format!("cannot find an app named `{name}`"))?;
+    if matches.any(|(_, aumid)| aumid != &first.1) {
+        return Err(format!("cannot tell which app named `{name}` to open, so nothing was opened."));
+    }
+    Ok(first)
+}
+
 /// The Start menu shortcut named `name` (its file name without `.lnk`, any case).
 pub fn shortcut_named<'a>(name: &str, shortcuts: &'a [String]) -> Option<&'a String> {
     let wanted = strip_ci(name, ".lnk").unwrap_or(name);
@@ -143,6 +154,48 @@ mod tests {
 
     fn window(pid: i32, title: &str) -> TopWindow {
         TopWindow { pid, title: title.into(), visible: true, cloaked: false, tool: false, app_window: false, owned: false }
+    }
+
+    fn packaged_apps() -> Vec<(String, String)> {
+        vec![("Calculator".into(), "Microsoft.WindowsCalculator_pub!App".into()),
+             ("Calculadora".into(), "Microsoft.WindowsCalculator_pub!App".into()),
+             ("Éditeur".into(), "Vendor.Editor_pub!App".into())]
+    }
+
+    #[test]
+    fn packaged_names_match_exactly_not_substrings_or_aumids() {
+        let apps = packaged_apps();
+        assert_eq!(packaged_named("Calculator", &apps), Ok(&apps[0]));
+        for name in ["Calc", "Microsoft.WindowsCalculator_pub!App", "Missing"] {
+            assert_eq!(packaged_named(name, &apps), Err(format!("cannot find an app named `{name}`")));
+        }
+    }
+
+    #[test]
+    fn packaged_names_ignore_case_and_surrounding_whitespace() {
+        let apps = vec![(" Calculator ".into(), "id!App".into())];
+        assert_eq!(packaged_named("  cALCULATOR  ", &apps), Ok(&apps[0]));
+    }
+
+    #[test]
+    fn packaged_names_are_localized_and_unicode_case_insensitive() {
+        let apps = packaged_apps();
+        assert_eq!(packaged_named("Calculadora", &apps), Ok(&apps[1]));
+        assert_eq!(packaged_named("ÉDITEUR", &apps), Ok(&apps[2]));
+    }
+
+    #[test]
+    fn packaged_names_refuse_distinct_aumids_but_not_duplicate_entries() {
+        let mut apps = vec![("Calculator".into(), "one!App".into()); 2];
+        assert_eq!(packaged_named("Calculator", &apps), Ok(&apps[0]));
+        apps.push(("calculator".into(), "two!App".into()));
+        assert_eq!(packaged_named("Calculator", &apps), Err(
+            "cannot tell which app named `Calculator` to open, so nothing was opened.".into()));
+    }
+
+    #[test]
+    fn an_empty_apps_folder_has_no_match() {
+        assert_eq!(packaged_named("Calculator", &[]), Err("cannot find an app named `Calculator`".into()));
     }
 
     #[test]

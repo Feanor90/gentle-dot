@@ -17,13 +17,13 @@
 //! Elements come from UI Automation (`winaccess` maps them), with a 0.5 s timeout so a hung app
 //! cannot stall the helper, as the Accessibility timeout does on macOS.
 
-use super::blocklist::{blocked_name, blocked_reason, AppIdentity, UNIDENTIFIED};
+use super::blocklist::{blocked_aumid, blocked_name, blocked_reason, AppIdentity, UNIDENTIFIED};
 use super::coords::{fit_long_edge, Point, ScreenshotGeometry, MAX_LONG_EDGE};
 use super::encode::{bgra_to_jpeg, JPEG_QUALITY};
 use super::risk::{AxElement, Focus};
 use super::glow::Frame;
 use super::winaccess::{element, is_default, unreadable, UIA_BUTTON, UIA_WINDOW};
-use super::winapps::{answers_to, app_pids, executable_target, hosted_page, request, shortcut_named, strip_ci, Request, TopWindow};
+use super::winapps::{answers_to, app_pids, executable_target, hosted_page, packaged_named, request, shortcut_named, strip_ci, Request, TopWindow};
 use super::winput::{releases, steps, Step, VirtualScreen};
 use super::{AppInfo, Capture, InputEvent, MouseButton};
 use std::ffi::c_void;
@@ -874,10 +874,91 @@ fn off_limits(label: &str) -> String {
     format!("{label} is off limits, so it was not opened.")
 }
 
-/// Opens an app, or brings it forward when it already runs, the way `open -a` does on macOS: by a
-/// running app's name or executable, else a Start menu shortcut with that name, else the program
-/// App Paths or PATH names. Whatever the route, only a program on a local drive is started, with
-/// no arguments, and never one the blocklist names.
+/// AppsFolder's localized display names and system-provided parsing names (packaged AUMIDs).
+/// Any failed query discards the whole enumeration: a partial list cannot rule out ambiguity.
+fn packaged_apps() -> windows::core::Result<Vec<(String, String)>> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{
+        SHGetKnownFolderItem, FOLDERID_AppsFolder, BHID_EnumItems, IEnumShellItems, IShellItem,
+        KF_FLAG_DEFAULT, SIGDN, SIGDN_NORMALDISPLAY, SIGDN_DESKTOPABSOLUTEPARSING,
+    };
+    fn display(item: &IShellItem, kind: SIGDN) -> windows::core::Result<String> {
+        // SAFETY: the live shell item allocates this string with the COM task allocator;
+        // it is copied and freed even when UTF-16 conversion fails.
+        unsafe {
+            let text = item.GetDisplayName(kind)?;
+            let copied = text.to_string();
+            CoTaskMemFree(Some(text.0.cast()));
+            copied.map_err(|_| windows::core::Error::from(windows::Win32::Foundation::E_INVALIDARG))
+        }
+    }
+    let _apartment = Apartment::join();
+    // SAFETY: live COM objects; Next writes into one owned Option and reports its count.
+    unsafe {
+        let folder: IShellItem = SHGetKnownFolderItem(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, None)?;
+        let items: IEnumShellItems = folder.BindToHandler(None, &BHID_EnumItems)?;
+        let mut apps = Vec::new();
+        loop {
+            let mut next = [None];
+            let mut fetched = 0;
+            items.Next(&mut next, Some(&mut fetched))?;
+            if fetched == 0 {
+                return Ok(apps);
+            }
+            let item = next[0].take().ok_or_else(windows::core::Error::from_thread)?;
+            apps.push((display(&item, SIGDN_NORMALDISPLAY)?, display(&item, SIGDN_DESKTOPABSOLUTEPARSING)?));
+        }
+    }
+}
+
+/// Guard the resolved display name and package before activation, including localized Settings.
+fn packaged_target<'a>(wanted: &str, apps: &'a [(String, String)]) -> Result<&'a (String, String), String> {
+    let app = packaged_named(wanted, apps)?;
+    if let Some(label) = blocked_name(&app.0).or_else(|| blocked_aumid(&app.1)) {
+        return Err(off_limits(label));
+    }
+    Ok(app)
+}
+
+/// Only the system's enumeration supplies the activation id; no shell or user AUMID is run.
+fn open_packaged_app(wanted: &str) -> Result<Option<AppIdentity>, String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Shell::{ApplicationActivationManager, IApplicationActivationManager, AO_NONE};
+    let apps = packaged_apps().map_err(|_| format!("cannot find an app named `{wanted}`"))?;
+    let (display, aumid) = packaged_target(wanted, &apps)?;
+    let _apartment = Apartment::join();
+    let before: Vec<HWND> = top_windows().into_iter().map(|(hwnd, _)| hwnd).collect();
+    let cannot_open = || format!("cannot open `{wanted}`: Windows could not start it");
+    let (id, arguments) = (wide(aumid), wide(""));
+    // SAFETY: system COM activation, with terminated strings alive throughout the call.
+    let pid = unsafe {
+        let manager: IApplicationActivationManager =
+            CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_INPROC_SERVER).map_err(|_| cannot_open())?;
+        manager.ActivateApplication(PCWSTR(id.as_ptr()), PCWSTR(arguments.as_ptr()), AO_NONE).map_err(|_| cannot_open())?
+    };
+    // The returned PID may be a host, not the app's core process. Never authorize identity(pid)
+    // or the foreground. Prove a top-level app window and return exactly its target_of identity
+    // (as settle and keyboard_target will see it). Same 3 s budget as new_app_identity.
+    let own = std::process::id() as i32;
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(100));
+        for (hwnd, _) in top_windows().into_iter().filter(|(_, window)| window.is_app()) {
+            let app = target_of(hwnd);
+            if blocked_reason(&app, own).is_none()
+                && ((pid != 0 && app.pid as u32 == pid)
+                    || (!before.contains(&hwnd) && answers_to(display, &app.name, app.bundle_id.as_deref())))
+            {
+                return Ok(Some(app));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Opens an app, or brings it forward when it already runs: running window, Start menu .lnk,
+/// App Paths, PATH, then AppsFolder by localized display name. Local executables and packaged
+/// activations both have no arguments and must pass the blocklist before launch.
 pub fn open_app(name: &str) -> Result<(), String> {
     let request = request(name)?;
     let own = std::process::id() as i32;
@@ -906,7 +987,10 @@ pub fn open_app(name: &str) -> Result<(), String> {
             Some(shortcut) => shortcut_target(shortcut)?,
             None => {
                 let found = app_path(wanted).or_else(|| search_exe(wanted));
-                executable_target(&found.ok_or_else(|| format!("cannot find an app named `{wanted}`"))?, "")?
+                match found {
+                    Some(program) => executable_target(&program, "")?,
+                    None => return open_packaged_app(wanted).map(|_| ()),
+                }
             }
         },
     };
@@ -997,7 +1081,10 @@ pub fn open_app_identified(name: &str) -> Result<Option<AppIdentity>, String> {
             Some(shortcut) => shortcut_target(shortcut)?,
             None => {
                 let found = app_path(wanted).or_else(|| search_exe(wanted));
-                executable_target(&found.ok_or_else(|| format!("cannot find an app named `{wanted}`"))?, "")?
+                match found {
+                    Some(program) => executable_target(&program, "")?,
+                    None => return open_packaged_app(wanted),
+                }
             }
         },
     };
@@ -1458,6 +1545,57 @@ mod tests {
             id.bundle_id.as_deref().is_some_and(|exe| exe.eq_ignore_ascii_case("Notepad.exe")),
             "the identity is Notepad's, not whatever is front: {id:?}"
         );
+    }
+
+    #[test]
+    fn packaged_resolution_guards_both_display_name_and_package_before_activation() {
+        let apps = vec![
+            ("Configuración".into(), "windows.immersivecontrolpanel_cw5n1h2txyewy!App".into()),
+            ("Settings".into(), "Unrelated_pub!App".into()),
+            ("Calculadora".into(), "Microsoft.WindowsCalculator_pub!App".into()),
+        ];
+        assert_eq!(packaged_target("Configuración", &apps), Err("Settings is off limits, so it was not opened.".into()));
+        assert_eq!(packaged_target("Settings", &apps), Err("Settings is off limits, so it was not opened.".into()));
+        assert_eq!(packaged_target("Calculadora", &apps), Ok(&apps[2]));
+        assert_eq!(packaged_target("Missing", &apps), Err("cannot find an app named `Missing`".into()));
+    }
+
+    /// Uses the localized AppsFolder name, bypassing the classic resolver to exercise activation
+    /// even if calc.exe is on PATH. Close Calculator first; no input is posted to any app.
+    #[test]
+    #[ignore = "interactive Windows desktop: Calculator installed; close Calculator first"]
+    fn an_opened_packaged_calculator_has_its_window_identity_not_a_host_or_foreground() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+        let calculators = || -> Vec<HWND> {
+            top_windows().into_iter().filter(|(hwnd, window)| {
+                window.is_app() && target_of(*hwnd).bundle_id.as_deref().is_some_and(|exe| {
+                    exe.eq_ignore_ascii_case("CalculatorApp.exe") || exe.eq_ignore_ascii_case("Calculator.exe")
+                })
+            }).map(|(hwnd, _)| hwnd).collect()
+        };
+        assert!(calculators().is_empty(), "close every Calculator window first");
+        let apps = packaged_apps().expect("AppsFolder is readable");
+        let (name, aumid) = apps.iter().find(|(_, id)| id.to_ascii_lowercase().starts_with("microsoft.windowscalculator_")).expect("Calculator is installed");
+        eprintln!("Calculator display name {name:?}, parsing name {aumid:?}");
+        let opened = open_packaged_app(name).expect("Calculator activates");
+        let windows = calculators();
+        let identities: Vec<_> = windows.iter().map(|hwnd| target_of(*hwnd)).collect();
+        for hwnd in windows {
+            // SAFETY: these are Calculator windows opened by this test, never pre-existing ones.
+            unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
+        }
+        let id = opened.expect("Calculator's app window is identified, not the activation host");
+        assert!(identities.contains(&id), "identity must equal target_of(Calculator window): {id:?}, windows {identities:?}");
+        assert!(blocked_reason(&id, std::process::id() as i32).is_none());
+    }
+
+    #[test]
+    fn classic_open_entry_points_keep_their_protocol_refusal() {
+        for name in ["ms-settings:", "shell:AppsFolder", "shell:AppsFolder\\Microsoft.WindowsCalculator_pub!App"] {
+            let expected = format!("`{name}` is not an app name: URLs and protocols cannot be opened.");
+            assert_eq!(open_app(name), Err(expected.clone()));
+            assert_eq!(open_app_identified(name), Err(expected));
+        }
     }
 
     #[test]

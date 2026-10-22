@@ -134,7 +134,9 @@ Computer control runs on Windows too (see [design.md, S24.10](design.md#computer
 
 Typing requires an app deliberately clicked or opened by the assistant. Before each text chunk and Return, the helper checks that app is still in front and neither the frontmost nor focused app is blocked. A mid-type change stops further input and reports how many characters were already sent; screenshots never authorize typing. A tiny check-to-`SendInput` race remains because Windows input cannot target a window.
 
-Elevated apps cannot be driven under Windows UIPI. Apps Windows cannot identify, including Store apps without a core window, are refused. UI Automation uses a 0.5 s timeout, not a hard deadline for the whole action; unreadable elements can require more confirmations, and read-only documents count as text areas. The glow and working top-edge line run on Windows; after a call, the Dot and panel return without taking keyboard focus.
+`open_app` can open Microsoft Store apps by their localized name (for example, **Calculadora** on Spanish Windows). After running apps, Start-menu shortcuts, App Paths and PATH, it looks in Windows AppsFolder. Names must match exactly apart from case and surrounding whitespace; ambiguous names are refused. It does not accept AUMIDs or `shell:` commands. Blocked packages, including Settings under a localized name, are refused before launch. An opened app grants typing authority only when its native app-window identity is verified.
+
+Elevated apps cannot be driven under Windows UIPI. Apps Windows cannot identify, including Store frames without a core window, are refused. UI Automation uses a 0.5 s timeout, not a hard deadline for the whole action; unreadable elements can require more confirmations, and read-only documents count as text areas. The glow and working top-edge line run on Windows; after a call, the Dot and panel return without taking keyboard focus.
 
 ### Voice input
 

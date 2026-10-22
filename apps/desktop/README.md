@@ -53,7 +53,9 @@ Computer control runs on Windows too ([design.md, S24.10](../../docs/design.md#c
 
 Typing re-checks the deliberately clicked/opened app's foreground PID and both frontmost/focused blocklists before every text chunk and Return. A mid-type change stops further input and reports the count already sent; partial input still gets a key glow mark. Screenshots never authorize typing. `SendInput` cannot target a window, so a tiny check-to-post race remains.
 
-Elevated apps cannot be driven under Windows UIPI. Store apps without a core window stay Unidentified (refused). UI Automation uses a 0.5 s timeout, not a hard deadline for the whole action; read-only documents count as text areas and unreadable elements can require more confirmations. Real input, capture, dialogs, and glow require the user's own interactive desktop session for validation.
+`open_app` resolves running windows → Start-menu `.lnk` → App Paths → PATH → AppsFolder. The last fallback opens Microsoft Store apps by an exact localized display name, ignoring case and surrounding whitespace; distinct matching AUMIDs are ambiguous and refused. Only Windows supplies AUMIDs (user `shell:` commands and protocols remain refused). Both display-name and language-independent package blocklists run before activation. The activation PID is only a hint: a verified top-level app-window identity within three seconds is required for keyboard authority, never an arbitrary foreground window.
+
+Elevated apps cannot be driven under Windows UIPI. Store frames without a core window stay Unidentified (refused). UI Automation uses a 0.5 s timeout, not a hard deadline for the whole action; read-only documents count as text areas and unreadable elements can require more confirmations. Real input, capture, dialogs, and glow require the user's own interactive desktop session for validation.
 
 ## Menu bar
 
