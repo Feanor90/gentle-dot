@@ -43,7 +43,7 @@ use tauri::{LogicalPosition, LogicalSize};
 #[cfg(windows)]
 use tauri::{PhysicalPosition, PhysicalSize};
 
-const DOT: &str = "dot";
+pub(crate) const DOT: &str = "dot";
 pub(crate) const PANEL: &str = "panel";
 const TRAY: &str = "main";
 /// The Dot window, in points: a 66 pt black disc with the rose, plus a 3 pt
@@ -104,9 +104,9 @@ impl working::Windows for ShellWindows {
 
     fn show(&self, part: Part) {
         let Some(window) = self.get(part) else { return };
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         let shown = computer::show_without_focus(&window);
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         let shown = window.show().map_err(err);
         if let Err(error) = shown {
             eprintln!("gentle-dot: cannot show the {part:?} again: {error}");
@@ -872,8 +872,8 @@ fn restart_daemon(app: AppHandle) {
     });
 }
 
-/// ⌥⇧Esc ends computer control from anywhere, even while another app is in front.
-#[cfg(target_os = "macos")]
+/// ⌥⇧Esc (Alt+Shift+Esc on Windows) ends control even with another app in front.
+#[cfg(any(target_os = "macos", windows))]
 fn register_panic_shortcut(app: &AppHandle) {
     let handler = |app: &AppHandle, _: &_, event: tauri_plugin_global_shortcut::ShortcutEvent| {
         if event.state() == ShortcutState::Pressed {
@@ -1026,7 +1026,7 @@ pub fn run() {
             let (voice_input, voice_model) = voice::start(&handle);
             app.manage(voice_input);
             app.manage(voice_model);
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             register_panic_shortcut(&handle);
 
             build_windows(&handle, &config, places_windows, rose_hidden)?;

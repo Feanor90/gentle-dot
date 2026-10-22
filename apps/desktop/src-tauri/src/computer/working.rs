@@ -234,6 +234,13 @@ impl Inner {
                 outcome = Err(error);
                 break;
             }
+            // Tauri's cached visibility may diverge after a native focus-free restore.
+            // A successful API return alone must never permit input through our own UI.
+            #[cfg(windows)]
+            if self.windows.is_visible(part) {
+                outcome = Err(format!("window {part:?} is still visible"));
+                break;
+            }
             state.hidden.set(part, true);
         }
         if let Some(op) = state.current.as_mut() {
@@ -328,6 +335,8 @@ mod tests {
         visible: Mutex<Visibility>,
         rose_hidden: AtomicBool,
         fails: Mutex<Option<Part>>,
+        /// Model Tao's cached-hidden state after a native focus-free restoration.
+        hide_noop: AtomicBool,
     }
 
     fn name(part: Part) -> &'static str {
@@ -346,7 +355,9 @@ mod tests {
             if *self.fails.lock().unwrap() == Some(part) {
                 return Err(format!("cannot hide the {}", name(part)));
             }
-            self.visible.lock().unwrap().set(part, false);
+            if !self.hide_noop.load(Ordering::SeqCst) {
+                self.visible.lock().unwrap().set(part, false);
+            }
             self.log.lock().unwrap().push(format!("hide {}", name(part)));
             Ok(())
         }
@@ -432,6 +443,7 @@ mod tests {
             visible: Mutex::new(visible),
             rose_hidden: AtomicBool::new(!visible.dot),
             fails: Mutex::new(None),
+            hide_noop: AtomicBool::new(false),
         });
         let rings = Arc::new(FakeRings { log: log.clone(), fails: AtomicBool::new(false), on_show: Mutex::new(None) });
         let main =
@@ -479,6 +491,20 @@ mod tests {
         rig.working.finish(operation);
         assert_eq!(rig.log(), ["rings on 1", "hide dot", "hide panel", "rings off 1", "show dot", "show panel"]);
         assert_eq!(rig.visible(), BOTH);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_cached_hide_noop_after_native_restore_never_prepares_an_action() {
+        let rig = rig();
+        let first = rig.working.begin().unwrap();
+        rig.working.finish(first);
+        assert_eq!(rig.visible(), BOTH);
+        rig.windows.hide_noop.store(true, Ordering::SeqCst);
+        assert_eq!(rig.working.begin(), Err(NOT_HIDDEN.to_string()));
+        assert_eq!(rig.visible(), BOTH);
+        assert!(!rig.working.is_current(first + 1));
+        assert_eq!(rig.log(), ["rings on 1", "hide dot", "hide panel", "rings off 1", "show dot", "show panel", "rings on 2", "hide dot", "rings off 2"]);
     }
 
     #[test]

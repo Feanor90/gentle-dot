@@ -47,6 +47,18 @@ Runtime overrides:
 
 `shortcut` in `~/.gentle-dot/config.json` changes the global shortcut (default `Alt+Space`; on Windows, when another program holds it, `Ctrl+Alt+Space` for that session). The Dot position is saved in `~/.gentle-dot/desktop.json` as `dot_points`, in macOS points (the screen space every monitor shares, whatever its scale factor). The `dot` key written by older builds was in physical pixels and is ignored, so the Dot starts once more at the right edge of the main display.
 
+## Windows computer control
+
+Computer control runs on Windows too ([design.md, S24.10](../../docs/design.md#computer-control-macos-and-windows-s24)): `SendInput` and GDI capture, UI Automation for the risk check, a Windows blocklist, task dialogs that refuse by default, **Alt+Shift+Esc** registered at startup to stop (registration failures are logged), and the glow. Windows asks for no permission for computer control. The working ring shows the same top-edge line as on macOS; the Dot and panel return without taking keyboard focus (`ShowWindow` with `SW_SHOWNA`).
+
+Typing re-checks the deliberately clicked/opened app's foreground PID and both frontmost/focused blocklists before every text chunk and Return. A mid-type change stops further input and reports the count already sent; partial input still gets a key glow mark. Screenshots never authorize typing. `SendInput` cannot target a window, so a tiny check-to-post race remains.
+
+`open_app` resolves running windows → Start-menu `.lnk` → App Paths → PATH → AppsFolder. The last fallback opens Microsoft Store apps by an exact localized display name, ignoring case and surrounding whitespace; distinct matching AUMIDs are ambiguous and refused. Only Windows supplies AUMIDs (user `shell:` commands and protocols remain refused). Both display-name and language-independent package blocklists run before activation. The activation PID is only a hint: a verified top-level app-window identity within three seconds is required for keyboard authority, never an arbitrary foreground window. The sole launcher-stub mapping is Windows System32/SysWOW64 `calc.exe` (requests `calc` or `calc.exe`) → system-enumerated AUMID prefix `Microsoft.WindowsCalculator_`: the compatibility launcher exits after starting packaged Calculator. Localized names are not used for this mapping, unrelated executable paths are unchanged, and a missing package or unavailable enumeration keeps the original stub launch with fail-closed keyboard authority.
+
+The Stop banner is inside the panel; it is hidden with the panel during calls, as is the rose/Dot. Native focus-free restoration bypasses Tao's visibility cache, so Windows preparation also performs native `SW_HIDE` and verifies invisibility before actions. Capture exclusion alone does not prevent interception. Any remaining own window at the requested point is refused without input or typing authority: `That point is covered by Gentle Dot's own window, which screenshots do not show. Choose a visible point elsewhere; nothing was sent.` The layered click-through glow is unchanged; own interactive UI is never bypassed.
+
+Elevated apps cannot be driven under Windows UIPI. Store frames without a core window stay Unidentified (refused). UI Automation uses a 0.5 s timeout, not a hard deadline for the whole action; read-only documents count as text areas and unreadable elements can require more confirmations. Real input, capture, dialogs, and glow require the user's own interactive desktop session for validation.
+
 ## Menu bar
 
 | Item | What it does |

@@ -1,9 +1,10 @@
 //! Computer control (S24): a native helper inside the app that serves MCP on loopback so the
-//! agent can see and drive the Mac. Every rule (session grant, blocklist, rate limit, risky
-//! action confirmation, panic stop) lives here, outside the agent's reach.
+//! agent can see and drive the Mac or the PC. Every rule (session grant, blocklist, rate limit,
+//! risky action confirmation, panic stop) lives here, outside the agent's reach.
 //!
-//! The rules are pure modules tested on every OS. `Desktop` is the seam to the real Mac
-//! (`macos`), and `fake` records events for the tests. Off macOS the helper does not start.
+//! The rules are pure modules tested on every OS. `Desktop` is the seam to the real desktop
+//! (`macos` on macOS, `win` on Windows), and `fake` records events for the tests. On other
+//! systems the helper does not start.
 
 pub mod app;
 pub mod blocklist;
@@ -22,6 +23,15 @@ pub mod risk;
 pub mod server;
 pub mod session;
 pub mod windows;
+#[cfg(any(windows, test))]
+pub mod winaccess;
+#[cfg(any(windows, test))]
+pub mod winapps;
+#[cfg(any(windows, test))]
+pub mod winput;
+// The Windows desktop (S24 on Windows).
+#[cfg(windows)]
+pub mod win;
 pub mod working;
 
 use blocklist::AppIdentity;
@@ -96,6 +106,13 @@ pub trait Desktop: Send + Sync {
     fn list_apps(&self) -> Result<Vec<AppInfo>, String>;
     /// Opens (or activates) an app by name or bundle id.
     fn open_app(&self, name: &str) -> Result<(), String>;
+    /// Native identity of the requested app, never inferred from the foreground.
+    /// Backends without verified identity cannot authorize a keyboard target.
+    #[cfg(windows)]
+    fn open_app_identified(&self, name: &str) -> Result<Option<AppIdentity>, String> {
+        self.open_app(name)?;
+        Ok(None)
+    }
     /// The Accessibility element at a point, then its ancestors; empty when unknown.
     fn element_at(&self, at: Point) -> Vec<AxElement>;
     fn focused_element(&self) -> Option<Focus>;

@@ -12,9 +12,14 @@ pub fn app(pid: i32, bundle: &str, name: &str) -> AppIdentity {
 }
 
 type OwnerAt = Box<dyn Fn(Point) -> Option<AppIdentity> + Send + Sync>;
+#[cfg(windows)]
+type PostHook = Box<dyn Fn(usize) + Send + Sync>;
 
 pub struct FakeDesktop {
     pub events: Mutex<Vec<InputEvent>>,
+    /// Runs after a successful post, with the total number of recorded events.
+    #[cfg(windows)]
+    pub after_post: Mutex<Option<PostHook>>,
     pub permissions: Mutex<Permissions>,
     pub frontmost: Mutex<Option<AppIdentity>>,
     pub focused_app: Mutex<Option<AppIdentity>>,
@@ -22,7 +27,15 @@ pub struct FakeDesktop {
     pub elements: Mutex<Vec<AxElement>>,
     pub focus: Mutex<Option<Focus>>,
     pub opened: Mutex<Vec<String>>,
+    /// Native launch result, independent of any later foreground changes.
+    #[cfg(windows)]
+    pub opened_identity: Mutex<Option<AppIdentity>>,
     pub activated: Mutex<Vec<i32>>,
+    /// What activation eventually brings forward; by default activation only records the pid.
+    #[cfg(windows)]
+    pub activates_to: Mutex<Option<AppIdentity>>,
+    #[cfg(windows)]
+    pub activations_needed: Mutex<usize>,
     pub captures: AtomicUsize,
     /// A 2560 × 1600 pt display at the origin, captured at 1280 × 800 (scale 0.5).
     pub geometry: ScreenshotGeometry,
@@ -34,6 +47,8 @@ impl Default for FakeDesktop {
         let owner = safari.clone();
         FakeDesktop {
             events: Mutex::new(Vec::new()),
+            #[cfg(windows)]
+            after_post: Mutex::new(None),
             permissions: Mutex::new(Permissions { accessibility: true, screen_recording: true, screenshots_supported: true }),
             frontmost: Mutex::new(Some(safari)),
             focused_app: Mutex::new(None),
@@ -41,7 +56,13 @@ impl Default for FakeDesktop {
             elements: Mutex::new(Vec::new()),
             focus: Mutex::new(None),
             opened: Mutex::new(Vec::new()),
+            #[cfg(windows)]
+            opened_identity: Mutex::new(None),
             activated: Mutex::new(Vec::new()),
+            #[cfg(windows)]
+            activates_to: Mutex::new(None),
+            #[cfg(windows)]
+            activations_needed: Mutex::new(1),
             captures: AtomicUsize::new(0),
             geometry: ScreenshotGeometry::for_display(Point { x: 0.0, y: 0.0 }, 2560.0, 1280, 800),
         }
@@ -66,6 +87,10 @@ impl Desktop for FakeDesktop {
 
     fn post(&self, event: &InputEvent) -> Result<(), String> {
         self.events.lock().unwrap().push(event.clone());
+        #[cfg(windows)]
+        if let Some(hook) = self.after_post.lock().unwrap().as_ref() {
+            hook(self.events().len());
+        }
         Ok(())
     }
 
@@ -79,6 +104,12 @@ impl Desktop for FakeDesktop {
     fn open_app(&self, name: &str) -> Result<(), String> {
         self.opened.lock().unwrap().push(name.into());
         Ok(())
+    }
+
+    #[cfg(windows)]
+    fn open_app_identified(&self, name: &str) -> Result<Option<AppIdentity>, String> {
+        self.open_app(name)?;
+        Ok(self.opened_identity.lock().unwrap().clone())
     }
 
     fn element_at(&self, _at: Point) -> Vec<AxElement> {
@@ -102,7 +133,22 @@ impl Desktop for FakeDesktop {
     }
 
     fn activate(&self, pid: i32) {
+        #[cfg(not(windows))]
         self.activated.lock().unwrap().push(pid);
+        #[cfg(windows)]
+        {
+        let count = {
+            let mut activated = self.activated.lock().unwrap();
+            activated.push(pid);
+            activated.len()
+        };
+        if count < *self.activations_needed.lock().unwrap() {
+            return;
+        }
+        if let Some(app) = self.activates_to.lock().unwrap().clone() {
+            *self.frontmost.lock().unwrap() = Some(app);
+        }
+        }
     }
 }
 

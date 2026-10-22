@@ -44,6 +44,12 @@ const KEYS: &[(&str, u16)] = &[
     ("f1", 122), ("left", 123), ("right", 124), ("down", 125), ("up", 126),
 ];
 
+/// Every key name `parse_combo` accepts, aliases aside.
+#[cfg(test)]
+pub(crate) fn names() -> impl Iterator<Item = &'static str> {
+    KEYS.iter().map(|(name, _)| *name)
+}
+
 /// Other spellings of the named keys.
 const ALIASES: &[(&str, &str)] = &[
     ("enter", "return"), ("esc", "escape"), ("backspace", "delete"), ("del", "forwarddelete"),
@@ -87,6 +93,13 @@ mod tests {
 
     fn mods(cmd: bool, shift: bool, alt: bool, ctrl: bool) -> Modifiers {
         Modifiers { cmd, shift, alt, ctrl, fn_key: false }
+    }
+
+    #[test]
+    fn every_named_key_parses_to_its_canonical_name() {
+        for name in names() {
+            assert_eq!(parse_combo(name).unwrap().key, name);
+        }
     }
 
     #[test]
